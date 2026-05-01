@@ -24,8 +24,9 @@
 
 (defun run-migrations (db)
   "Apply all schema migrations idempotently."
-  (let ((sql (read-migration-file "src/catalogue/migrations/0001_init.sql")))
-    (dolist (stmt (split-statements sql))
+  (dolist (mig '("src/catalogue/migrations/0001_init.sql"
+                 "src/catalogue/migrations/0002_patches.sql"))
+    (dolist (stmt (split-statements (read-migration-file mig)))
       (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) stmt)))
         (when (plusp (length trimmed))
           (sqlite:execute-non-query db trimmed))))))
@@ -132,6 +133,23 @@
                        *release-columns*)
                software-name)))
     (when rows (row-to-release (first rows)))))
+
+(defun insert-patch (db &key sha256 from-release-id to-release-id patcher size)
+  (sqlite:execute-non-query
+   db
+   "INSERT OR REPLACE INTO patches (sha256, from_release_id, to_release_id, patcher, size, built_at) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+   sha256 from-release-id to-release-id patcher size))
+
+(defun list-patches-to (db to-release-id)
+  "Return list of plists describing every patch ending at TO-RELEASE-ID."
+  (mapcar (lambda (row)
+            (destructuring-bind (sha from-id to-id patcher size built-at) row
+              (list :sha256 sha :from-release-id from-id :to-release-id to-id
+                    :patcher patcher :size size :built-at built-at)))
+          (sqlite:execute-to-list
+           db
+           "SELECT sha256, from_release_id, to_release_id, patcher, size, built_at FROM patches WHERE to_release_id = ? ORDER BY size ASC"
+           to-release-id)))
 
 (defun record-install-event (db &key client-id software release-id kind
                                      from-release-id status error)

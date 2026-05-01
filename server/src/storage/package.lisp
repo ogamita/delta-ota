@@ -6,8 +6,11 @@
   (:export #:make-cas
            #:cas-root
            #:cas-blob-path
+           #:cas-patch-path
            #:put-blob-from-file
+           #:put-patch-from-file
            #:has-blob
+           #:has-patch
            #:blob-size
            #:sha256-hex-of-file
            #:sha256-hex-of-bytes

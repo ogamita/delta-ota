@@ -1,0 +1,80 @@
+;;; SPDX-License-Identifier: AGPL-3.0-or-later
+;;; Copyright (C) 2026 Ogamita Ltd.
+;;;
+;;; Patch builder.  Phase-2 simplification: each new release publish
+;;; builds patches synchronously from every prior release of the same
+;;; (software, os, arch) to the new release.  The proper async worker
+;;; pool with a Postgres-backed job queue lands in phase 5.
+
+(in-package #:ota-server.workers)
+
+(defparameter *bsdiff-binary*
+  ;; Resolved at boot; set by the http app via a config value if
+  ;; needed.  The default points at the location the dev image / the
+  ;; repo Makefile populate.
+  (or (uiop:getenv "OTA_BSDIFF")
+      "/opt/ota/bin/bsdiff"))
+
+(defun build-patch-from-blobs (cas catalogue
+                               &key from-release-id to-release-id
+                                    from-blob-sha to-blob-sha)
+  "Run vendored bsdiff(1) on the two on-disk blobs, store the resulting
+   patch in the patches CAS, and record it in the catalogue.  Returns
+   (values patch-sha patch-size).  Idempotent: if a patch with the same
+   (from,to,patcher) already exists in the catalogue, it is reused."
+  (let* ((from-blob (ota-server.storage:cas-blob-path cas from-blob-sha))
+         (to-blob   (ota-server.storage:cas-blob-path cas to-blob-sha))
+         (tmp (merge-pathnames
+               (format nil "tmp/patch-~A.bsdiff" (random (expt 2 32)))
+               (ota-server.storage:cas-root cas))))
+    (ensure-directories-exist tmp)
+    (unless (probe-file from-blob)
+      (error "build-patch: missing source blob ~A" from-blob))
+    (unless (probe-file to-blob)
+      (error "build-patch: missing target blob ~A" to-blob))
+    (uiop:run-program (list (namestring *bsdiff-binary*)
+                            (namestring from-blob)
+                            (namestring to-blob)
+                            (namestring tmp))
+                      :output :string :error-output :string)
+    (multiple-value-bind (sha size)
+        (ota-server.storage:put-patch-from-file cas tmp)
+      (ota-server.catalogue:insert-patch
+       catalogue
+       :sha256 sha
+       :from-release-id from-release-id
+       :to-release-id   to-release-id
+       :patcher "bsdiff"
+       :size size)
+      (format t "build-patch: ~A -> ~A: ~A bytes (sha ~A)~%"
+              from-release-id to-release-id size sha)
+      (force-output)
+      (values sha size))))
+
+(defun build-patches-for-release (cas catalogue
+                                  &key software os arch new-version
+                                       new-release-id new-blob-sha)
+  "Build a patch from every previously published release of the same
+   (software, os, arch) to the new release.  Returns a list of plists
+   describing the patches built."
+  (let ((built '()))
+    (dolist (rel (ota-server.catalogue:list-releases catalogue software))
+      (when (and (string= (getf rel :os) os)
+                 (string= (getf rel :arch) arch)
+                 (not (string= (getf rel :version) new-version)))
+        (handler-case
+            (multiple-value-bind (sha size)
+                (build-patch-from-blobs
+                 cas catalogue
+                 :from-release-id (getf rel :release-id)
+                 :to-release-id   new-release-id
+                 :from-blob-sha   (getf rel :blob-sha256)
+                 :to-blob-sha     new-blob-sha)
+              (push (list :from (getf rel :version)
+                          :sha256 sha :size size :patcher "bsdiff")
+                    built))
+          (error (e)
+            (format *error-output*
+                    "build-patches: skipping ~A->~A: ~A~%"
+                    (getf rel :release-id) new-release-id e)))))
+    (nreverse built)))

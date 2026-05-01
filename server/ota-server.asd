@@ -28,12 +28,14 @@
                (:module "catalogue"
                 :components ((:file "package")
                              (:file "db" :depends-on ("package"))))
+               (:module "workers"
+                :components ((:file "package")
+                             (:file "patcher" :depends-on ("package")))
+                :depends-on ("storage" "catalogue"))
                (:module "http"
                 :components ((:file "package")
                              (:file "server" :depends-on ("package")))
-                :depends-on ("storage" "manifest" "catalogue"))
-               (:module "workers"
-                :components ((:file "package")))
+                :depends-on ("storage" "manifest" "catalogue" "workers"))
                (:module "admin"
                 :components ((:file "package")))
                (:file "main" :depends-on ("http")))

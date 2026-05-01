@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"gitlab.com/ogamita/delta-ota/client/internal/manifest"
+	"gitlab.com/ogamita/delta-ota/client/internal/patch"
 	"gitlab.com/ogamita/delta-ota/client/internal/state"
 	"gitlab.com/ogamita/delta-ota/client/internal/tarx"
 	"gitlab.com/ogamita/delta-ota/client/internal/transport"
@@ -32,11 +33,24 @@ var ErrNotImplemented = errors.New("libota: not implemented yet")
 // defaults to ~/.ota; TrustedPubKeys gates which signing keys we
 // accept (hex-encoded). Empty TrustedPubKeys means trust-on-first-use:
 // the key the server presents is pinned and recorded in state.json.
+//
+// FallbackRatio (default 0.7) caps the patch transfer size relative
+// to the full blob: if every available patch is larger than
+// FallbackRatio * blob_size, the client downloads the full blob
+// instead of patching.
 type Config struct {
 	ServerURL      string
 	OTAHome        string
 	TrustedPubKeys []string
 	Timeout        time.Duration
+	FallbackRatio  float64
+}
+
+func (c Config) fallbackRatio() float64 {
+	if c.FallbackRatio <= 0 {
+		return 0.7
+	}
+	return c.FallbackRatio
 }
 
 func defaultOTAHome() string {
@@ -115,10 +129,31 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 			m.Software, m.Version, software, version)
 	}
 
-	// Download blob, hash-verify on the way.
+	// Resolve transfer strategy: patch if we have a usable local blob
+	// AND the manifest declares a patch from our current version
+	// AND the patch is smaller than fallback_ratio * blob_size.
 	blobPath := layout.BlobPath(version)
-	if _, err := tr.DownloadBlob(ctx, m.Blob.SHA256, blobPath, nil); err != nil {
-		return "", err
+	transferred := false
+	if st.Current != "" && st.Current != version {
+		oldBlob := layout.BlobPath(st.Current)
+		if _, err := os.Stat(oldBlob); err == nil {
+			pref := pickPatch(m.PatchesIn, st.Current, m.Blob.Size, cfg.fallbackRatio())
+			if pref != nil {
+				patchPath := filepath.Join(layout.PatchesDir, st.Current+"-to-"+version+".patch")
+				if _, err := tr.DownloadPatch(ctx, pref.SHA256, patchPath, nil); err != nil {
+					return "", fmt.Errorf("upgrade: download patch: %w", err)
+				}
+				if _, err := patch.Apply(oldBlob, patchPath, blobPath, m.Blob.SHA256, pref.Patcher); err != nil {
+					return "", err
+				}
+				transferred = true
+			}
+		}
+	}
+	if !transferred {
+		if _, err := tr.DownloadBlob(ctx, m.Blob.SHA256, blobPath, nil); err != nil {
+			return "", err
+		}
 	}
 
 	// Extract into distribution-<version>.
@@ -144,7 +179,8 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 		return "", err
 	}
 
-	// Update state.json.
+	// Update state.json + run local retention.
+	prev := st.Current
 	st.Software = software
 	if st.Current != version {
 		if st.Current != "" {
@@ -158,7 +194,60 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 	if err := layout.Save(st); err != nil {
 		return "", err
 	}
+	pruneOldArtefacts(layout, st, prev)
 	return version, nil
+}
+
+// pickPatch picks the cheapest patch from `from` to the new release
+// out of a manifest's patches_in, subject to the fallback ratio cap.
+// Returns nil if no acceptable patch is found.
+func pickPatch(in []manifest.PatchRef, from string, blobSize int64, fallbackRatio float64) *manifest.PatchRef {
+	cap := int64(float64(blobSize) * fallbackRatio)
+	var best *manifest.PatchRef
+	for i := range in {
+		p := &in[i]
+		if p.From != from {
+			continue
+		}
+		if p.Patcher != "bsdiff" {
+			continue
+		}
+		if cap > 0 && p.Size > cap {
+			continue
+		}
+		if best == nil || p.Size < best.Size {
+			best = p
+		}
+	}
+	return best
+}
+
+// pruneOldArtefacts implements the local retention policy. After
+// upgrade vX -> vY, vX-2 material is dropped:
+//   - distribution-vX-2.archived
+//   - blob-vX-2
+//   - patch vX-2 -> vX-1
+func pruneOldArtefacts(layout *state.Layout, st *state.State, lastPrev string) {
+	if len(st.History) < 3 {
+		return
+	}
+	older := st.History[len(st.History)-3]
+	_ = lastPrev
+	for _, p := range []string{
+		layout.BlobPath(older),
+		filepath.Join(layout.Root, "distribution-"+older+".archived"),
+	} {
+		_ = os.RemoveAll(p)
+	}
+	// Patch files matching <older>-to-*.patch
+	if entries, err := os.ReadDir(layout.PatchesDir); err == nil {
+		prefix := older + "-to-"
+		for _, e := range entries {
+			if !e.IsDir() && len(e.Name()) > len(prefix) && e.Name()[:len(prefix)] == prefix {
+				_ = os.Remove(filepath.Join(layout.PatchesDir, e.Name()))
+			}
+		}
+	}
 }
 
 func checkTrust(st *state.State, trusted []string, presented string) error {

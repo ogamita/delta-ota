@@ -106,10 +106,11 @@
                                   blob-sha256 blob-size blob-url
                                   channels classifications
                                   uncollectable deprecated published-at
-                                  notes)
+                                  notes (patches-in '()))
   "Return an ORDERED-OBJECT that serialises to the manifest JSON in a
    deterministic key order — the bytes are signed, so byte-exactness
-   matters."
+   matters.  PATCHES-IN is a list of plists with keys :from :sha256
+   :size :patcher (sorted by ascending size)."
   (ordered
    "schema_version"  1
    "release_id"      (format nil "~A/~A-~A/~A" software os arch version)
@@ -122,7 +123,17 @@
    "blob"            (ordered "sha256" blob-sha256
                               "size"   blob-size
                               "url"    blob-url)
-   "patches_in"      #()
+   "patches_in"      (coerce
+                      (mapcar (lambda (p)
+                                (ordered
+                                 "from"    (getf p :from)
+                                 "patcher" (or (getf p :patcher) "bsdiff")
+                                 "sha256"  (getf p :sha256)
+                                 "size"    (getf p :size)
+                                 "url"     (format nil "/v1/patches/~A"
+                                                   (getf p :sha256))))
+                              patches-in)
+                      'vector)
    "patches_out"     #()
    "channels"        (ensure-vector (or channels #()))
    "classifications" (ensure-vector (or classifications #()))

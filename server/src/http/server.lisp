@@ -74,6 +74,9 @@
     ((and (eq method :get) (= 3 (length segments))
           (equal (first segments) "v1") (equal (second segments) "blobs"))
      (values :get-blob (list :sha256 (third segments))))
+    ((and (eq method :get) (= 3 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "patches"))
+     (values :get-patch (list :sha256 (third segments))))
     ((and (eq method :post) (equal segments '("v1" "admin" "software")))
      :admin-create-software)
     ((and (eq method :post) (= 5 (length segments))
@@ -209,6 +212,16 @@
                  (list :content-type "application/octet-stream")
                  (probe-file path))))))
 
+(defun handle-get-patch (app params)
+  (let ((path (ota-server.storage:cas-patch-path
+               (app-state-cas app) (getf params :sha256))))
+    (cond ((not (probe-file path))
+           (error-response 404 "patch not found"))
+          (t
+           (list 200
+                 (list :content-type "application/octet-stream")
+                 (probe-file path))))))
+
 (defun handle-admin-create-software (app env)
   (unless (authorised-admin-p env app)
     (return-from handle-admin-create-software (error-response 401 "unauthorised")))
@@ -281,11 +294,50 @@
               :blob-sha256 sha :blob-size size
               :manifest-sha256 manifest-sha
               :notes notes)
-             (json-response 201
-                            (obj "release_id" release-id
-                                 "blob_sha256" sha
-                                 "blob_size" size
-                                 "manifest_sha256" manifest-sha)))))))))
+             ;; Build patches from every prior release of the same
+             ;; (software, os, arch) to this new release, then
+             ;; re-render the manifest with patches_in populated and
+             ;; re-sign.  Failures here do not roll back the publish:
+             ;; the full blob is always available as fallback.
+             (let* ((built (handler-case
+                               (ota-server.workers:build-patches-for-release
+                                (app-state-cas app)
+                                (app-state-catalogue app)
+                                :software software :os os :arch arch
+                                :new-version version
+                                :new-release-id release-id
+                                :new-blob-sha sha)
+                             (error (e)
+                               (format *error-output* "publish: patch build failed: ~A~%" e)
+                               nil)))
+                    (patches-in built))
+               (when patches-in
+                 (let* ((mp (ota-server.manifest:build-manifest-plist
+                             :software software :os os :arch arch
+                             :os-versions osversions :version version
+                             :blob-sha256 sha :blob-size size
+                             :blob-url (format nil "/v1/blobs/~A" sha)
+                             :notes notes
+                             :patches-in patches-in))
+                        (mb (ota-server.manifest:manifest-to-json-bytes mp))
+                        (sig2 (ota-server.manifest:sign-bytes
+                               mb
+                               (ota-server.manifest:keypair-private (app-state-keypair app))
+                               (ota-server.manifest:keypair-public  (app-state-keypair app)))))
+                   (write-bytes (merge-pathnames
+                                 (format nil "~A/~A.json" software version)
+                                 (app-state-manifests-dir app))
+                                mb)
+                   (write-bytes (merge-pathnames
+                                 (format nil "~A/~A.sig" software version)
+                                 (app-state-manifests-dir app))
+                                sig2)))
+               (json-response 201
+                              (obj "release_id" release-id
+                                   "blob_sha256" sha
+                                   "blob_size" size
+                                   "manifest_sha256" manifest-sha
+                                   "patches_built" (length patches-in)))))))))))
 
 (defun write-body-to-tmp (env cas)
   "Stream the request body into a temp file under the CAS."
@@ -378,6 +430,7 @@
                  (:get-release            (handle-get-release state params))
                  (:get-manifest           (handle-get-manifest state params))
                  (:get-blob               (handle-get-blob state params))
+                 (:get-patch              (handle-get-patch state params))
                  (:admin-create-software  (handle-admin-create-software state env))
                  (:admin-publish-release  (handle-admin-publish-release state env params))
                  (:events-install         (handle-events-install state env)))

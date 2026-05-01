@@ -13,6 +13,8 @@
            #:list-releases
            #:get-release
            #:get-latest-release
-           #:record-install-event))
+           #:record-install-event
+           #:insert-patch
+           #:list-patches-to))
 
 (in-package #:ota-server.catalogue)

@@ -28,6 +28,27 @@
     (merge-pathnames (format nil "blobs/~A/~A" prefix sha256-hex)
                      (cas-root cas))))
 
+(defun cas-patch-path (cas sha256-hex)
+  (declare (type cas cas) (type string sha256-hex))
+  (assert (= (length sha256-hex) 64))
+  (let ((prefix (subseq sha256-hex 0 2)))
+    (merge-pathnames (format nil "patches/~A/~A" prefix sha256-hex)
+                     (cas-root cas))))
+
+(defun has-patch (cas sha256-hex)
+  (and (probe-file (cas-patch-path cas sha256-hex)) t))
+
+(defun put-patch-from-file (cas src-pathname)
+  "Move SRC-PATHNAME into the patches CAS, returning (values sha size)."
+  (let* ((sha (sha256-hex-of-file src-pathname))
+         (dst (cas-patch-path cas sha)))
+    (ensure-directories-exist dst)
+    (cond ((probe-file dst) (delete-file src-pathname))
+          (t (sb-posix:rename (namestring src-pathname) (namestring dst))))
+    (values sha (with-open-file (in dst :direction :input
+                                        :element-type '(unsigned-byte 8))
+                  (file-length in)))))
+
 (defun has-blob (cas sha256-hex)
   (and (probe-file (cas-blob-path cas sha256-hex)) t))
 

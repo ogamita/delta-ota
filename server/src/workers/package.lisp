@@ -3,6 +3,8 @@
 
 (defpackage #:ota-server.workers
   (:use #:cl)
-  (:documentation "Ogamita Delta OTA server — workers module. Phase-0 skeleton."))
+  (:export #:build-patch-from-blobs
+           #:build-patches-for-release
+           #:*bsdiff-binary*))
 
 (in-package #:ota-server.workers)

@@ -72,29 +72,39 @@ func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, er
 	return io.ReadAll(resp.Body)
 }
 
+// DownloadPatch is like DownloadBlob but for /v1/patches/<sha>.
+func (c *Client) DownloadPatch(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
+	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/patches/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)
+}
+
 // DownloadBlob streams the blob at /v1/blobs/<sha> into dstPath,
 // verifying that the bytes hash to expectedSHA256 (hex). Returns the
 // number of bytes written. The destination is removed on hash
 // mismatch.
 func (c *Client) DownloadBlob(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
-	url := fmt.Sprintf("%s/v1/blobs/%s", c.BaseURL, sha256Hex)
+	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/blobs/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)
+}
+
+// downloadHashed is the shared implementation for DownloadBlob and
+// DownloadPatch.
+func (c *Client) downloadHashed(ctx context.Context, url, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("blob fetch: %w", err)
+		return 0, fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("blob fetch: %s", resp.Status)
+		return 0, fmt.Errorf("download: %s", resp.Status)
 	}
 
 	tmp := dstPath + ".part"
 	out, err := os.Create(tmp)
 	if err != nil {
-		return 0, fmt.Errorf("blob create: %w", err)
+		return 0, fmt.Errorf("download create: %w", err)
 	}
 	hasher := sha256.New()
 	mw := io.MultiWriter(out, hasher)
@@ -105,17 +115,17 @@ func (c *Client) DownloadBlob(ctx context.Context, sha256Hex, dstPath string, pr
 	}
 	if err != nil {
 		_ = os.Remove(tmp)
-		return written, fmt.Errorf("blob copy: %w", err)
+		return written, fmt.Errorf("download copy: %w", err)
 	}
 
 	got := hex.EncodeToString(hasher.Sum(nil))
 	if got != sha256Hex {
 		_ = os.Remove(tmp)
-		return written, fmt.Errorf("blob sha mismatch: want %s got %s", sha256Hex, got)
+		return written, fmt.Errorf("download sha mismatch: want %s got %s", sha256Hex, got)
 	}
 	if err := os.Rename(tmp, dstPath); err != nil {
 		_ = os.Remove(tmp)
-		return written, fmt.Errorf("blob rename: %w", err)
+		return written, fmt.Errorf("download rename: %w", err)
 	}
 	return written, nil
 }

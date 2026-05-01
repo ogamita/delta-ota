@@ -67,6 +67,20 @@ on every push (=tools/vendor-verify.sh=).
 | mendsley-bsdiff          | =vendor/mendsley-bsdiff/=                      | =b817e9491cf7b8699c8462ef9e2657ca4ccd7667=   | BSD-2-Clause  | 2026-05-01  | =521a835d349d6719d63b584ae2fb2875500a3febfbb2ba103baea476b3a4b012= |
 | sharplispers-archive     | =vendor/sharplispers-archive/=                 | =631271c091ed02994bec3980cb288a2cf32c7cdc=   | BSD-3-Clause  | 2026-05-01  | =9fe0bfa4e03f6eb00bf49c7e683607411b14c8ae9a0bbb6acaa85e3f3866816c= |
 | gabstv-go-bsdiff         | =client/internal/vendor/gabstv-go-bsdiff/=     | =d449682b2c4873092fdd69b3df05e17f5d38b76e=   | MIT           | 2026-05-01  | =7038306b68e82d98370777a6abc3e2e864f689e665ee46335907868f626f9b0a= |
+| dsnet-compress           | =client/internal/vendor/dsnet-compress/=       | =39efe44ab707ffd2c1ef32cc7dbebfe584718686=   | BSD-3-Clause  | 2026-05-01  | =ee15a841c143d09c352a22a9cae5956a91f96f85ee6804fd0c89f707012be3ad= |
+
+Note on bsdiff format compatibility (phase 2):
+
+- =mendsley-bsdiff= produces "ENDSLEY/BSDIFF43" patches.  Its
+  decoder is correspondingly C-only and would force a =cgo= build
+  on the client (we want pure-Go).
+- =gabstv-go-bsdiff= produces and consumes the original Colin
+  Percival "BSDIFF40" format (with bzip2 from =dsnet-compress=).
+- The server therefore builds a small first-party CLI under
+  =client/cmd/bsdiff/= that calls into =gabstv-go-bsdiff=.  Both
+  ends speak the same wire format and the client stays cgo-free.
+- =mendsley-bsdiff= remains vendored as a fallback C reference and
+  for future use, but is *not* on the active build path.
 
 ** Components considered and rejected
 

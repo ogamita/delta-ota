@@ -61,8 +61,18 @@ setup:
 vendor-verify:
 	tools/vendor-verify.sh
 
-vendor-build:
+vendor-build: $(SERVER_BUILD_DIR)/bin/bsdiff
 	$(MAKE) -f tools/vendor-build/mendsley-bsdiff.mk all
+
+# Server's patch worker uses the gabstv-go-bsdiff library via a
+# first-party CLI wrapper.  This guarantees byte-for-byte format
+# compatibility with the in-process bspatch on the Go client (both
+# emit/consume BSDIFF40+bzip2).  The mendsley C build is kept for
+# future reference and is invoked by the legacy target above.
+$(SERVER_BUILD_DIR)/bin/bsdiff:
+	@mkdir -p $(SERVER_BUILD_DIR)/bin
+	cd client && CGO_ENABLED=0 $(GO) build $(GOFLAGS) \
+	    -o ../$(SERVER_BUILD_DIR)/bin/bsdiff ./cmd/bsdiff
 
 # ---------- build ----------
 build: build-server build-admin build-client

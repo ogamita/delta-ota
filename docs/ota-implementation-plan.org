@@ -263,7 +263,7 @@ sha256 over deterministic-tar matches the published blob's sha256.
 Goal :: upgrades transfer only the binary delta; full-blob fallback
 exists and is exercised.
 
-- [ ] =Patch= entity, schema migration, =patches/= CAS directory.
+- [X] =Patch= entity, schema migration, =patches/= CAS directory.
 - [ ] *Patch builder worker* : background pool that consumes a job
   queue (in-memory for now, Postgres-backed in phase 5).  Invokes
   the *vendored* =bsdiff= binary built in phase 0
