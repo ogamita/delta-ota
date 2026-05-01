@@ -19,23 +19,94 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
-Pre-1.0 baseline. Phase-7 hardening and 1.0 cut prep:
+Nothing yet.
+
+## [1.0.0] - 2026-05-01
+
+The 1.0 cut. Public contracts (HTTP/JSON API, manifest schema,
+libota C ABI, state.json layout) frozen for the v1.x line.
 
 ### Added
-- Fuzz tests for the three client-side attack-surface entry
-  points: `manifest.Parse`, `tarx.Extract`, `patch.Apply`,
-  plus `manifest.Verify` and `tarx.safeName`. Run with
-  `go test -fuzz=Fuzz... -fuzztime=Ns ./internal/...`.
-- ADR-0005: threat-model walkthrough — 20 threats from the spec,
-  each marked Closed / Mitigated / Accepted with the disposition
-  reasoning.
-- `docs/perf.org` — performance assumptions, the strace recipe to
-  verify `sendfile` actually fires for blob downloads, sizing
-  reference, known costs (patch-builder RAM, TLS user-space copy,
-  disk-space growth model).
+- **Server** (Common Lisp / SBCL + Woo on Linux):
+  - HTTP/JSON API with kernel-level `sendfile(2)` on plain HTTP.
+  - Catalogue (SQLite by default; PG sub-phase to come).
+  - Content-addressed blob and patch storage (FS by default; S3
+    sub-phase to come).
+  - Ed25519-signed manifests with deterministic ordered-object JSON
+    encoding for byte-stable signing.
+  - Deterministic POSIX-ustar release blobs.
+  - Synchronous bsdiff patch worker (BSDIFF40 + bzip2) building a
+    patch from every prior release of the same `(software, os,
+    arch)` triple at publish time.
+  - Reverse-patch builder: `POST /v1/admin/software/{sw}/patches/reverse`.
+  - Garbage collection: `POST /v1/admin/software/{sw}/gc` with
+    `dry_run`, `min_user_count`, `min_age_days`.
+  - Storage verification: `POST /v1/admin/verify` re-hashes every
+    artefact and reports mismatches.
+  - Manifest re-sign on key rotation.
+  - Install-token mint + per-client bearer exchange:
+    `POST /v1/admin/install-tokens` (single) and
+    `POST /v1/admin/install-tokens/batch` (up to 10 000 per call).
+    `POST /v1/exchange-token` (client side).
+  - Classification-based visibility filtering on every catalogue
+    read.
+  - Audit log of every admin write: `GET /v1/admin/audit`.
+  - Recovery anchors: `GET /v1/software/{sw}/anchors` returns every
+    uncollectable release plus the latest visible one.
+  - Rate limits: in-memory token-bucket per identity (600-token
+    capacity, 10 tokens/sec refill); returns 429 + `Retry-After`.
+  - Optional TLS via `OTA_TLS_CERT` / `OTA_TLS_KEY`.
+  - HTML install page at `GET /v1/install/{sw}`.
+- **Client** (Go, cgo-free, single static binary per OS):
+  - `ota-agent install / upgrade / revert / doctor / watch`.
+  - `doctor --recover=<version>` for multi-step rollback to any
+    server-curated anchor.
+  - `watch --interval=24h --once` polling daemon for cron / systemd
+    / launchd / Windows Task Scheduler.
+  - `libota` exported as a C-ABI shared library (`-buildmode=c-shared`)
+    and static archive (`-buildmode=c-archive`); five entry points
+    (`ota_install / ota_upgrade / ota_revert / ota_version /
+    ota_last_error`) plus generated `libota.h`.
+  - Platform abstraction with symlink-or-shim `current` link
+    (Windows non-admin/non-developer-mode falls back to `current.path`).
+  - In-process bspatch (vendored `gabstv-go-bsdiff`).
+  - Safe tar extractor (rejects `..`, NUL, absolute paths, Windows
+    reserved names).
+  - Atomic switch-over with absolute-target symlinks.
+- **Admin CLI** (`ota-admin`):
+  - `publish <dir>`: tars the source with the deterministic writer
+    and uploads.
+  - `mint-tokens --csv users.csv [--classifications=...] [--ttl=7d]`:
+    bulk install-token issuance; emits a TSV ready for mail merge.
+- **Tooling**:
+  - `tools/backup.sh` / `tools/restore.sh` for full-root tarball
+    backup with SHA-256 sidecar.
+  - `tools/vendor-import.sh` / `tools/vendor-verify.sh` for
+    permissive-only vendoring.
+  - `tools/check-licence-headers.sh` for SPDX enforcement.
+  - `tools/check-self-contained.sh` to assert no third-party dynamic
+    deps in the client binary.
+- **Documentation**:
+  - Specifications, implementation plan, datasheet, user manual,
+    operator runbook, performance notes, dependencies list,
+    third-party licences. All buildable as PDFs via `make docs-pdf`.
+  - Five ADRs (stack split; Woo not Hunchentoot; vendoring policy;
+    bsdiff-only / no xdelta3; threat-model walkthrough).
+  - Marketing HTML page under `marketing/`.
+- **CI**:
+  - GitLab pipeline: prepare → verify (vendor-verify, licence-headers,
+    go-vet, go-test, go-fuzz) → build (server, libota cgo,
+    client × 3 OSes × 2 arches) → test (unit + e2e: install, auth,
+    ops, recovery) → package (multi-arch server image) → publish.
+  - GitHub Actions mirror with native macOS + Windows test runners.
+- **Vendored** (all permissive licences): `mendsley/bsdiff`,
+  `gabstv/go-bsdiff`, `dsnet/compress`, `sharplispers/archive`.
+  No GPL.
 
-### Changed
-- nothing breaking.
+### Deferred to post-1.0 sub-phases
+- Mandatory mTLS for admin endpoints (cert-subject identity).
+- PostgreSQL catalogue backend (cl-sqlite → cl-dbi swap).
+- S3-compatible blob storage backend.
 
 ## Pre-1.0 history
 
