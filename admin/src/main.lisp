@@ -3,7 +3,7 @@
 
 (defpackage #:ota-admin
   (:use #:cl)
-  (:export #:main #:publish))
+  (:export #:main #:publish #:mint-tokens-from-csv))
 
 (in-package #:ota-admin)
 
@@ -45,13 +45,94 @@
           (uiop:quit 1))
         resp))))
 
+(defun parse-ttl (s)
+  "Parse a TTL like \"7d\", \"3h\", \"45m\", \"60s\" into seconds."
+  (when (zerop (length s)) (return-from parse-ttl nil))
+  (let* ((unit (char s (1- (length s))))
+         (n (parse-integer s :end (1- (length s)) :junk-allowed t)))
+    (case unit
+      (#\s n)
+      (#\m (* n 60))
+      (#\h (* n 3600))
+      (#\d (* n 86400))
+      (t (parse-integer s)))))
+
+(defun split-csv-line (line)
+  (loop with acc = '()
+        with start = 0
+        for i below (length line)
+        when (char= (char line i) #\,)
+          do (push (subseq line start i) acc)
+             (setf start (1+ i))
+        finally (push (subseq line start) acc)
+                (return (nreverse acc))))
+
+(defun mint-tokens-from-csv (&key csv classifications (ttl-seconds 604800)
+                                  (server "http://127.0.0.1:8080")
+                                  (token (uiop:getenv "OTA_ADMIN_TOKEN"))
+                                  (output "tokens.tsv"))
+  "Read a CSV (one identifier per line, optional second column for
+   classifications), mint one install token per line, and write a
+   TSV at OUTPUT with columns: identifier, classifications,
+   install_token, expires_at, install_url."
+  (unless token
+    (error "mint-tokens-from-csv: OTA_ADMIN_TOKEN env var or :token argument required"))
+  (let ((lines '()))
+    (with-open-file (in csv :direction :input)
+      (loop for line = (read-line in nil nil) while line
+            for s = (string-trim '(#\Space #\Tab #\Return) line)
+            when (and (plusp (length s)) (not (char= (char s 0) #\#)))
+              do (push s lines)))
+    (with-open-file (out output :direction :output :if-exists :supersede)
+      (format out "identifier~Cclassifications~Cinstall_token~Cexpires_at~Cinstall_url~%"
+              #\Tab #\Tab #\Tab #\Tab)
+      (dolist (line (nreverse lines))
+        (let* ((cells (split-csv-line line))
+               (identifier (first cells))
+               (cls-from-csv (second cells))
+               (cls (or (and cls-from-csv (split-string cls-from-csv #\;))
+                        classifications
+                        '("public")))
+               (resp (dexador:post
+                      (format nil "~A/v1/admin/install-tokens" server)
+                      :headers (list (cons "Authorization" (format nil "Bearer ~A" token))
+                                     (cons "Content-Type" "application/json"))
+                      :content (com.inuoe.jzon:stringify
+                                (let ((h (make-hash-table :test 'equal)))
+                                  (setf (gethash "classifications" h)
+                                        (coerce cls 'vector))
+                                  (setf (gethash "ttl_seconds" h) ttl-seconds)
+                                  h))))
+               (parsed (com.inuoe.jzon:parse resp))
+               (tok    (gethash "install_token" parsed))
+               (exp    (gethash "expires_at"    parsed))
+               (url    (format nil "~A/v1/install/SOFTWARE?token=~A" server tok)))
+          (format out "~A~C~{~A~^;~}~C~A~C~A~C~A~%"
+                  identifier #\Tab cls #\Tab tok #\Tab exp #\Tab url)
+          (format t "minted: ~A~%" identifier))))
+    (format t "wrote ~A~%" output)))
+
+(defun split-string (s sep)
+  (loop with acc = '()
+        with start = 0
+        for i below (length s)
+        when (char= (char s i) sep)
+          do (push (subseq s start i) acc)
+             (setf start (1+ i))
+        finally (push (subseq s start) acc)
+                (return (nreverse acc))))
+
 (defun usage ()
   (format *error-output*
 "ota-admin — Ogamita Delta OTA admin CLI
 
 Usage:
   ota-admin publish <dir> --software=NAME --version=X --os=OS --arch=ARCH
-                          [--os-versions=12,13] [--server=URL]
+                          [--os-versions=12,13] [--classifications=stable]
+                          [--server=URL]
+
+  ota-admin mint-tokens --csv=PATH --classifications=stable [--ttl=7d]
+                        [--server=URL] [--output=tokens.tsv]
 
 Environment:
   OTA_ADMIN_TOKEN   bearer token for admin auth (required)
@@ -75,6 +156,18 @@ Environment:
 (defun main (&rest argv)
   (let ((argv (or argv (uiop:command-line-arguments))))
     (cond ((or (null argv) (string= (first argv) "help")) (usage))
+          ((string= (first argv) "mint-tokens")
+           (let ((rest (rest argv)))
+             (mint-tokens-from-csv
+              :csv (or (get-flag rest "csv")
+                       (progn (format *error-output* "missing --csv~%") (uiop:quit 2)))
+              :classifications (let ((c (get-flag rest "classifications")))
+                                 (when c (split-string c #\,)))
+              :ttl-seconds (or (parse-ttl (or (get-flag rest "ttl") "")) 604800)
+              :server (or (get-flag rest "server")
+                          (uiop:getenv "OTA_SERVER")
+                          "http://127.0.0.1:8080")
+              :output (or (get-flag rest "output") "tokens.tsv"))))
           ((string= (first argv) "publish")
            (let ((rest (rest argv)))
              (publish :dir (or (first (positional-args rest))

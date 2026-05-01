@@ -59,7 +59,9 @@ func main() {
 		revertCmd(flag.Args()[1:])
 	case "doctor":
 		doctorCmd(flag.Args()[1:])
-	case "list", "show", "verify", "prune", "watch":
+	case "watch":
+		watchCmd(flag.Args()[1:])
+	case "list", "show", "verify", "prune":
 		fmt.Fprintf(os.Stderr, "ota-agent: %q not implemented yet\n", flag.Arg(0))
 		os.Exit(1)
 	default:
@@ -176,6 +178,53 @@ func upgradeCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("upgraded %s to %s\n", name, v)
+}
+
+// watchCmd runs `ota-agent upgrade <name> --to=latest` on a fixed
+// interval, sleeping in between. Designed to be run as a long-lived
+// foreground process under cron / systemd / launchd / Windows Task
+// Scheduler.  --once exits after a single check.
+func watchCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL")
+	interval := fs.Duration("interval", 24*time.Hour, "polling interval")
+	once := fs.Bool("once", false, "check once and exit")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "watch: missing <name>")
+		os.Exit(2)
+	}
+	name := fs.Arg(0)
+	server := *srv
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "watch: --server or $OTA_SERVER required")
+		os.Exit(2)
+	}
+	cfg := libota.Config{
+		ServerURL:      strings.TrimRight(server, "/"),
+		OTAHome:        os.Getenv("OTA_HOME"),
+		TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
+	}
+	check := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		v, err := libota.Upgrade(ctx, cfg, name, "latest")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] watch: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+			return
+		}
+		fmt.Printf("[%s] %s @ %s\n", time.Now().UTC().Format(time.RFC3339), name, v)
+	}
+	check()
+	if *once {
+		return
+	}
+	tick := time.NewTicker(*interval)
+	defer tick.Stop()
+	for range tick.C {
+		check()
+	}
 }
 
 func doctorCmd(args []string) {

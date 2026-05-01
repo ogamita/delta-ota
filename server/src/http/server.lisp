@@ -16,7 +16,12 @@
   ;; phase-4
   (default-client-classifications #("public") :type vector)
   tls-cert
-  tls-key)
+  tls-key
+  ;; phase-7-followup: in-memory token-bucket rate limit per identity.
+  ;; KEY = client_id|"admin"|"anon-<ip>", VALUE = (cons tokens last-refill).
+  (rate-buckets (make-hash-table :test 'equal :synchronized t))
+  (rate-capacity 600)              ; tokens
+  (rate-refill-per-sec 10))        ; tokens/sec
 
 (defparameter *app* nil)
 
@@ -54,6 +59,9 @@
   (cond
     ((and (eq method :get) (equal segments '("v1" "health")))
      :health)
+    ((and (eq method :get) (= 3 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "install"))
+     (values :install-page (list :software (third segments))))
     ((and (eq method :get) (equal segments '("v1" "software")))
      :list-software)
     ((and (eq method :get) (= 3 (length segments))
@@ -94,6 +102,8 @@
      :exchange-token)
     ((and (eq method :post) (equal segments '("v1" "admin" "install-tokens")))
      :admin-mint-install-token)
+    ((and (eq method :post) (equal segments '("v1" "admin" "install-tokens" "batch")))
+     :admin-mint-install-tokens-batch)
     ((and (eq method :get) (equal segments '("v1" "admin" "audit")))
      :admin-list-audit)
     ((and (eq method :post) (= 5 (length segments))
@@ -112,6 +122,12 @@
           (equal (nth 6 segments) "uncollectable"))
      (values :admin-mark-uncollectable
              (list :software (fourth segments) :version (nth 5 segments))))
+    ((and (eq method :post) (= 6 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "software") (equal (fifth segments) "patches")
+          (equal (nth 5 segments) "reverse"))
+     (values :admin-build-reverse-patch
+             (list :software (fourth segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -158,6 +174,39 @@
                       :classifications (app-state-default-client-classifications app)
                       :client-id nil))))))))
 
+(defun rate-allow-p (app key)
+  "Token-bucket rate limiter, in-memory, per APP-keyed identity.
+   Returns T if KEY may make one more request, NIL if rate-limited."
+  (let* ((cap (app-state-rate-capacity app))
+         (refill (app-state-rate-refill-per-sec app))
+         (buckets (app-state-rate-buckets app))
+         (now (get-internal-real-time))
+         (units internal-time-units-per-second)
+         (cell (gethash key buckets)))
+    (multiple-value-bind (tokens last)
+        (if cell (values (car cell) (cdr cell)) (values cap now))
+      (let* ((elapsed-sec (/ (- now last) units))
+             (refilled (min cap (+ tokens (* elapsed-sec refill)))))
+        (cond ((>= refilled 1)
+               (setf (gethash key buckets) (cons (- refilled 1) now))
+               t)
+              (t
+               (setf (gethash key buckets) (cons refilled now))
+               nil))))))
+
+(defun rate-limit-key (env identity)
+  (or (getf identity :client-id)
+      (let ((ra (or (getf env :remote-addr)
+                    (and (getf env :headers)
+                         (header-of (getf env :headers) "x-forwarded-for")))))
+        (concatenate 'string "anon-" (or ra "?")))))
+
+(defun rate-limited-response ()
+  (list 429
+        (list :content-type "application/json; charset=utf-8"
+              :|retry-after| "1")
+        (list (encode-json-string (obj "error" "rate limited")))))
+
 (defun classification-match-p (identity-classifications release-classifications)
   "True if the identity is allowed to see the release.  An admin
    (:all) sees everything.  Any other identity must share at least
@@ -183,6 +232,79 @@
 
 (defun handle-health ()
   (json-response 200 (obj "status" "ok")))
+
+(defun detect-os (env)
+  (let* ((headers (getf env :headers))
+         (ua (or (header-of headers "user-agent") "")))
+    (cond ((search "Windows" ua) "windows")
+          ((or (search "Mac OS" ua) (search "Macintosh" ua)) "macos")
+          ((search "Linux" ua) "linux")
+          (t "linux"))))
+
+(defun handle-install-page (app env params)
+  "A minimal HTML install page.  Detects the OS from the User-Agent,
+   tells the user the one-line CLI to run, and offers the agent
+   binary download.  An admin must mint and embed the install token
+   server-side (or hand-out token URLs from a separate flow) — this
+   page itself does not require auth, so it cannot mint tokens."
+  (declare (ignore env))
+  (let* ((sw (getf params :software))
+         (host (or (app-state-hostname app) "localhost")))
+    (list 200
+          (list :content-type "text/html; charset=utf-8")
+          (list (install-page-html sw host)))))
+
+(defun install-page-html (software hostname)
+  (format nil "<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\">
+<title>Install ~A</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+       max-width: 720px; margin: 4rem auto; padding: 0 1rem;
+       color: #222; line-height: 1.5; }
+h1 { font-size: 1.6rem; }
+code { background: #f4f4f4; padding: 0.15rem 0.35rem; border-radius: 3px; }
+pre { background: #f4f4f4; padding: 1rem; border-radius: 6px;
+      overflow-x: auto; }
+.btn { display: inline-block; background: #0a64a4; color: white;
+       padding: 0.5rem 1rem; border-radius: 4px; text-decoration: none; }
+small { color: #666; }
+</style>
+</head><body>
+<h1>Install ~A</h1>
+<p>Welcome.  This page guides you through installing
+<strong>~A</strong> on your workstation.</p>
+
+<h2>1. Get the agent</h2>
+<p>Download the <code>ota-agent</code> binary for your operating system:</p>
+<p><a class=\"btn\" href=\"https://~A/downloads/ota-agent-linux-amd64\">Linux (amd64)</a>
+   <a class=\"btn\" href=\"https://~A/downloads/ota-agent-darwin-arm64\">macOS</a>
+   <a class=\"btn\" href=\"https://~A/downloads/ota-agent-windows-amd64.exe\">Windows</a></p>
+
+<h2>2. Get an install token</h2>
+<p>Your administrator will email you a one-shot install token —
+or paste one provided to you below.</p>
+
+<h2>3. Install</h2>
+<p>Run the following command, substituting your install token:</p>
+<pre>ota-agent install ~A \\
+    --server https://~A \\
+    --install-token YOUR_TOKEN \\
+    --latest</pre>
+
+<p><small>Once the agent is running it will fetch the latest release,
+verify the publisher's signature, install the software, and atomically
+flip your <code>current</code> pointer.  Every subsequent run upgrades
+incrementally — typically a small fraction of the full payload.</small></p>
+
+<hr>
+<small>Powered by <a href=\"https://gitlab.com/ogamita/delta-ota\">Ogamita Delta OTA</a> &middot;
+<a href=\"https://~A/v1/health\">server health</a></small>
+</body></html>~%"
+          software software software
+          hostname hostname hostname
+          software hostname
+          hostname))
 
 (defun handle-list-software (app)
   (let ((items (mapcar #'plist-to-json-software
@@ -539,6 +661,43 @@
        :target nil :detail (format nil "ttl=~A" ttl))
       (json-response 201 (obj "install_token" token "expires_at" expires)))))
 
+(defparameter *batch-mint-cap* 10000
+  "Hard ceiling on the number of tokens a single batch call may
+   mint, to keep the server's audit log and DB write path sane.")
+
+(defun handle-admin-mint-install-tokens-batch (app env)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-mint-install-tokens-batch (error-response 401 "unauthorised")))
+  (let* ((body (read-request-body-bytes env))
+         (json (and body (ignore-errors
+                           (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8)))))
+         (count (or (and (hash-table-p json) (gethash "count" json)) 1))
+         (cls (or (and (hash-table-p json) (gethash "classifications" json))
+                  #("public")))
+         (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json)) 604800)))
+    (cond
+      ((or (not (integerp count)) (< count 1))
+       (error-response 400 "count must be a positive integer"))
+      ((> count *batch-mint-cap*)
+       (error-response 400 (format nil "count exceeds cap of ~A" *batch-mint-cap*)))
+      (t
+       (let ((tokens (loop repeat count collect
+                           (multiple-value-bind (token expires)
+                               (ota-server.catalogue:mint-install-token
+                                (app-state-catalogue app)
+                                :classifications cls
+                                :ttl-seconds ttl
+                                :created-by "admin")
+                             (obj "install_token" token "expires_at" expires)))))
+         (ota-server.catalogue:append-audit
+          (app-state-catalogue app)
+          :identity "admin" :action "mint-install-tokens-batch"
+          :target nil :detail (format nil "count=~A ttl=~A" count ttl))
+         (json-response 201
+                        (obj "count"  count
+                             "tokens" (coerce tokens 'vector))))))))
+
 (defun handle-admin-list-audit (app env)
   (unless (authorised-admin-p env app)
     (return-from handle-admin-list-audit (error-response 401 "unauthorised")))
@@ -555,6 +714,51 @@
                             "at" (getf r :at)))
                      rows)
                     'vector))))
+
+(defun handle-admin-build-reverse-patch (app env params)
+  "Build an on-demand reverse patch from `from`->`to` (where `from`
+   is the newer version), useful for the recovery tool to
+   downgrade with bandwidth savings.  Body: {from: ver, to: ver}."
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-build-reverse-patch (error-response 401 "unauthorised")))
+  (let* ((body (read-request-body-bytes env))
+         (json (and body (ignore-errors
+                           (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8)))))
+         (from-v (and (hash-table-p json) (gethash "from" json)))
+         (to-v   (and (hash-table-p json) (gethash "to"   json)))
+         (sw     (getf params :software)))
+    (cond
+      ((or (null from-v) (null to-v))
+       (error-response 400 "both 'from' and 'to' versions required"))
+      (t
+       (let ((from-rel (ota-server.catalogue:get-release
+                        (app-state-catalogue app) sw from-v))
+             (to-rel   (ota-server.catalogue:get-release
+                        (app-state-catalogue app) sw to-v)))
+         (cond
+           ((or (null from-rel) (null to-rel))
+            (error-response 404 "release(s) not found"))
+           (t
+            (multiple-value-bind (sha size)
+                (ota-server.workers:build-patch-from-blobs
+                 (app-state-cas app) (app-state-catalogue app)
+                 :from-release-id (getf from-rel :release-id)
+                 :to-release-id   (getf to-rel   :release-id)
+                 :from-blob-sha   (getf from-rel :blob-sha256)
+                 :to-blob-sha     (getf to-rel   :blob-sha256))
+              (ota-server.catalogue:append-audit
+               (app-state-catalogue app)
+               :identity "admin" :action "build-reverse-patch"
+               :target (format nil "~A->~A" from-v to-v)
+               :detail (format nil "size=~A" size))
+              (json-response 201
+                             (obj "from"    from-v
+                                  "to"      to-v
+                                  "patcher" "bsdiff"
+                                  "sha256"  sha
+                                  "size"    size
+                                  "url"     (format nil "/v1/patches/~A" sha)))))))))))
 
 (defun handle-admin-mark-uncollectable (app env params)
   (unless (authorised-admin-p env app)
@@ -703,10 +907,16 @@
       (multiple-value-bind (route params) (match-route method segments)
         (cond
           ((null route) (error-response 404 "no such route" path))
+          ((and (not (eq route :health))
+                (not (rate-allow-p state
+                                   (rate-limit-key
+                                    env (resolve-identity env state)))))
+           (rate-limited-response))
           (t
            (handler-case
                (case route
                  (:health                       (handle-health))
+                 (:install-page                 (handle-install-page state env params))
                  (:list-software                (handle-list-software state))
                  (:get-software                 (handle-get-software state params))
                  (:list-releases                (handle-list-releases state env params))
@@ -718,11 +928,13 @@
                  (:admin-create-software        (handle-admin-create-software state env))
                  (:admin-publish-release        (handle-admin-publish-release state env params))
                  (:admin-mint-install-token     (handle-admin-mint-install-token state env))
+                 (:admin-mint-install-tokens-batch (handle-admin-mint-install-tokens-batch state env))
                  (:admin-list-audit             (handle-admin-list-audit state env))
                  (:admin-gc                     (handle-admin-gc state env params))
                  (:admin-verify                 (handle-admin-verify state env))
                  (:get-anchors                  (handle-get-anchors state env params))
                  (:admin-mark-uncollectable     (handle-admin-mark-uncollectable state env params))
+                 (:admin-build-reverse-patch    (handle-admin-build-reverse-patch state env params))
                  (:exchange-token               (handle-exchange-token state env))
                  (:events-install               (handle-events-install state env)))
              (error (e)

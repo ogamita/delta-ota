@@ -165,6 +165,7 @@ ORG_FILES := \
     $(DOCS_DIR)/operations.org                   \
     $(DOCS_DIR)/delta-ota-datasheet.org          \
     $(DOCS_DIR)/delta-ota-user-manual.org        \
+    $(DOCS_DIR)/delta-ota-executive-summary.org  \
     $(DOCS_DIR)/dependencies.org                 \
     $(DOCS_DIR)/THIRD_PARTY_LICENSES.org         \
     $(DOCS_DIR)/perf.org

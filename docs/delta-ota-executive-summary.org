@@ -1,0 +1,70 @@
+#+TITLE: Ogamita Delta OTA — Executive Summary
+#+SUBTITLE: One page for decision-makers
+#+AUTHOR: Ogamita Ltd.
+#+EMAIL: sales@ogamita.com
+#+OPTIONS: toc:nil num:nil
+
+* The problem
+
+Shipping software to thousands of users with multi-GB binaries is
+expensive, slow, and fragile.  Vanilla auto-updaters re-download
+the *whole* payload at every release — typically 1 to 4 GB per
+user per month.  CDNs make distribution cheap for the publisher,
+but they do nothing about the bandwidth and time each user loses.
+Users on flaky Wi-Fi, constrained corporate VPNs, or laptops with
+intermittent connectivity fall behind, get stuck on broken
+intermediate states, and eventually stop updating.
+
+* The product
+
+*Ogamita Delta OTA* is an over-the-air software-distribution system
+that ships *the change between two releases, not the whole release*.
+A typical 2 GB monthly upgrade transfers about 20 MB —
+roughly *1 % of a full re-install*.  The client-side library is a
+single self-contained binary per OS (Windows, macOS, Linux), with
+no DLL hell, no admin rights required, and no runtime to install.
+A failed download or interrupted patch never breaks the running
+installation : the agent only flips the active distribution once
+the new bytes have been fully validated on disk.
+
+* What you get
+
+- *Server* (Linux x86_64 / arm64, single host or Kubernetes) :
+  HTTP/JSON API, kernel-level zero-copy delivery (=sendfile=),
+  Ed25519-signed manifests, multi-arch container image.
+- *Client* : embeddable C-ABI library + single-file CLI.  No
+  =cgo=, no OpenSSL DLL, no installer.
+- *Operations* : garbage collection, content-integrity
+  verification, audit log, install-token bulk issuance, recovery
+  rollback to known-good "anchor" releases.
+- *Documentation* : datasheet, user manual, operator runbook,
+  performance recipe — all generated as PDFs.
+
+* Numbers that matter
+
+| Metric                                  | Value                                    |
+|-----------------------------------------+------------------------------------------|
+| Typical upgrade transfer                | ~1 % of full blob size                   |
+| Cold-install full transfer              | up to 8 GB (configurable cap)            |
+| 10 000 upgrading clients @ 09:00        | ~200 GB egress over ~80 s on 2×10 GbE    |
+| Client binary size                      | ~10 MB                                   |
+| Client runtime dependencies             | *none*                                   |
+| Server tested on                        | Linux amd64, Linux arm64                 |
+| Cross-platform unit-test runners        | Linux + macOS + Windows (CI)             |
+
+* Licensing
+
+Dual licence : *AGPL-3.0-or-later* for open-source distribution;
+*commercial licences from Ogamita Ltd.* for proprietary
+distribution and SLA-backed support.
+
+| Channel             | Address                                      |
+|---------------------+----------------------------------------------|
+| Sales / commercial  | [[mailto:sales@ogamita.com][sales@ogamita.com]]                            |
+| Technical support   | [[mailto:support@ogamita.com][support@ogamita.com]]                          |
+| Source              | [[https://gitlab.com/ogamita/delta-ota]]         |
+| Container registry  | =registry.gitlab.com/ogamita/delta-ota=      |
+
+For the system limits and operational figures, see the
+[[file:delta-ota-datasheet.org][datasheet]].  For the deployment, configuration, and day-to-day
+operational procedures, see the [[file:operations.org][operator runbook]].
