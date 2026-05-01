@@ -55,5 +55,8 @@ RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp 
 ENV GOPATH=/go
 ENV PATH=/go/bin:/usr/local/go/bin:${PATH}
 ENV CGO_ENABLED=0
+# Quicklisp is installed at /opt/quicklisp; build.lisp finds setup.lisp
+# at $(QUICKLISP_HOME)/quicklisp/setup.lisp -> /opt/quicklisp/setup.lisp.
+ENV QUICKLISP_HOME=/opt
 
 WORKDIR /workspace

@@ -151,8 +151,9 @@ build-server:
 build-client-linux:
   <<: *go-cross
   script:
-    - (cd client && GOOS=linux GOARCH=amd64 go build $GOFLAGS -o ../client/build/linux-amd64/ ./agent ./libota)
-    - (cd client && GOOS=linux GOARCH=arm64 go build $GOFLAGS -o ../client/build/linux-arm64/ ./agent ./libota)
+    - mkdir -p client/build/linux-amd64 client/build/linux-arm64
+    - (cd client && GOOS=linux GOARCH=amd64 go build $GOFLAGS -o ../client/build/linux-amd64/ota-agent       ./agent)
+    - (cd client && GOOS=linux GOARCH=arm64 go build $GOFLAGS -o ../client/build/linux-arm64/ota-agent       ./agent)
   artifacts:
     paths:
       - client/build/linux-*/
@@ -161,8 +162,9 @@ build-client-linux:
 build-client-darwin:
   <<: *go-cross
   script:
-    - (cd client && GOOS=darwin GOARCH=amd64 go build $GOFLAGS -o ../client/build/darwin-amd64/ ./agent ./libota)
-    - (cd client && GOOS=darwin GOARCH=arm64 go build $GOFLAGS -o ../client/build/darwin-arm64/ ./agent ./libota)
+    - mkdir -p client/build/darwin-amd64 client/build/darwin-arm64
+    - (cd client && GOOS=darwin GOARCH=amd64 go build $GOFLAGS -o ../client/build/darwin-amd64/ota-agent     ./agent)
+    - (cd client && GOOS=darwin GOARCH=arm64 go build $GOFLAGS -o ../client/build/darwin-arm64/ota-agent     ./agent)
   artifacts:
     paths:
       - client/build/darwin-*/
@@ -171,7 +173,8 @@ build-client-darwin:
 build-client-windows:
   <<: *go-cross
   script:
-    - (cd client && GOOS=windows GOARCH=amd64 go build $GOFLAGS -o ../client/build/windows-amd64/ ./agent ./libota)
+    - mkdir -p client/build/windows-amd64
+    - (cd client && GOOS=windows GOARCH=amd64 go build $GOFLAGS -o ../client/build/windows-amd64/ota-agent.exe ./agent)
   artifacts:
     paths:
       - client/build/windows-*/
