@@ -23,6 +23,12 @@
            #:get-client-by-token
            #:touch-client
            #:append-audit
-           #:list-audit))
+           #:list-audit
+           ;; phase-5 ops
+           #:count-users-at-release
+           #:delete-release
+           #:delete-patches-touching
+           #:list-patches-by-from-or-to
+           #:count-releases-using-blob))
 
 (in-package #:ota-server.catalogue)

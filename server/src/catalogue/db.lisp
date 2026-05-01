@@ -241,6 +241,54 @@
    "INSERT INTO audit_log (identity, action, target, detail, at) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
    identity action target detail))
 
+;; ---------------- Phase-5 operations ----------------
+
+(defun count-users-at-release (db software-name release-id &key (window-days 180))
+  "Number of distinct clients whose latest successful install_event
+   for SOFTWARE-NAME points at RELEASE-ID and is within the recency
+   window. Approximate by design (uninstalls aren't reported)."
+  (let* ((cutoff-univ (- (get-universal-time)
+                         (* window-days 86400)))
+         (cutoff-iso (universal-to-iso8601 cutoff-univ))
+         (rows (sqlite:execute-to-list
+                db
+                "SELECT COUNT(DISTINCT client_id)
+                   FROM install_events
+                  WHERE software_name = ?
+                    AND release_id    = ?
+                    AND status        = 'ok'
+                    AND at           >= ?"
+                software-name release-id cutoff-iso)))
+    (or (caar rows) 0)))
+
+(defun count-releases-using-blob (db blob-sha256)
+  "How many releases reference this blob hash."
+  (caar (sqlite:execute-to-list
+         db "SELECT COUNT(*) FROM releases WHERE blob_sha256 = ?"
+         blob-sha256)))
+
+(defun list-patches-by-from-or-to (db release-id)
+  (mapcar (lambda (row)
+            (destructuring-bind (sha from-id to-id patcher size) row
+              (list :sha256 sha :from-release-id from-id
+                    :to-release-id to-id :patcher patcher :size size)))
+          (sqlite:execute-to-list
+           db
+           "SELECT sha256, from_release_id, to_release_id, patcher, size
+              FROM patches
+             WHERE from_release_id = ? OR to_release_id = ?"
+           release-id release-id)))
+
+(defun delete-patches-touching (db release-id)
+  (sqlite:execute-non-query
+   db "DELETE FROM patches WHERE from_release_id = ? OR to_release_id = ?"
+   release-id release-id))
+
+(defun delete-release (db software-name version)
+  (sqlite:execute-non-query
+   db "DELETE FROM releases WHERE software_name = ? AND version = ?"
+   software-name version))
+
 (defun list-audit (db &optional (limit 100))
   (mapcar (lambda (row)
             (destructuring-bind (id identity action target detail at) row

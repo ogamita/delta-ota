@@ -226,11 +226,13 @@ e2e:
   script:
     - tests/e2e/run.sh
     - tests/e2e/auth.sh
+    - tests/e2e/ops.sh
   artifacts:
     when: always
     paths:
       - tests/e2e/run/logs/
       - tests/e2e/run-auth/logs/
+      - tests/e2e/run-ops/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

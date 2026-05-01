@@ -1,0 +1,283 @@
+#+TITLE: delta-ota — Operations Runbook
+#+AUTHOR: Ogamita Ltd.
+#+OPTIONS: toc:2 num:t
+
+This is the operator's reference. Day-to-day actions an SRE needs:
+deploy, configure, garbage-collect, verify integrity, rotate keys,
+back up, restore.
+
+* Deployment topologies
+
+Two supported topologies (see [[file:ota-specifications.org][ota-specifications.org]] for the
+architectural detail):
+
+1. *Single dedicated host* — typical for customer-hosted
+   deployments.  SQLite catalogue, filesystem blob storage, systemd
+   unit, OS-managed TLS certificates.  This is the default.
+
+2. *Kubernetes* — for cloud deployments.  PostgreSQL for the
+   catalogue, S3 / S3-compatible (MinIO, AWS S3, …) for blobs and
+   patches, the server image scales horizontally behind a load
+   balancer.
+
+The same container image (=registry.gitlab.com/ogamita/delta-ota/server=)
+serves both topologies; the storage and database backends are
+selected in =ota.toml= via the =[storage]= and =[catalogue]= sections.
+
+** Prerequisites
+
+- Linux host (server is Linux-only — Woo + libev).
+- For SQLite topology: a writable data directory, the vendored
+  =bsdiff= helper at =/opt/ota/bin/bsdiff=.
+- For PostgreSQL topology: PG ≥ 14; the catalogue migrations are
+  applied automatically on first boot.
+
+** Quick start — single host
+
+#+begin_src sh
+# 1. unpack the release tarball
+sudo mkdir -p /opt/ota /var/lib/ota /etc/ota
+sudo tar -C /opt/ota -xzf delta-ota-server-X.Y.Z.tar.gz
+
+# 2. drop in a config
+sudo install -m 0640 etc/ota.toml.sample /etc/ota/ota.toml
+sudoedit /etc/ota/ota.toml             # set admin_token, hostname
+
+# 3. systemd
+sudo install -m 0644 etc/ota-server.service /etc/systemd/system/
+sudo systemctl enable --now ota-server
+#+end_src
+
+* Configuration
+
+Single TOML file (=ota.toml=).  Reload requires a restart for v1.
+
+| Section            | Key             | Default                | Notes |
+|--------------------+-----------------+------------------------+-------|
+| =[server]=         | =listen=        | =0.0.0.0:8443=         | host:port |
+| =[server]=         | =hostname=      | =localhost=            | used in URLs/manifests |
+| =[server]=         | =data_dir=      | =/var/lib/ota=         | OTA root |
+| =[server]=         | =log_level=     | =info=                 | trace/debug/info/warn |
+| =[tls]=            | =cert=, =key=   | unset                  | optional; otherwise plain HTTP |
+| =[catalogue]=      | =db=            | =sqlite:db/ota.db=     | =postgres://...= for PG |
+| =[storage]=        | =backend=       | =fs=                   | =fs= (only one in v1) |
+| =[patcher]=        | =default=       | =bsdiff=               | bsdiff is the only patcher in v1 (ADR-0004) |
+| =[patcher]=        | =bsdiff_path=   | =/opt/ota/bin/bsdiff=  | absolute path; never =$PATH= |
+
+Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
+=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=.
+
+* Day-to-day operations
+
+** Publish a release
+
+From a developer workstation that has =ota-admin= installed:
+
+#+begin_src sh
+export OTA_SERVER=https://ota.example.com
+export OTA_ADMIN_TOKEN=$(pass show ota/admin)
+
+ota-admin publish ./build/release/      \
+    --software=schms                    \
+    --version=3.4.1                     \
+    --os=windows --arch=x86_64          \
+    --os-versions=10,11
+#+end_src
+
+The server hashes the payload, stores the blob, builds patches from
+every prior release of the same =(software, os, arch)= triple, and
+re-signs the manifest.
+
+** Mint an install token
+
+Required for first-time installs by an unmanaged client:
+
+#+begin_src sh
+curl -X POST                                        \
+     -H "Authorization: Bearer $OTA_ADMIN_TOKEN"    \
+     -H "Content-Type: application/json"            \
+     -d '{"classifications":["public"],"ttl_seconds":900}'  \
+     https://ota.example.com/v1/admin/install-tokens
+#+end_src
+
+The token is one-shot and short-TTL.  The user pastes it into
+=ota-agent install ... --install-token=<token>=, which exchanges it
+for a per-workstation bearer that is persisted in =state.json=.
+
+** Garbage-collect old releases
+
+Drops releases that are not =uncollectable=, not the latest in their
+software, have ≤ =min_user_count= clients in the recency window, and
+have been published longer than =min_age_days=.
+
+#+begin_src sh
+# Dry-run first.
+curl -X POST                                                 \
+     -H "Authorization: Bearer $OTA_ADMIN_TOKEN"             \
+     -H "Content-Type: application/json"                     \
+     -d '{"dry_run": true, "min_user_count": 0, "min_age_days": 30}'  \
+     https://ota.example.com/v1/admin/software/schms/gc
+
+# Then for real.
+curl -X POST                                                 \
+     -H "Authorization: Bearer $OTA_ADMIN_TOKEN"             \
+     -H "Content-Type: application/json"                     \
+     -d '{"min_user_count": 0, "min_age_days": 30}'          \
+     https://ota.example.com/v1/admin/software/schms/gc
+#+end_src
+
+GC is idempotent and safe to schedule from cron / systemd timer.
+The blob is only deleted when no surviving release references it.
+
+** Verify storage integrity
+
+Walks every blob and patch on disk, recomputes SHA-256, reports
+mismatches.  Run from cron weekly.
+
+#+begin_src sh
+curl -X POST                                                 \
+     -H "Authorization: Bearer $OTA_ADMIN_TOKEN"             \
+     https://ota.example.com/v1/admin/verify
+#+end_src
+
+The response carries =checked=, =ok=, and =bad= (a list of
+=(path, actual, expected)= triples).  Any =bad= entry is a
+corrupted artefact and warrants an investigation /immediately/ —
+likely disk rot or a botched manual edit.
+
+** Inspect the audit log
+
+#+begin_src sh
+curl -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+     https://ota.example.com/v1/admin/audit
+#+end_src
+
+Each row records the identity (admin / client_id / "gc"), the
+action, the target, optional detail, and a UTC timestamp.
+
+* Backup and disaster recovery
+
+** Take a backup
+
+The server can keep running.  SQLite's WAL means concurrent reads
+are fine; the resulting backup is a consistent snapshot at the
+moment =cp= reaches the DB file.
+
+#+begin_src sh
+sudo tools/backup.sh /var/lib/ota /var/backups/ota
+# -> /var/backups/ota/ota-backup-20260501T184500Z.tar.gz
+# -> /var/backups/ota/ota-backup-20260501T184500Z.tar.gz.sha256
+#+end_src
+
+For PostgreSQL deployments, also run =pg_dump= and add the dump to
+the tarball.  S3-backed storage doesn't need to be in the tarball —
+the bucket itself is the backup, replicated by the cloud provider.
+
+** Restore from a backup
+
+Stops the world for the time it takes to untar.  The destination
+must be empty:
+
+#+begin_src sh
+sudo systemctl stop ota-server
+sudo tools/restore.sh ota-backup-20260501T184500Z.tar.gz /var/lib/ota
+sudo systemctl start ota-server
+
+# Verify integrity once the server is back up.
+curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+     https://ota.example.com/v1/admin/verify
+#+end_src
+
+* Key rotation
+
+The Ed25519 manifest-signing key lives at =$OTA_ROOT/etc/keys/=.
+Rotation procedure:
+
+1. Generate the new keypair (offline, on a hardened workstation):
+   #+begin_src sh
+   sbcl --non-interactive --no-userinit --no-sysinit \
+        --load ~/quicklisp/setup.lisp \
+        --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
+        --eval '(ql:quickload "ota-server" :silent t)' \
+        --eval '(let ((kp (ota-server.manifest:load-or-generate-keypair "/tmp/newkey/")))
+                  (format t "PUB=~A~%" (ota-server.manifest:keypair-public-hex kp)))'
+   #+end_src
+
+2. Distribute the *new public key* to clients via your existing
+   trust-bundle channel /before/ rotating.  Until clients trust the
+   new key, they will refuse manifests signed with it.
+
+3. Stop the server, replace =ed25519.priv= and =ed25519.pub= in
+   =$OTA_ROOT/etc/keys/=, restart.
+
+4. Re-sign every manifest in place (no manifest bytes change; only
+   the .sig files):
+   #+begin_src sh
+   sbcl --non-interactive --no-userinit --no-sysinit \
+        --load ~/quicklisp/setup.lisp \
+        --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
+        --eval '(ql:quickload "ota-server" :silent t)' \
+        --eval '(let ((kp (ota-server.manifest:load-or-generate-keypair
+                            "/var/lib/ota/etc/keys/")))
+                  (ota-server.workers:resign-manifests
+                   "/var/lib/ota/manifests/" kp))'
+   #+end_src
+
+5. Once your monitoring confirms all active clients have accepted
+   the new key, retire the old key.
+
+* TLS certificate rotation
+
+The recommended deployment terminates TLS at a reverse proxy
+(nginx, HAProxy, or a cloud LB).  When TLS is offloaded the rotation
+procedure is the proxy's, not the OTA server's.
+
+When TLS is terminated by Woo directly (=OTA_TLS_CERT= and
+=OTA_TLS_KEY= set):
+
+1. Drop the new cert/key into the configured paths.
+2. =systemctl restart ota-server=.
+
+* Sizing and tuning
+
+Steady-state numbers from the spec
+([[file:ota-specifications.org::*Performance, sizing and operational limits][Performance, sizing and operational limits]]):
+
+- 2 GB blob, monthly cadence, mostly recompiled binaries → median
+  patch size ≈ 20 MB (5–50 MB range).
+- 10 000 clients all upgrading at 09:00 Monday → 200 GB egress.
+  At 2 × 10 Gb/s the server saturates for ~80 s — acceptable
+  without explicit staggering.
+- Cold install of a 2 GB blob × 10 000 first-time clients → 20 TB
+  egress.  *This needs staggering* — install tokens are
+  rate-limited at the install page (token-bucket per channel).
+
+* Backends not yet implemented
+
+** PostgreSQL catalogue
+
+Phase-5 abstracts the catalogue behind a clean function surface
+(=ota-server.catalogue=) but the v1 implementation calls
+=cl-sqlite= directly.  Adding PG means switching to =cl-dbi= behind
+the same surface; the migration files stay valid SQL on both DBs
+(SQLite's =strftime= is the only divergence — a per-driver helper
+will hide it).  Ship target: a sub-phase between v1 and v1.1.
+
+** S3 / S3-compatible blob storage
+
+The CAS interface (=make-cas=, =put-blob-from-file=,
+=cas-blob-path=, =put-patch-from-file=) is structured to admit a
+second backend, but only the filesystem implementation exists in
+v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
+straightforward to add.  Ship target: a sub-phase, driven by the
+first customer who needs it.
+
+* Troubleshooting
+
+| Symptom                                         | Likely cause                                     | First action |
+|-------------------------------------------------+--------------------------------------------------+--------------|
+| Client gets 404 on a release that was published | Classification mismatch                          | Verify install token's classifications include the release's |
+| =manifest fetch: signature does not verify=     | Server's signing key was rotated; client has stale public key | Push new public key to clients |
+| =bsdiff= subprocess fails on publish            | Blob exceeds available RAM (= 2 × blob size)     | Stage the patch worker on a host with more RAM, or use =uncollectable= so the build is offline |
+| GC pruned a release a customer still uses       | Telemetry incomplete (no install_event)          | Re-publish the release; investigate why telemetry was missing |
+| =sendfile= path silently breaks under TLS       | TLS encryption happens in userspace              | Move TLS termination to a reverse proxy with kTLS |

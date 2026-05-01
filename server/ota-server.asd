@@ -30,8 +30,9 @@
                              (:file "db" :depends-on ("package"))))
                (:module "workers"
                 :components ((:file "package")
-                             (:file "patcher" :depends-on ("package")))
-                :depends-on ("storage" "catalogue"))
+                             (:file "patcher"    :depends-on ("package"))
+                             (:file "operations" :depends-on ("package")))
+                :depends-on ("storage" "catalogue" "manifest"))
                (:module "http"
                 :components ((:file "package")
                              (:file "server" :depends-on ("package")))

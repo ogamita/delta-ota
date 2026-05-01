@@ -96,6 +96,12 @@
      :admin-mint-install-token)
     ((and (eq method :get) (equal segments '("v1" "admin" "audit")))
      :admin-list-audit)
+    ((and (eq method :post) (= 5 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "software") (equal (fifth segments) "gc"))
+     (values :admin-gc (list :software (fourth segments))))
+    ((and (eq method :post) (equal segments '("v1" "admin" "verify")))
+     :admin-verify)
     (t nil)))
 
 (defun bearer-of (env)
@@ -540,6 +546,57 @@
                      rows)
                     'vector))))
 
+(defun handle-admin-gc (app env params)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-gc (error-response 401 "unauthorised")))
+  (let* ((body (read-request-body-bytes env))
+         (json (and body (ignore-errors
+                           (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8)))))
+         (dry-run (and (hash-table-p json) (gethash "dry_run" json)))
+         (min-users (or (and (hash-table-p json) (gethash "min_user_count" json)) 0))
+         (min-age   (or (and (hash-table-p json) (gethash "min_age_days"   json)) 30))
+         (result (ota-server.workers:gc-software
+                  (app-state-cas app)
+                  (app-state-catalogue app)
+                  (app-state-keypair app)
+                  (app-state-manifests-dir app)
+                  :software (getf params :software)
+                  :min-user-count min-users
+                  :min-age-days min-age
+                  :dry-run dry-run)))
+    (ota-server.catalogue:append-audit
+     (app-state-catalogue app)
+     :identity "admin" :action "gc"
+     :target (getf params :software)
+     :detail (format nil "pruned=~A dry_run=~A"
+                     (length (getf result :pruned)) (getf result :dry-run)))
+    (json-response 200
+                   (obj "software" (getf params :software)
+                        "pruned"   (coerce (getf result :pruned) 'vector)
+                        "dry_run"  (if (getf result :dry-run) t nil)))))
+
+(defun handle-admin-verify (app env)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-verify (error-response 401 "unauthorised")))
+  (let ((r (ota-server.workers:verify-storage (app-state-cas app))))
+    (ota-server.catalogue:append-audit
+     (app-state-catalogue app)
+     :identity "admin" :action "verify-storage"
+     :target nil
+     :detail (format nil "checked=~A ok=~A bad=~A"
+                     (getf r :checked) (getf r :ok) (length (getf r :bad))))
+    (json-response 200
+                   (obj "checked" (getf r :checked)
+                        "ok"      (getf r :ok)
+                        "bad"     (coerce
+                                   (mapcar (lambda (entry)
+                                             (obj "path" (first entry)
+                                                  "actual" (second entry)
+                                                  "expected" (third entry)))
+                                           (getf r :bad))
+                                   'vector)))))
+
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
   (let* ((body (read-request-body-bytes env))
@@ -596,6 +653,8 @@
                  (:admin-publish-release        (handle-admin-publish-release state env params))
                  (:admin-mint-install-token     (handle-admin-mint-install-token state env))
                  (:admin-list-audit             (handle-admin-list-audit state env))
+                 (:admin-gc                     (handle-admin-gc state env params))
+                 (:admin-verify                 (handle-admin-verify state env))
                  (:exchange-token               (handle-exchange-token state env))
                  (:events-install               (handle-events-install state env)))
              (error (e)

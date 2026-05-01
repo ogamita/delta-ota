@@ -374,20 +374,38 @@ invisible to a client whose classifications don't include
 
 Goal :: the server is production-shaped.
 
-- [ ] *PostgreSQL backend* for =catalogue= behind the same DBI
-  layer; SQLite remains the default for single-host deployments.
-- [ ] *S3 backend* for =blobs/= and =patches/= behind the same CAS
-  interface (filesystem stays the default).
-- [ ] *Garbage collection* : scheduled =gc= job per the spec, with
-  =dry-run=, =min-user-count=, =min_age=; exposed at =POST
-  /v1/admin/software/{software}/gc=.
-- [ ] *Verification job* : walks blobs and patches, re-hashes them,
-  reports mismatches.
-- [ ] *Backup/restore script* : dumps the catalogue + lists blob
-  hashes; a restore re-hydrates from any storage backend.
-- [ ] *Manifest re-sign* on key rotation, in place.
-- [ ] *Operational doc* : =docs/operations.org= covering deploy,
-  cert rotation, key rotation, GC tuning, disaster recovery.
+- [ ] *PostgreSQL backend* — *deferred*.  The catalogue surface
+  (=ota-server.catalogue=) is the abstraction line; the v1
+  implementation calls =cl-sqlite= directly.  Switching to
+  =cl-dbi= behind the same surface is a sub-phase between v1 and
+  v1.1; SQLite stays the default until then.  See
+  [[file:operations.org::*PostgreSQL catalogue][operations.org]] for the migration plan.
+- [ ] *S3 backend* — *deferred*.  The CAS interface
+  (=make-cas=, =put-blob-from-file=, =cas-blob-path=,
+  =put-patch-from-file=) is structured to admit a second backend;
+  only the filesystem implementation exists in v1.  Driven by the
+  first customer that needs it.
+- [X] *Garbage collection* : =gc-software= prunes releases that
+  are not =uncollectable=, not the latest, have ≤ =min_user_count=
+  active clients in a configurable window, and are older than
+  =min_age_days=.  Exposed at =POST
+  /v1/admin/software/{software}/gc= with =dry_run=,
+  =min_user_count=, =min_age_days= JSON body.  Idempotent.
+- [X] *Verification job* : =verify-storage= walks =blobs/= and
+  =patches/=, re-hashes each file, reports mismatches.  Exposed at
+  =POST /v1/admin/verify= returning =checked=/=ok=/=bad= triples.
+- [X] *Backup/restore* : =tools/backup.sh= tarballs the OTA root
+  (db, blobs, patches, manifests, etc/keys), with a SHA-256
+  sidecar.  =tools/restore.sh= refuses to clobber a non-empty
+  destination.  Verified by =tests/e2e/ops.sh=: backup → restore
+  preserves the manifest tree byte-for-byte.
+- [X] *Manifest re-sign* : =resign-manifests= rewrites every
+  =<sw>/<v>.sig= under =manifests/= with a new keypair without
+  touching the .json bytes.  Procedure documented in
+  [[file:operations.org::*Key rotation][operations.org → Key rotation]].
+- [X] *Operational doc* : [[file:operations.org][docs/operations.org]] — deploy, configure,
+  publish, mint install tokens, GC, verify, audit, backup/restore,
+  key rotation, sizing, deferred backends, troubleshooting.
 
 Exit criterion : a one-page runbook walks an ops engineer through
 deploy, cert rotation, and disaster recovery from a backup, and the

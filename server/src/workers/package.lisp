@@ -5,6 +5,10 @@
   (:use #:cl)
   (:export #:build-patch-from-blobs
            #:build-patches-for-release
-           #:*bsdiff-binary*))
+           #:*bsdiff-binary*
+           ;; phase-5
+           #:gc-software
+           #:verify-storage
+           #:resign-manifests))
 
 (in-package #:ota-server.workers)

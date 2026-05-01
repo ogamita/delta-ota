@@ -140,11 +140,13 @@ go-test:
 test: test-unit
 test-unit: lisp-check lisp-test go-test
 
-e2e: e2e-install e2e-auth
+e2e: e2e-install e2e-auth e2e-ops
 e2e-install:
 	tests/e2e/run.sh
 e2e-auth:
 	tests/e2e/auth.sh
+e2e-ops:
+	tests/e2e/ops.sh
 
 run-server: build-server
 	$(SBCL) --core $(SERVER_BUILD_DIR)/ota-server.core \
