@@ -8,7 +8,7 @@
 | Licence          | MIT (see ./LICENSE)                         |
 | Imported on      | 2026-05-01                                        |
 | Tarball SHA-256  | `bc18c0f9dd52ad0adf109cc36f82eaf5fa9a2913ccee4ffabd822489e5bf5ed7`                             |
-| Tree SHA-256     | `291d1ebf9a1cb6a19fd85cf6aaec288e5978119155ae450f74bbde52bfcd090b`                                 |
+| Tree SHA-256     | `7038306b68e82d98370777a6abc3e2e864f689e665ee46335907868f626f9b0a`                                 |
 
 This directory contains a verbatim copy of upstream source. Do not
 edit files here directly. To apply local changes, record a `.patch`

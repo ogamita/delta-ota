@@ -34,9 +34,11 @@ for vd in vendor client/internal/vendor; do
             continue
         fi
 
-        actual="$(cd "${dir}" && find . -type f ! -name VENDORED.md -print0 \
-            | sort -z \
+        actual="$(cd "${dir}" && \
+            LC_ALL=C find . -type f ! -name VENDORED.md -print0 \
+            | LC_ALL=C sort -z \
             | xargs -0 sha256sum \
+            | LC_ALL=C sort \
             | sha256sum | awk '{print $1}')"
 
         if [ "${recorded}" != "${actual}" ]; then

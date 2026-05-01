@@ -112,9 +112,14 @@ else
 fi
 
 # Compute SHA-256 of the imported tree.
-tree_sha="$(cd "${dest}" && find . -type f ! -name VENDORED.md -print0 \
-    | sort -z \
+# Portable across macOS / Linux / Alpine: byte-wise sort, with the
+# per-file hash list re-sorted after xargs to absorb any batching
+# that might reorder output. LC_ALL=C ensures locale-independent.
+tree_sha="$(cd "${dest}" && \
+    LC_ALL=C find . -type f ! -name VENDORED.md -print0 \
+    | LC_ALL=C sort -z \
     | xargs -0 sha256sum \
+    | LC_ALL=C sort \
     | sha256sum | awk '{print $1}')"
 
 today="$(date -u +%Y-%m-%d)"

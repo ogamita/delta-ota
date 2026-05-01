@@ -8,7 +8,7 @@
 | Licence          | BSD-3-Clause (see ./LICENSE)                         |
 | Imported on      | 2026-05-01                                        |
 | Tarball SHA-256  | `7d8d664acd941077c3c3fea0e0aee830397d87336add170556d49b243c0c47ac`                             |
-| Tree SHA-256     | `c5a50c6d49c36532dbf3972eb9bd64f634294debf7176f327265a1dbd352a4b6`                                 |
+| Tree SHA-256     | `9fe0bfa4e03f6eb00bf49c7e683607411b14c8ae9a0bbb6acaa85e3f3866816c`                                 |
 
 This directory contains a verbatim copy of upstream source. Do not
 edit files here directly. To apply local changes, record a `.patch`
