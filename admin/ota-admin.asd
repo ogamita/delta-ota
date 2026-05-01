@@ -7,7 +7,9 @@
   :license "AGPL-3.0-or-later"
   :version "0.1.0"
   :homepage "https://gitlab.com/ogamita/delta-ota"
-  :depends-on ("alexandria" "uiop" "com.inuoe.jzon" "dexador")
+  ;; Phase-0 minimum. Real deps land per implementation phase:
+  ;;   com.inuoe.jzon, dexador
+  :depends-on ("alexandria" "uiop")
   :pathname "src/"
   :components ((:file "main"))
   :in-order-to ((test-op (test-op "ota-admin/tests"))))

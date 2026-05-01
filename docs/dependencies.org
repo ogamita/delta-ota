@@ -25,7 +25,7 @@ fully static.
 | ironclad     | SHA-256, Ed25519, AES                    | BSD-3-Clause  |
 | com.inuoe.jzon | JSON                                   | MIT           |
 | cl-dbi       | DB-independent SQL                       | LLGPL         |
-| cl-sqlite    | SQLite driver                            | Public Domain |
+| sqlite       | SQLite driver (Quicklisp dist name)      | Public Domain |
 | cl-postgres  | PostgreSQL driver                        | zlib          |
 | clack        | HTTP middleware                          | LLGPL         |
 | woo          | HTTP server with sendfile                | MIT           |

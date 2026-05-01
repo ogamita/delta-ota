@@ -9,16 +9,11 @@
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
+  ;; Phase-0 minimum. Real deps land per implementation phase:
+  ;;   ironclad, com.inuoe.jzon, cl-dbi, sqlite, cl-postgres,
+  ;;   clack, woo, cl+ssl
   :depends-on ("alexandria"
-               "uiop"
-               "ironclad"
-               "com.inuoe.jzon"
-               "cl-dbi"
-               "cl-sqlite"
-               "cl-postgres"
-               "clack"
-               "woo"
-               "cl+ssl")
+               "uiop")
   :pathname "src/"
   :components ((:module "catalogue"
                 :components ((:file "package")))
