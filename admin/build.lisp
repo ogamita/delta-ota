@@ -3,11 +3,19 @@
 
 (require :asdf)
 
-(let ((qlinit (merge-pathnames "quicklisp/setup.lisp"
-                               (or (uiop:getenv "QUICKLISP_HOME")
-                                   (user-homedir-pathname)))))
-  (when (probe-file qlinit)
-    (load qlinit)))
+(let* ((candidates (remove nil
+                            (list (uiop:getenv "QUICKLISP_HOME")
+                                  "/opt"
+                                  (namestring (user-homedir-pathname)))))
+       (setup (loop for base in candidates
+                    for path = (concatenate 'string
+                                            (string-right-trim "/" base)
+                                            "/quicklisp/setup.lisp")
+                    when (probe-file path) return path)))
+  (when setup
+    (format t "build: loading Quicklisp from ~A~%" setup)
+    (force-output)
+    (load setup)))
 
 (asdf:load-asd (truename "admin/ota-admin.asd"))
 

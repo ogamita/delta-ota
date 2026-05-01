@@ -8,14 +8,26 @@
 
 (require :asdf)
 
-;; Load Quicklisp if available (dev workstation or our CI dev image at
-;; /opt/quicklisp). The setup.lisp registers Quicklisp with ASDF, which
-;; means missing dependencies are downloaded on first ql:quickload.
-(let ((qlinit (merge-pathnames "quicklisp/setup.lisp"
-                               (or (uiop:getenv "QUICKLISP_HOME")
-                                   (user-homedir-pathname)))))
-  (when (probe-file qlinit)
-    (load qlinit)))
+;; Load Quicklisp from the first directory that has setup.lisp.
+;; The CI dev image installs it at /opt/quicklisp; developer
+;; workstations typically have it under $HOME or $QUICKLISP_HOME.
+(let* ((candidates (remove nil
+                            (list (uiop:getenv "QUICKLISP_HOME")
+                                  "/opt"
+                                  (namestring (user-homedir-pathname)))))
+       (setup (loop for base in candidates
+                    for path = (concatenate 'string
+                                            (string-right-trim "/" base)
+                                            "/quicklisp/setup.lisp")
+                    when (probe-file path) return path)))
+  (cond (setup
+         (format t "build: loading Quicklisp from ~A~%" setup)
+         (force-output)
+         (load setup))
+        (t
+         (format t "build: WARNING — Quicklisp setup.lisp not found in ~S~%"
+                 candidates)
+         (force-output))))
 
 (asdf:load-asd (truename "server/ota-server.asd"))
 
