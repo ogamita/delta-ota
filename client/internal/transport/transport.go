@@ -111,6 +111,38 @@ func (c *Client) ExchangeInstallToken(ctx context.Context, installToken, hwinfo 
 	return &out, nil
 }
 
+// Anchor is a server-curated "known-good" release that the recovery
+// tool can offer to the user.
+type Anchor struct {
+	Version   string `json:"version"`
+	ReleaseID string `json:"release_id"`
+	Channel   string `json:"channel,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	BlobSize  int64  `json:"blob_size,omitempty"`
+}
+
+// Anchors fetches the recovery anchors for SOFTWARE.
+func (c *Client) Anchors(ctx context.Context, software string) ([]Anchor, error) {
+	url := fmt.Sprintf("%s/v1/software/%s/anchors", c.BaseURL, software)
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("anchors: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("anchors: %s", resp.Status)
+	}
+	var out []Anchor
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("anchors decode: %w", err)
+	}
+	return out, nil
+}
+
 // LatestRelease fetches /v1/software/<sw>/releases/latest as raw JSON.
 func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, error) {
 	url := fmt.Sprintf("%s/v1/software/%s/releases/latest", c.BaseURL, software)

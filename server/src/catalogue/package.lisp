@@ -29,6 +29,8 @@
            #:delete-release
            #:delete-patches-touching
            #:list-patches-by-from-or-to
-           #:count-releases-using-blob))
+           #:count-releases-using-blob
+           ;; phase-6
+           #:mark-uncollectable))
 
 (in-package #:ota-server.catalogue)

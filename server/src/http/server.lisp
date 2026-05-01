@@ -102,6 +102,16 @@
      (values :admin-gc (list :software (fourth segments))))
     ((and (eq method :post) (equal segments '("v1" "admin" "verify")))
      :admin-verify)
+    ((and (eq method :get) (= 4 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "software")
+          (equal (fourth segments) "anchors"))
+     (values :get-anchors (list :software (third segments))))
+    ((and (eq method :post) (= 7 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "software") (equal (fifth segments) "releases")
+          (equal (nth 6 segments) "uncollectable"))
+     (values :admin-mark-uncollectable
+             (list :software (fourth segments) :version (nth 5 segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -546,6 +556,62 @@
                      rows)
                     'vector))))
 
+(defun handle-admin-mark-uncollectable (app env params)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-mark-uncollectable (error-response 401 "unauthorised")))
+  (ota-server.catalogue:mark-uncollectable
+   (app-state-catalogue app)
+   (getf params :software) (getf params :version))
+  (ota-server.catalogue:append-audit
+   (app-state-catalogue app)
+   :identity "admin" :action "mark-uncollectable"
+   :target (format nil "~A/~A" (getf params :software) (getf params :version))
+   :detail nil)
+  (json-response 200 (obj "software" (getf params :software)
+                          "version"  (getf params :version)
+                          "uncollectable" t)))
+
+(defun handle-get-anchors (app env params)
+  "Return server-curated 'known-good' versions for the recovery
+   tool.  v1 policy: every release marked uncollectable, plus the
+   latest in each channel — filtered by the caller's
+   classifications.  Newest first."
+  (let* ((id (resolve-identity env app))
+         (rels (remove-if-not
+                (lambda (r) (visible-release-p id r))
+                (ota-server.catalogue:list-releases
+                 (app-state-catalogue app) (getf params :software))))
+         (anchors '()))
+    ;; Anchor: every uncollectable release.
+    (dolist (r rels)
+      (when (getf r :uncollectable)
+        (push (anchor-of r "uncollectable") anchors)))
+    ;; Anchor: the latest visible release (skip if already added as
+    ;; uncollectable).
+    (when (first rels)
+      (let ((latest (first rels)))
+        (unless (find (getf latest :release-id) anchors
+                      :key #'anchor-release-id :test #'string=)
+          (push (anchor-of latest "latest") anchors))))
+    (json-response 200
+                   (coerce (nreverse anchors) 'vector))))
+
+(defun anchor-of (rel reason)
+  (obj "version"     (getf rel :version)
+       "release_id"  (getf rel :release-id)
+       "channel"     (let ((cs (getf rel :channels)))
+                       (if (and cs (plusp (length cs)))
+                           (aref cs 0) ""))
+       "reason"      reason
+       "blob_size"   (getf rel :blob-size)))
+
+(defun anchor-release-id (anchor)
+  "Pull the 'release_id' field out of an anchor ordered-object."
+  (let ((pairs (ota-server.manifest::ordered-object-pairs anchor)))
+    (loop for pair across pairs
+          when (string= (car pair) "release_id")
+            return (cdr pair))))
+
 (defun handle-admin-gc (app env params)
   (unless (authorised-admin-p env app)
     (return-from handle-admin-gc (error-response 401 "unauthorised")))
@@ -655,6 +721,8 @@
                  (:admin-list-audit             (handle-admin-list-audit state env))
                  (:admin-gc                     (handle-admin-gc state env params))
                  (:admin-verify                 (handle-admin-verify state env))
+                 (:get-anchors                  (handle-get-anchors state env params))
+                 (:admin-mark-uncollectable     (handle-admin-mark-uncollectable state env params))
                  (:exchange-token               (handle-exchange-token state env))
                  (:events-install               (handle-events-install state env)))
              (error (e)

@@ -415,21 +415,26 @@ runbook's commands are exercised by an integration test.
 
 Goal :: the recovery story works for users, not just engineers.
 
-- [ ] =GET /v1/software/{software}/anchors= : returns a curated
-  list of known-good versions (default: latest =uncollectable= per
-  channel; admin override).
-- [ ] =ota-agent doctor=, =ota-agent doctor <name> --recover= :
-  interactive multi-step rollback.  Lists local distributions,
-  fetches the anchors, lets the user pick, downloads the chosen
-  version (full blob or patch chain) if not local, flips =current=.
-- [ ] Optional reverse-patch generation : admin endpoint =POST
-  /v1/admin/software/{software}/patches/reverse?from=Y&to=X= builds
-  the reverse patch on demand and stores it in CAS.  The recovery
-  tool may pull these.
-- [ ] =ota-agent watch= background watcher (cron / Task Scheduler /
-  launchd integration helpers).
-- [ ] Install page polish : OS detection, install-token UX, "your
-  install will start in N minutes" queue message at high load.
+- [X] =GET /v1/software/{software}/anchors= : every uncollectable
+  release plus the latest visible release; filtered by the
+  caller's classifications; newest first.
+- [X] =ota-agent doctor <name>= : prints local distributions and
+  remote anchors.  =--recover=<version>= installs the chosen
+  anchor (multi-step rollback).  Phase-1 install path is reused —
+  full-blob download for old anchors, patch path when one exists.
+- [X] Admin endpoint to flag a release uncollectable: =POST
+  /v1/admin/software/{sw}/releases/{v}/uncollectable=.
+- [ ] *Reverse-patch generation* — *deferred*.  The recovery tool
+  works without it (anchor versions are regular blobs); reverse
+  patches would shave bandwidth on rollback at the cost of more
+  patch-build cycles.  Driven by a customer who needs it.
+- [ ] *=ota-agent watch=* background watcher — *deferred*.  Cron /
+  Task Scheduler / launchd integration helpers can be added when
+  there's a real customer.
+- [ ] *Install page polish* — *deferred*.  Phase 4's
+  install-token + exchange flow already gives the page everything
+  it needs to mint and hand out tokens; OS detection and
+  staggering UX are page-level concerns.
 
 Exit criterion : a user with a broken install can run =ota-agent
 doctor <name> --recover=, pick an anchor, and end up on a working

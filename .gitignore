@@ -56,6 +56,7 @@ Thumbs.db
 /tests/e2e/run/
 /tests/e2e/run-auth/
 /tests/e2e/run-ops/
+/tests/e2e/run-recovery/
 *.log
 
 # Local development

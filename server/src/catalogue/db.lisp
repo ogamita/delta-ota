@@ -289,6 +289,12 @@
    db "DELETE FROM releases WHERE software_name = ? AND version = ?"
    software-name version))
 
+(defun mark-uncollectable (db software-name version)
+  "Mark a release as uncollectable (permanent archive)."
+  (sqlite:execute-non-query
+   db "UPDATE releases SET uncollectable = 1 WHERE software_name = ? AND version = ?"
+   software-name version))
+
 (defun list-audit (db &optional (limit 100))
   (mapcar (lambda (row)
             (destructuring-bind (id identity action target detail at) row

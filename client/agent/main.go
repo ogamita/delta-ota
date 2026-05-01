@@ -9,9 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"gitlab.com/ogamita/delta-ota/client/internal/transport"
 	"gitlab.com/ogamita/delta-ota/client/libota"
 )
 
@@ -55,7 +57,9 @@ func main() {
 		upgradeCmd(flag.Args()[1:])
 	case "revert":
 		revertCmd(flag.Args()[1:])
-	case "list", "show", "verify", "prune", "watch", "doctor":
+	case "doctor":
+		doctorCmd(flag.Args()[1:])
+	case "list", "show", "verify", "prune", "watch":
 		fmt.Fprintf(os.Stderr, "ota-agent: %q not implemented yet\n", flag.Arg(0))
 		os.Exit(1)
 	default:
@@ -172,6 +176,82 @@ func upgradeCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("upgraded %s to %s\n", name, v)
+}
+
+func doctorCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL")
+	recover := fs.String("recover", "", "version to install (multi-step rollback)")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "doctor: missing <name>")
+		os.Exit(2)
+	}
+	name := fs.Arg(0)
+	server := *srv
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "doctor: --server or $OTA_SERVER required")
+		os.Exit(2)
+	}
+
+	ota_home := os.Getenv("OTA_HOME")
+	if ota_home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			ota_home = filepath.Join(h, ".ota")
+		}
+	}
+	root := filepath.Join(ota_home, name)
+
+	// 1. Local distributions on disk.
+	fmt.Printf("=== %s — local installations under %s ===\n", name, root)
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, e := range entries {
+			n := e.Name()
+			if strings.HasPrefix(n, "distribution-") {
+				fmt.Printf("  %s\n", n)
+			}
+		}
+	} else {
+		fmt.Printf("  (no directory at %s)\n", root)
+	}
+
+	// 2. Server-curated anchors.
+	fmt.Printf("\n=== %s — server-curated anchors ===\n", name)
+	tr := transport.New(strings.TrimRight(server, "/"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	anchors, err := tr.Anchors(ctx, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "doctor: anchors: %v\n", err)
+		// Continue: maybe the user only wants local info.
+	} else {
+		for _, a := range anchors {
+			fmt.Printf("  %-12s reason=%s\n", a.Version, a.Reason)
+		}
+		if len(anchors) == 0 {
+			fmt.Println("  (none)")
+		}
+	}
+
+	// 3. If --recover=<version> was passed, install that.
+	if *recover != "" {
+		fmt.Printf("\n=== recovering: installing %s %s ===\n", name, *recover)
+		cfg := libota.Config{
+			ServerURL:      strings.TrimRight(server, "/"),
+			OTAHome:        ota_home,
+			TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
+			Timeout:        2 * time.Minute,
+		}
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel2()
+		v, err := libota.Install(ctx2, cfg, name, *recover)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "doctor: recover: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("recovered %s -> %s\n", name, v)
+	}
 }
 
 func revertCmd(args []string) {
