@@ -23,7 +23,7 @@ fully static.
 | alexandria   | utilities                                | Public Domain |
 | uiop         | portability                              | MIT           |
 | ironclad     | SHA-256, Ed25519, AES                    | BSD-3-Clause  |
-| jzon         | JSON                                     | MIT           |
+| com.inuoe.jzon | JSON                                   | MIT           |
 | cl-dbi       | DB-independent SQL                       | LLGPL         |
 | cl-sqlite    | SQLite driver                            | Public Domain |
 | cl-postgres  | PostgreSQL driver                        | zlib          |

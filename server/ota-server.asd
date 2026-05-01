@@ -12,7 +12,7 @@
   :depends-on ("alexandria"
                "uiop"
                "ironclad"
-               "jzon"
+               "com.inuoe.jzon"
                "cl-dbi"
                "cl-sqlite"
                "cl-postgres"
