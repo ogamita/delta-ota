@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Production image for ota-server.
+# Multi-stage:
+#   1. builder    — full toolchain (SBCL + C compiler) builds:
+#                   * the SBCL core image for ota-server
+#                   * the vendored bsdiff/xdelta3 helper binaries
+#   2. runtime    — minimal Debian slim, only what's needed at runtime:
+#                   the SBCL runtime stub, libssl, libev, the helpers,
+#                   and the application core.
+
+# ---------- Stage 1: builder ----------
+FROM registry.gitlab.com/ogamita/delta-ota/dev:latest AS builder
+
+WORKDIR /src
+COPY . /src
+
+RUN make vendor-verify \
+ && make vendor-build \
+ && make build-server
+
+# Output artefacts:
+#   /src/server/build/ota-server.core
+#   /src/server/build/bin/bsdiff
+#   /src/server/build/bin/xdelta3
+
+# ---------- Stage 2: runtime ----------
+FROM debian:12-slim
+
+ARG VERSION=dev
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.title="Ogamita Delta OTA — server"
+LABEL org.opencontainers.image.description="Over-the-air software distribution server (delta-ota)."
+LABEL org.opencontainers.image.vendor="Ogamita Ltd."
+LABEL org.opencontainers.image.source="https://gitlab.com/ogamita/delta-ota"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${VCS_REF}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        sbcl \
+        libssl3 \
+        libev4 \
+        libsqlite3-0 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 ota \
+    && useradd  --system --uid 1000 --gid ota --home-dir /var/lib/ota --shell /usr/sbin/nologin ota \
+    && mkdir -p /var/lib/ota /etc/ota \
+    && chown -R ota:ota /var/lib/ota /etc/ota
+
+# Application bits
+COPY --from=builder --chown=root:root /src/server/build/ota-server.core /opt/ota/ota-server.core
+COPY --from=builder --chown=root:root /src/server/build/bin/bsdiff      /opt/ota/bin/bsdiff
+COPY --from=builder --chown=root:root /src/server/build/bin/xdelta3     /opt/ota/bin/xdelta3
+COPY --chown=root:root server/etc/ota.docker.toml                       /etc/ota/ota.toml.sample
+COPY --chown=root:root docker/entrypoint.sh                             /usr/local/bin/ota-entrypoint
+
+ENV OTA_ROOT=/var/lib/ota
+ENV OTA_CONFIG=/etc/ota/ota.toml
+ENV OTA_BSDIFF=/opt/ota/bin/bsdiff
+ENV OTA_XDELTA3=/opt/ota/bin/xdelta3
+
+USER ota
+EXPOSE 8443
+VOLUME ["/var/lib/ota", "/etc/ota"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/opt/ota/bin/healthcheck"] || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ota-entrypoint"]
+CMD ["serve"]

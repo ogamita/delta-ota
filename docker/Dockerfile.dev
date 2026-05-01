@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Development / CI base image: SBCL + Go + build tools.
+# Used by the GitLab pipeline and by `make` on developer workstations
+# that prefer not to install SBCL+Go locally.
+
+FROM debian:12-slim
+
+ARG SBCL_VERSION=2.4.0
+ARG GO_VERSION=1.22.5
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        make \
+        build-essential \
+        pkg-config \
+        libev-dev \
+        libssl-dev \
+        sbcl \
+        sqlite3 \
+        libsqlite3-dev \
+        libpq-dev \
+        sha256sum \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go: use the official tarball, not the distro package, to pin the version.
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) GOARCH=amd64 ;; \
+        arm64) GOARCH=arm64 ;; \
+        *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" \
+        | tar -C /usr/local -xz; \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go; \
+    ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+# Quicklisp for SBCL (built-in libraries pulled at server build time, not
+# baked into the image — keeps the image small and the lock current).
+RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp \
+    && sbcl --non-interactive --no-userinit --no-sysinit \
+        --load /tmp/quicklisp.lisp \
+        --eval '(quicklisp-quickstart:install :path "/opt/quicklisp")' \
+        --eval '(let ((ql-util::*do-not-prompt* t))
+                  (ql:add-to-init-file))' \
+    && rm /tmp/quicklisp.lisp
+
+ENV GOPATH=/go
+ENV PATH=/go/bin:/usr/local/go/bin:${PATH}
+ENV CGO_ENABLED=0
+
+WORKDIR /workspace

@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Local end-to-end stack: ota-server + Postgres + MinIO (S3 compatible).
+# Used by `make e2e` and by developers who want to exercise the
+# Kubernetes-style deployment topology on their workstation.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ota
+      POSTGRES_PASSWORD: ota
+      POSTGRES_DB: ota
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ota"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ota
+      MINIO_ROOT_PASSWORD: ota-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ota-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "8443:8443"
+    volumes:
+      - otadata:/var/lib/ota
+      - ./test-config/ota.toml:/etc/ota/ota.toml:ro
+    environment:
+      OTA_DB_URL: "postgres://ota:ota@postgres:5432/ota"
+      OTA_S3_ENDPOINT: "http://minio:9000"
+      OTA_S3_BUCKET: "delta-ota"
+      OTA_S3_ACCESS_KEY: "ota"
+      OTA_S3_SECRET_KEY: "ota-secret"
+
+volumes:
+  pgdata:
+  miniodata:
+  otadata:

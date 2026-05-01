@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Authoritative pipeline for delta-ota.
+# Hosted on gitlab.com/ogamita/delta-ota; mirrored to GitHub.
+#
+# Stages:
+#   prepare   build the dev image (cached) — used by all later jobs
+#   verify    licence headers, vendor hash check, lint
+#   build     server core, libota (3 OS), ota-agent (3 OS)
+#   test      unit + integration; e2e with docker-compose
+#   package   server image, signed client binaries
+#   publish   only on tags: push images, create release, attach binaries
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+variables:
+  DEV_IMAGE: "$CI_REGISTRY_IMAGE/dev:latest"
+  SERVER_IMAGE: "$CI_REGISTRY_IMAGE/server:$CI_COMMIT_SHORT_SHA"
+  CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath -tags=netgo,osusergo"
+
+stages:
+  - prepare
+  - verify
+  - build
+  - test
+  - package
+  - publish
+
+# ---------- prepare ----------
+build-dev-image:
+  stage: prepare
+  image: docker:26
+  services:
+    - docker:26-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker pull "$DEV_IMAGE" || true
+    - docker build --pull --cache-from "$DEV_IMAGE"
+        -t "$DEV_IMAGE"
+        -f docker/Dockerfile.dev .
+    - docker push "$DEV_IMAGE"
+  rules:
+    - changes:
+        - docker/Dockerfile.dev
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ---------- verify ----------
+vendor-verify:
+  stage: verify
+  image: $DEV_IMAGE
+  script:
+    - make vendor-verify
+
+licence-headers:
+  stage: verify
+  image: $DEV_IMAGE
+  script:
+    - tools/check-licence-headers.sh
+
+go-lint:
+  stage: verify
+  image: $DEV_IMAGE
+  script:
+    - cd client && go vet ./...
+
+lisp-lint:
+  stage: verify
+  image: $DEV_IMAGE
+  script:
+    - make lisp-check
+
+# ---------- build ----------
+build-server:
+  stage: build
+  image: $DEV_IMAGE
+  script:
+    - make vendor-build build-server
+  artifacts:
+    paths:
+      - server/build/
+    expire_in: 1 week
+
+build-client-linux:
+  stage: build
+  image: $DEV_IMAGE
+  script:
+    - GOOS=linux   GOARCH=amd64 make build-client
+    - GOOS=linux   GOARCH=arm64 make build-client
+  artifacts:
+    paths:
+      - client/build/linux-*/
+    expire_in: 1 week
+
+build-client-darwin:
+  stage: build
+  image: $DEV_IMAGE
+  script:
+    - GOOS=darwin  GOARCH=amd64 make build-client
+    - GOOS=darwin  GOARCH=arm64 make build-client
+  artifacts:
+    paths:
+      - client/build/darwin-*/
+    expire_in: 1 week
+
+build-client-windows:
+  stage: build
+  image: $DEV_IMAGE
+  script:
+    - GOOS=windows GOARCH=amd64 make build-client
+  artifacts:
+    paths:
+      - client/build/windows-*/
+    expire_in: 1 week
+
+# ---------- test ----------
+unit:
+  stage: test
+  image: $DEV_IMAGE
+  script:
+    - make test-unit
+  needs:
+    - build-server
+    - build-client-linux
+
+e2e:
+  stage: test
+  image: docker:26
+  services:
+    - docker:26-dind
+  before_script:
+    - apk add --no-cache make
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - make e2e
+  artifacts:
+    when: always
+    paths:
+      - tests/e2e/run/logs/
+    expire_in: 1 week
+
+self-contained-check:
+  stage: test
+  image: $DEV_IMAGE
+  needs:
+    - build-client-linux
+  script:
+    - tools/check-self-contained.sh client/build/linux-amd64/ota-agent
+    - tools/check-self-contained.sh client/build/linux-arm64/ota-agent
+
+# ---------- package ----------
+build-server-image:
+  stage: package
+  image: docker:26
+  services:
+    - docker:26-dind
+  needs:
+    - build-server
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build
+        --build-arg VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+        --build-arg VCS_REF="${CI_COMMIT_SHA}"
+        -t "$SERVER_IMAGE"
+        -f docker/Dockerfile.server .
+    - docker push "$SERVER_IMAGE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+# ---------- publish ----------
+release:
+  stage: publish
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - build-client-linux
+    - build-client-darwin
+    - build-client-windows
+    - build-server-image
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - echo "Releasing ${CI_COMMIT_TAG}"
+  release:
+    name: "Ogamita Delta OTA ${CI_COMMIT_TAG}"
+    tag_name: "$CI_COMMIT_TAG"
+    description: "See CHANGELOG.md"

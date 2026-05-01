@@ -1,212 +1,1232 @@
+#+TITLE: Specifications for an OTA Software Distribution System
+#+AUTHOR: Pascal Bourguignon
+#+OPTIONS: toc:3 num:t
+#+STARTUP: showall
 
-* Specifications for an OTA system
+* Overview
 
 ** Purpose
 
-We want to distribute a software package.
-This packages is composed of several failes, sources, compiled files,
-resources, binary libraries.
-It amounts up to more than 2 GB.
-
-New versions are released periodically (say monthly).
-
-Users have variable bandwidth and latency, so they cannot get the
-files on-demand reliably, and they cannot download the whole package
-at each release.
-
-Therefore we need an OTA system that will let users download only the
-changes from one release to the other, which should be smaller patch
-files easily managed by the network and users.
-
-** Features
-
-We may use xdelta3 or perhaps better (compression-wise): bsdiff to
-implement the system.
-
-*** Server side
-
-Since users may not all upgrade in sync, the server will have to keep
-several versions (as long as some user has this version installed),
-along with the diff from these versions to the latest version.
-
-**** function publish-new-release (name version-number set-of-files)
-
-- =name= names the software.
-- =version-number= specifies the version of the release.
-- =set-of-file= is a set of files composing the release of the software.
-
-This function stores in the server a new release of the software.
-It may prepare new diffs for distribution.
-It may send notifications or otherwise prepare for the users to detect
-the new release.
-
-**** function mark-uncollectable (name version-number)
-
-- =name= names the software.
-- =version-number= specifies the version of the release.
-
-This function indicates that this relaase of the software may never be
-erased from the server (it's a permanent archive).
-
-**** function count-user-at-release (name version-number) -> integer
-
-- =name= names the software.
-- =version-number= specifies the version of the release.
-
-Statistics of user fetching releases are kept, so we may infer a count
-of users still using a given release of the software.
-Note: this is approximate, since users who disappear (erase their
-software) are not accounted for.
-
-**** function garbage-collect (name [min-user-count = 0])
-
-- =name= names the software.
-- =min-user-count= specifies the version of the release.
-
-Erase the releases of the softare that have at most min-user-count users
-
-*** Client side
-
-Clients may install software packages.
-The first time a full download of the package is needed.
-When a new release is available, the user may upgrade.
-It is possible to skip an release or more.
-The user system must keep the binary blob of the release he uses, so
-patches against it may be performed to obtain a new release binary
-blob, before installation of the upgrade.
-When an upgrade is downloaded, only a small patch file is obtained,
-and used to patch the saved binary blob.
-
-As OTA, we must ensure that the user always has a working software
-release, so:
-
-1- the download of the patch is asynchronous and nothing is ever
-   upgrade before full completion and validation of the download is
-   obtained.
-
-2- the patching of the binary blob is asynchronous and nothing is ever
-   upgrade before full completion and validation of the new binary
-   blob.
-
-3- we don't upgrade by overriding the exising installation, but
-   install the new release in a parallel distribution directory, and
-   only when this distribution directory is completed and validated,
-   the switch over to the new release is performed (the old
-   distribution directory can be archived and scheduled for
-   later suppression).
-
-For release n active:
-
-- blob-n
-- distribution-n
-
-When upgrade from n to m:
-
-- blob-n
-- distribution-n
-- diff-n-m
-then:
-- blob-m
-then:
-- distribution-m
-then (switch over):
-- distribution-n.archived
-
-So for release m active:
-
-- blob-n
-- distribution-n.archived
-- diff-n-m
-- blob-m
-- distribution-m
-
-When upgrade from m to o:
-
-- delete blob-n
-- delete distribution-n.archived
-- delete diff-n-m
-
-and proceeed like from n to m.
-
-**** function list-software () -> list-of-software-name            ; remote
-
-Queries the server to return list of software names available.
-
-**** function list-release (name) -> list-of-version-number        ; remote
-
-- =name= names the software.
-
-Queries the server to return the list of release =version-number=
-available.
-
-**** function latest-release (name) -> version-number              ; remote
-
-- =name= names the software.
-
-Queries the server to return just the =version=number= of the last
-release.
-
-**** function install-or-upgrade-software (name version-number)    ; mixed
-
-- =name= names the software.
-- =version-number= specifies the version of the release.
-
-If a binary blob is not available locally, then
-
-   download a full release, and install it.
-
-else
-
-  find the diff we need to use
-  download this diff
-  apply it to build the wanted binary blob
-  and install it.
-
-end
-
-Successful installation implies archiving the previous installation.
-
-**** function revert-previous-release (name)                       ; local
-
-- =name= names the software.
-
-Archive the current installation, and
-unarchive the previous installation.
-
-**** function downloaded-releases (name) -> list-of-version-number ; local
-
-- =name= names the software.
-
-Internal function.
-Return the list of releases that we have locally.
-
-**** function downloaded-upgrades (name) -> list-of-pair-of-version-number ; local
-
-- =name= names the software.
-
-Internal function.
-Return the list of diff that we have locally.
-((from-n to-m) (from-m to-o) …)
-
-*** Interaction - Authetication - Security
-
-The system may be configured to use authentication of the client and
-server (certificates), and to check them.
-
-The server may be configured so that availability of software and
-version depend on a classification of the client.  So functions such
-as list-software, list-release, latest-release and
-install-or-upgrade-software
-may return different result depending on the client and time when the
-request is made.
-
-In some circumstances, we may want to stagger distributions of
-releases amongst numerous clients.
-
-But note that if a diff is about 1 MB, 10_000 client downloading it AT
-THE SAME TIME (eg. 9:00 on Monday morning), will involve a traffic of
-only 10 GB on the server side, which is entirely supported by current
-high end internet server in internet server centers.  Such servers
-have 2 x 10 Gb/s ethernet connections and the internet bandwidth to
-feed them. So staggering would hardly be needed. (Perhaps only for new
-software where full downloads would be needed).
+Distribute large software packages (sources, compiled artefacts,
+resources, binary libraries; total size >2 GB) to user workstations
+"over the air", in such a way that:
+
+- the *first* installation can be performed by an unprivileged user
+  through a web page, without any pre-installed tooling;
+
+- each subsequent /upgrade/ transfers only a *binary patch* between
+  the user's currently installed release and the targeted release,
+  not the full package;
+
+- a working installation is preserved on the user's workstation at
+  all times: any failure during download, patching, or installation
+  must leave the previously working release intact;
+
+- multiple releases can coexist on the server for as long as any
+  client still uses them, so users may skip releases or upgrade at
+  their own pace.
+
+The patch format is pluggable.  The default is =bsdiff= / =bspatch=
+(better compression for our payload mix).  =xdelta3= can be selected
+per package by configuration.
+
+** Scope and non-goals
+
+In scope :: Packaged distribution of files belonging to one
+software product, server-side storage of releases and pre-computed
+patches, client-side patch download, validation, atomic switch-over,
+rollback, telemetry sufficient to garbage-collect old releases,
+authentication, classification-based release visibility, an
+administrative API, an admin CLI, and an embeddable client library.
+
+Out of scope :: System-level package management (=apt=, =msi=,
+=pkg=), uninstallation across the whole OS, kernel/driver
+distribution, code signing PKI (the system /uses/ signing material
+but does not /issue/ certificates), per-user license enforcement.
+
+** Glossary
+
+- *Software*: a named product that the system distributes
+  (e.g. ="schms"=, ="plugin-cao"=).
+- *OS target*: a triple =(os, arch, os-version-set)=, e.g.
+  =(windows, x86_64, {10, 11})=.  A package is built for exactly
+  one OS target.
+- *Release*: an immutable, versioned build of one software for one
+  OS target.  Identified by the triple
+  =(software-name, os-target, version)=.
+- *Blob*: the canonical archived payload of a release as stored on
+  the server and on the client (a single deterministic =.tar=
+  archive — see [[*Blob format and determinism][Blob format and determinism]]).
+- *Distribution*: the unpacked tree on disk that the user actually
+  runs (=blob= → unpacked → /distribution/).
+- *Patch*: a binary delta from one blob to another, generated by
+  =bsdiff= (default) or =xdelta3=.
+- *Channel*: a named subset of releases visible to a class of
+  clients (e.g. =stable=, =beta=, =canary=, =internal=).  Used for
+  staggered rollouts and access control.
+- *Manifest*: a signed JSON document describing a release and the
+  patches available to/from it.
+
+* High-level architecture
+
+#+begin_src
++---------------------------+        +-------------------------+
+|   Developer workstation   |        |   User workstation      |
+|   (Windows / macOS /      |        |   (Windows / macOS /    |
+|    Linux)                 |        |    Linux)               |
+|                           |        |                         |
+|  +---------------------+  | upload |  +-------------------+  |
+|  |   ota-admin CLI     |--+------->|  | ota-agent CLI     |  |
+|  |   (auth: cert)      |  |  HTTPS |  | + libota          |  |
+|  +---------------------+  |        |  +-------------------+  |
++---------------------------+        +-------------------------+
+            |                                    ^
+            | HTTPS (mTLS)                       | HTTPS (mTLS or token)
+            v                                    |
+   +------------------------------------------------------+
+   |                    OTA server (Unix)                 |
+   |                                                      |
+   |  +--------+   +---------+   +---------+   +-------+  |
+   |  | HTTP   |-->| API/    |-->| Storage |-->| FS /  |  |
+   |  | front  |   | service |   | layer   |   | S3    |  |
+   |  +--------+   +---------+   +---------+   +-------+  |
+   |       |             |                                |
+   |       v             v                                |
+   |  Web download   Patch builder (bsdiff/xdelta3)       |
+   |  page (initial  worker pool                          |
+   |  install)                                            |
+   +------------------------------------------------------+
+#+end_src
+
+Three executable artefacts compose the system:
+
+1. *Server* (=ota-server=) — long-running daemon on a Unix host;
+   exposes the HTTP/JSON API; stores blobs, patches, manifests,
+   metadata; runs background workers.
+2. *Admin client* (=ota-admin=) — CLI on developer workstations,
+   used for publishing releases, managing channels, classifications,
+   garbage collection, and reporting.  An optional GUI may wrap the
+   same library.
+3. *Client* — two pieces shipped together:
+   - =libota= : embeddable library (the public API documented in
+     [[*Client API (libota)][Client API (libota)]]) linked into applications that want to
+     self-update.
+   - =ota-agent= : a tiny CLI wrapping =libota= for users/admins who
+     prefer a command-line, and for the ~initial install~ web link.
+
+* Data model
+
+** Identifiers
+
+- =software-name= : =[a-z][a-z0-9-]{1,63}= — globally unique, lower-kebab.
+- =os= : one of =windows=, =macos=, =linux=.
+- =arch= : one of =x86_64=, =aarch64=, =i386= (extensible).
+- =os-version= : free-form short string, e.g. =10=, =11=, =14.3=,
+  =22.04=.  Compared with the package's =os-version-set= using
+  exact match (default) or a SemVer-range matcher when configured.
+- =version= : SemVer 2.0.0 (=MAJOR.MINOR.PATCH[-PRE][+BUILD]=).
+  Ordering is the standard SemVer ordering.  =+BUILD= is metadata
+  only and never affects ordering or identity.
+- =release-id= : the deterministic string
+  ={software-name}/{os}-{arch}/{version}=, e.g.
+  =schms/windows-x86_64/3.4.1=.
+
+** Entities
+
+#+begin_src
+Software        := { name, display_name, owners[], default_patcher,
+                     created_at }
+
+OSTarget        := { os, arch, os_versions[] }
+
+Release         := { release_id, software_name, os_target,
+                     version, blob_sha256, blob_size,
+                     manifest_sha256, signed_manifest_url,
+                     channels[], classifications[],
+                     uncollectable: bool, published_at,
+                     published_by, deprecated: bool, notes }
+
+Patch           := { from_release_id, to_release_id, patcher,
+                     sha256, size, built_at }
+
+Channel         := { name, software_name, description,
+                     classifications[] }
+
+Classification  := { name, description, members[] /* CN/group */ }
+
+Client          := { client_id, cert_subject, classifications[],
+                     last_seen_at, hwinfo_opaque }
+
+DownloadEvent   := { client_id, software_name, release_id,
+                     kind: full|patch, from_release_id?,
+                     bytes, started_at, completed_at, status }
+#+end_src
+
+The catalogue (everything but the blobs and patch files
+themselves) lives in a small SQL database — SQLite by default,
+PostgreSQL when scaling to multiple front-ends.  Blobs and patches
+live on the filesystem (or an S3-compatible object store), keyed by
+their content hash.
+
+** Storage layout (server)
+
+#+begin_src
+$OTA_ROOT/
+├── db/                         catalogue (SQLite or PG client cfg)
+├── blobs/
+│   └── <sha256[0:2]>/<sha256>   content-addressed storage of blobs
+├── patches/
+│   └── <sha256[0:2]>/<sha256>   content-addressed storage of patches
+├── manifests/
+│   └── <release-id>.json        signed JSON manifest per release
+├── tmp/                         in-progress uploads
+├── logs/
+└── etc/                         server configuration, keys, certs
+#+end_src
+
+** Storage layout (client)
+
+#+begin_src
+$OTA_HOME/<software-name>/
+├── current        symlink (or junction on Windows) → distribution-<v>
+├── previous       symlink → distribution-<prev-v>     (for revert)
+├── distribution-<version>/      unpacked tree being run
+├── archived/                    archived past distributions
+├── blobs/<version>              canonical blob for each kept version
+├── patches/<from>-<to>          downloaded but not yet applied
+└── state.json                   local state (current, previous, history)
+#+end_src
+
+The =current= symlink is the only externally observable pointer.
+On Windows where symlinks may be unprivileged-restricted, a
+directory junction is used; if neither is available a small launcher
+file =current.path= holds the path and is read by the launcher
+shim.
+
+** Blob format and determinism
+
+A *blob* is a single =.tar= archive (uncompressed, =POSIX ustar=)
+of the release tree, with deterministic ordering and metadata so
+that two builds of the same source produce byte-identical blobs:
+
+- entries sorted by path (lexicographic, byte-wise);
+- =mtime= = 0, =uid=/=gid= = 0, =uname=/=gname= = empty;
+- file modes normalised to =0644= (regular files) or =0755=
+  (executables, identified by the build manifest, never by source
+  =fs= bits);
+- no extended attributes, no =@LongLink= entries, no sparse
+  encoding;
+- no compression at the blob layer (compression happens once, on
+  the wire, via HTTP =Content-Encoding=).
+
+Determinism is required because patch quality and identity rely on
+identical bytes for the "same" release.  Compression at the blob
+layer would make =bsdiff= worthless; keeping the blob uncompressed
+also lets the client mmap it during patching with no extra step.
+
+The blob is the single canonical artefact.  The /distribution/ on
+disk is produced from it by extraction; conversely, on the client
+the blob is materialised once at install time and kept alongside the
+distribution so future patches have an exact source to apply to.
+
+* Server
+
+** Responsibilities
+
+- Receive uploaded release payloads from authenticated developers.
+- Materialise the blob (deterministic =.tar=), compute its hash and
+  size, store it.
+- Compute and store patches between the new release and a
+  configurable set of older releases (see [[*Patch generation policy][Patch generation policy]]).
+- Sign and serve manifests.
+- Authenticate clients (see [[*Authentication and authorisation][Authentication and authorisation]]).
+- Resolve, for a given client, the set of visible
+  software/releases/channels.
+- Serve full blobs (initial install) and patches (upgrades).
+- Record download events for telemetry and garbage collection.
+- Run periodic garbage collection.
+
+** Patch generation policy
+
+When a release =R_n= is published for a software, the server builds
+patches from a configurable set of source releases to =R_n=:
+
+- /Always/ from =R_{n-1}= (the immediate predecessor).
+- /By default/ from every release =R_k= such that =R_k= still has
+  active users above a threshold (see [[*function gc-threshold][gc-threshold]]).
+- /Optionally/ from every release marked =uncollectable=.
+- /Optionally/ a "supercheckpoint" patch from the latest
+  uncollectable release, regardless of user count, to give late
+  adopters a known-good shortcut.
+
+Patches are content-addressed by =sha256(patch-bytes)=, so duplicate
+payloads (e.g. when two source releases happen to produce the same
+patch) cost nothing.  Patch generation is asynchronous: the publish
+operation returns as soon as the blob and manifest are durable; a
+worker pool builds patches in the background and updates the
+manifest signed-state when each one becomes available.
+
+Patcher selection:
+
+- Default tool per software is recorded in =Software.default_patcher=
+  (=bsdiff= or =xdelta3=).
+- A given =Patch= entity records the tool actually used; the client
+  selects the matching patcher at apply time.
+
+Reverse patches (=Y → X=, where =Y > X=) are *optional* and built
+on demand for the recovery tool's needs.  They are not part of the
+v1 release flow.  Both =bsdiff= and =xdelta3= are fast enough that
+a missing or corrupted patch can be regenerated from the two
+reference blobs at any time, so patches are best thought of as a
+pre-computed cache, not as primary data.
+
+** HTTP/JSON API
+
+All requests use TLS.  Bodies are JSON unless noted.  Binary
+payloads (blobs, patches, signed manifests) are streamed with
+=Content-Type: application/octet-stream=.
+
+Naming convention: paths are stable and versioned under =/v1/=.
+
+*** Public/anonymous (only when so configured)
+
+| Method | Path                                       | Purpose                                      |
+|--------+--------------------------------------------+----------------------------------------------|
+| GET    | =/v1/health=                               | Liveness                                     |
+| GET    | =/v1/install/{software}=                   | HTML page for initial install                |
+| GET    | =/v1/install/{software}/agent=             | Download =ota-agent= for the requesting OS   |
+
+The install page detects =User-Agent=, offers the matching
+=ota-agent= binary, and embeds the URL of the latest full blob plus
+a one-shot install token (short TTL, single-use).  The agent then
+calls =install-software= using that token.
+
+*** Catalogue (read)
+
+| Method | Path                                                       |
+|--------+------------------------------------------------------------|
+| GET    | =/v1/software=                                             |
+| GET    | =/v1/software/{software}=                                  |
+| GET    | =/v1/software/{software}/releases=                         |
+| GET    | =/v1/software/{software}/releases/latest=                  |
+| GET    | =/v1/software/{software}/releases/{version}=               |
+| GET    | =/v1/software/{software}/releases/{version}/manifest=      |
+| GET    | =/v1/software/{software}/anchors=                          |
+
+The result of every catalogue query is filtered by the requesting
+client's classifications and channel memberships.
+
+*** Downloads
+
+| Method | Path                                                                   |
+|--------+------------------------------------------------------------------------|
+| GET    | =/v1/blobs/{sha256}=                                                   |
+| GET    | =/v1/patches/{sha256}=                                                 |
+| GET    | =/v1/software/{software}/releases/{version}/blob=                      |
+| GET    | =/v1/software/{software}/upgrade?from={ver}&to={ver}=                  |
+
+The /upgrade/ endpoint resolves the best available path (single
+patch, or chain of patches, or fall-back to a full blob) and
+redirects (HTTP 302) to the concrete artefact(s).  Range requests
+(=Range: bytes=…=) are supported on all binary endpoints so that an
+interrupted download can resume.
+
+The /anchors/ endpoint returns a small server-curated list of
+"known-good" versions for use by the recovery tool (see [[*Recovery tool with multi-step rollback][Recovery
+tool with multi-step rollback]]).  By default it returns the latest
+=uncollectable= release per channel; admins may override the list
+explicitly.
+
+*** Telemetry
+
+| Method | Path                  | Body                                 |
+|--------+-----------------------+--------------------------------------|
+| POST   | =/v1/events/download= | =DownloadEvent= (see [[*Entities][Entities]])      |
+| POST   | =/v1/events/install=  | =InstallEvent= (success/failure)     |
+
+Clients are encouraged but not required to post these events; they
+are how the server learns "user X is now on release Y" and feeds
+[[*function count-user-at-release (name version-number) -> integer][count-user-at-release]].
+
+*** Administrative
+
+All admin endpoints require an admin certificate (mTLS) /and/ an
+=Authorization: Bearer …= token.
+
+| Method | Path                                                          |
+|--------+---------------------------------------------------------------|
+| POST   | =/v1/admin/software=                                          |
+| POST   | =/v1/admin/software/{software}/releases=  (multipart upload)  |
+| PATCH  | =/v1/admin/software/{software}/releases/{version}=            |
+| POST   | =/v1/admin/software/{software}/releases/{version}/uncollectable= |
+| DELETE | =/v1/admin/software/{software}/releases/{version}=  (force)   |
+| GET    | =/v1/admin/software/{software}/stats=                         |
+| POST   | =/v1/admin/software/{software}/gc=                            |
+| POST   | =/v1/admin/channels=                                          |
+| PATCH  | =/v1/admin/channels/{name}=                                   |
+| POST   | =/v1/admin/classifications=                                   |
+| PATCH  | =/v1/admin/classifications/{name}=                            |
+| POST   | =/v1/admin/clients/{client_id}/classifications=               |
+
+** Manifest format
+
+A manifest is a JSON object signed by the server's release-signing
+key.  The detached signature is delivered alongside (or as a
+=multipart/signed= body).
+
+#+begin_src json
+{
+  "release_id": "schms/windows-x86_64/3.4.1",
+  "software": "schms",
+  "os": "windows",
+  "arch": "x86_64",
+  "os_versions": ["10", "11"],
+  "version": "3.4.1",
+  "published_at": "2026-04-12T10:42:11Z",
+  "blob": {
+    "sha256": "…",
+    "size": 2415919104,
+    "url": "/v1/blobs/…"
+  },
+  "patches_in": [
+    {"from": "3.4.0", "patcher": "bsdiff", "sha256": "…", "size": 1048576},
+    {"from": "3.3.7", "patcher": "bsdiff", "sha256": "…", "size": 4194304}
+  ],
+  "patches_out": [],
+  "channels": ["stable"],
+  "classifications": ["public", "internal"],
+  "deprecated": false,
+  "uncollectable": false,
+  "notes": "..."
+}
+#+end_src
+
+The manifest is the /authoritative/ contract for what a client must
+fetch and verify.  Clients that have it pinned can validate every
+subsequent artefact by hash without needing to trust intermediate
+hops.
+
+** Authentication and authorisation
+
+Three identities exist:
+
+1. *Developer/admin* — uses an X.509 client certificate issued by the
+   organisation's PKI (mTLS) /plus/ a short-lived bearer token
+   acquired from the auth endpoint.  The token carries scopes
+   (=publish:schms=, =admin:channels=…).
+2. *Application/agent* — uses an X.509 client certificate (mTLS) when
+   the deployment requires it; falls back to a bearer token issued
+   per workstation otherwise.  Identity binds to a =client_id=.
+3. *Anonymous* — only the public install page and =health= are
+   reachable; the install page itself mints a one-shot install token
+   for the agent.
+
+Authorisation:
+
+- Software/release visibility is filtered by the intersection of the
+  client's classifications with each release's =classifications= list
+  and channel memberships.
+- Admin endpoints require explicit scopes on the bearer token /and/
+  membership of an =admin= classification.
+- Rate limits per identity are enforced at the HTTP front (token
+  bucket per =client_id= or cert subject).
+
+** Configuration
+
+Single TOML file at =$OTA_ROOT/etc/ota.toml=:
+
+#+begin_src toml
+[server]
+listen        = "0.0.0.0:8443"
+hostname      = "ota.example.com"
+data_dir      = "/var/lib/ota"
+log_level     = "info"
+
+[tls]
+cert          = "etc/server.crt"
+key           = "etc/server.key"
+client_ca     = "etc/clients-ca.crt"
+require_mtls  = true
+
+[storage]
+backend       = "fs"          # or "s3"
+# s3_endpoint = "..."
+
+[catalogue]
+db            = "sqlite:db/ota.db"
+
+[patcher]
+default       = "bsdiff"      # bsdiff | xdelta3
+worker_count  = 4
+
+[gc]
+default_threshold = 0
+schedule          = "0 3 * * *"
+
+[install_token]
+ttl_seconds   = 900
+#+end_src
+
+* Server-side functions (formal)
+
+The functions below are the formal specification; the HTTP API is a
+binding.  They are also exposed by the admin CLI and admin library.
+
+** function publish-new-release
+
+#+begin_src
+publish-new-release(software-name,
+                    os-target,
+                    version,
+                    set-of-files,
+                    options) -> release-id
+#+end_src
+
+Inputs:
+
+- =software-name= — must already exist (or =--create= in
+  =options=).
+- =os-target= — =(os, arch, os-versions)=.  Must be consistent with
+  the package: the publisher attests this.
+- =version= — strict SemVer; must be > all currently-published
+  versions for the same =(software, os-target)=, unless
+  =--allow-out-of-order= is set in =options=.
+- =set-of-files= — directory tree, manifest, or =.zip= uploaded by
+  the developer.  Symlinks are followed and re-recorded as files
+  unless flagged.
+- =options= — =channels[]=, =classifications[]=, =notes=,
+  =default_patcher_override=, =build_patches_against= (list of
+  versions), =uncollectable=.
+
+Effects:
+
+1. Build the deterministic blob, hash it, store it.
+2. Generate a manifest (with empty =patches_in= initially), sign and
+   store it.
+3. Persist the =Release= row.
+4. Enqueue patch-build jobs for the configured set of source
+   releases.
+5. Return the =release-id= immediately; manifest is updated and
+   re-signed each time a patch finishes building.
+
+Error modes: duplicate version, invalid SemVer, mismatched
+=os-target=, blob exceeds configured maximum, signature key
+unavailable.
+
+** function mark-uncollectable
+
+#+begin_src
+mark-uncollectable(software-name, version) -> ok
+#+end_src
+
+Sets =Release.uncollectable = true=.  Idempotent.  An uncollectable
+release is exempt from [[*function garbage-collect][garbage-collect]] regardless of user count.
+
+** function count-user-at-release
+
+#+begin_src
+count-user-at-release(software-name, version) -> integer
+#+end_src
+
+Returns the number of distinct =client_id= values whose most recent
+successful =InstallEvent= for =software-name= names =version=, within
+a configurable window (default 180 days).  This is approximate (clients
+that uninstall do not report) and explicitly documented as such.
+
+** function garbage-collect
+
+#+begin_src
+garbage-collect(software-name,
+                min-user-count = gc-threshold,
+                dry-run        = false) -> [pruned-release-ids]
+#+end_src
+
+For each release of =software-name= that:
+- is not =uncollectable=,
+- is not the latest in any of its channels,
+- has =count-user-at-release(...) <= min-user-count=,
+- has been published longer than =min_age= (config, default 30
+  days),
+
+drop the =Release= row, the blob (after refcount check), and every
+patch that has it as endpoint.  Does /not/ touch manifests of other
+releases beyond removing entries that point at the pruned release.
+
+A =dry-run= mode reports what would be pruned.  GC is also exposed
+as a scheduled job.
+
+** function gc-threshold
+
+#+begin_src
+gc-threshold(software-name) -> integer
+#+end_src
+
+Per-software override of the GC threshold; defaults to
+=gc.default_threshold=.
+
+** function list-software / list-release / latest-release
+
+These are the read-side functions, available to both clients and
+admins.  Their results are filtered by the caller's classifications,
+exactly as described in [[*Authentication and authorisation][Authentication and authorisation]].
+
+* Client
+
+** Update-flow state machine
+
+States and transitions for /one/ software, from the perspective of
+the client.  The on-disk layout described in [[*Storage layout (client)][Storage layout (client)]]
+is the externalisation of this state.
+
+#+begin_src
+                 (no install)
+                      |
+                      | install-software(name, v0)
+                      v
++-----------+   upgrade(v0→v1)   +------------------+
+|  ACTIVE   |-------------------->|  DOWNLOADING     |
+|  (current |                     |  (patch or blob) |
+|   = vX)   |<--------------------|                  |
++-----------+   download fails    +------------------+
+   ^   ^                                |
+   |   | apply fails                    | download ok + sha ok
+   |   |                                v
+   |   |                          +------------------+
+   |   |                          |  PATCHING        |
+   |   |                          |  (build blob-v1) |
+   |   +--------------------------|                  |
+   |                              +------------------+
+   |                                    |
+   |                                    | patch ok + sha ok
+   |                                    v
+   |                              +------------------+
+   |                              |  EXTRACTING      |
+   |                              |  (distribution-  |
+   |                              |   v1)            |
+   |                              +------------------+
+   |                                    |
+   |                                    | extraction ok
+   |                                    v
+   |                              +------------------+
+   |       (atomic switch)        |  STAGED          |
+   +------------------------------|  current=v0,     |
+                                  |  next=v1         |
+                                  +------------------+
+#+end_src
+
+The atomic switch flips =current= → =distribution-v1= and =previous=
+→ =distribution-v0=, then garbage-collects local state per
+[[*Local retention][Local retention]].
+
+Failure at any state leaves =current= pointing at the previous
+working release.  The agent records the partial state in
+=state.json= so the next run can resume mid-flight.
+
+** Local retention
+
+After a successful upgrade =vX → vY=, the client keeps:
+
+- =distribution-vY= (current),
+- =distribution-vX= as =distribution-vX.archived= (one previous,
+  used by [[*function revert-previous-release][revert-previous-release]]),
+- =blob-vX= (still the basis for patches the user might be missing),
+- =blob-vY=,
+- the patch =vX→vY= (so it can be retried after crashes; pruned
+  after a configurable grace period).
+
+On the /next/ upgrade =vY → vZ=, =vX= material is dropped:
+=distribution-vX.archived=, =blob-vX=, and the =vX→vY= patch.  This
+matches the table in the original sketch and bounds disk usage to
+≈ 2 × blob-size + small overhead.
+
+A user-visible setting allows keeping more than one archived
+distribution (=archive_depth=, default 1).
+
+** Client API (=libota=)
+
+The library is the public surface for applications that want to
+self-update.  All functions are non-blocking by default — long
+operations report progress through a callback.  All functions can
+be invoked synchronously by waiting on the returned handle.
+
+#+begin_src
+/* discovery (remote) */
+list_software(out names[])                            -> handle
+list_releases(name, out versions[])                   -> handle
+latest_release(name, out version)                     -> handle
+
+/* install / upgrade (mixed) */
+install_or_upgrade(name, version_or_LATEST,
+                   progress_cb, opts)                 -> handle
+revert_previous(name)                                 -> result    /* local */
+
+/* introspection (local) */
+current_release(name, out version)                    -> result
+downloaded_releases(name, out versions[])             -> result
+downloaded_upgrades(name, out pairs[])                -> result
+
+/* maintenance (local) */
+verify_local_state(name)                              -> report
+prune_local(name, opts)                               -> result
+
+/* lifecycle */
+ota_init(config_path)                                 -> ctx
+ota_shutdown(ctx)
+#+end_src
+
+Cancellation, progress, and error reporting are uniform:
+=handle_cancel(h)=, =handle_progress(h) -> {phase, bytes, total}=,
+=handle_wait(h, timeout) -> result=.
+
+Bindings: a thin C ABI is the canonical surface; idiomatic wrappers
+are provided for at least Common Lisp (=cffi=), AutoLISP (via the
+agent CLI fallback), Python, and .NET.  See [[*Stack and language choices][Stack and language choices]].
+
+** =ota-agent= CLI
+
+A single executable.  Same set of operations as the library, exposed
+as subcommands:
+
+#+begin_src
+ota-agent install   <name> [--version=X|--latest]
+ota-agent upgrade   <name> [--to=X|--latest]
+ota-agent revert    <name>
+ota-agent list      [--remote|--local]
+ota-agent show      <name>
+ota-agent verify    <name>
+ota-agent prune     <name> [--archive-depth=N]
+ota-agent watch     <name> [--interval=24h]   # background watcher
+ota-agent doctor                              # diagnose env, perms, certs
+ota-agent doctor    <name> --recover          # interactive multi-step rollback
+#+end_src
+
+All subcommands accept =--json= for machine-readable output, used
+by integrations.
+
+** Functions (formal, client-side)
+
+*** function list-software / list-release / latest-release
+
+Remote calls to the corresponding server functions, with classification
+filtering applied server-side.  The library caches responses
+(default TTL 5 minutes; overridable per call).
+
+*** function install-or-upgrade-software
+
+#+begin_src
+install-or-upgrade-software(name, version) -> ok | error
+#+end_src
+
+If no blob for =name= exists locally:
+
+1. Fetch manifest of =version= from the server.
+2. Download full blob (=GET /v1/blobs/...=).
+3. Verify =sha256= against the manifest.
+4. Extract to =distribution-<version>=.
+5. Atomically flip =current=.
+
+Else (some blob =vX= exists locally):
+
+1. Fetch manifest of =version=.
+2. Resolve a patch path =vX → ... → version=.  Prefer a single
+   patch; otherwise chain.  Fall back to full blob if no path is
+   available or if the cumulative patch size exceeds the full blob
+   size × =fallback_ratio= (config, default 0.7).
+3. Download patch(es); verify =sha256= of each.
+4. Apply: =bspatch (or xdelta3) blob-vX patch... -> blob-version=;
+   verify =sha256= of the resulting blob against the manifest.
+5. Extract to =distribution-<version>=.
+6. Atomically flip =current=.
+7. Update local retention as in [[*Local retention][Local retention]].
+
+Successful completion posts a =POST /v1/events/install= event.
+
+*** function revert-previous-release
+
+#+begin_src
+revert-previous-release(name) -> ok | error
+#+end_src
+
+Swaps =current= and =previous= symlinks.  Both must exist and be
+valid distributions.  Posts an install event with
+=kind = "revert"=.
+
+*** function downloaded-releases / downloaded-upgrades
+
+Local enumeration of =blobs/= and =patches/= directories,
+cross-checked against =state.json=.
+
+* Administrative tasks
+
+The administrative surface, in addition to the API, is:
+
+** Day-to-day
+
+- Publish a new release for a given software/OS-target.
+- Tag a release as deprecated (still downloadable, but not
+  recommended).
+- Mark a release as uncollectable (long-term archive).
+- Promote a release across channels (=canary= → =beta= → =stable=).
+- Inspect download / install statistics.
+- Force-build a missing patch (e.g. for a long-tail user on a very
+  old release).
+
+** Periodic / scheduled
+
+- =gc= : pruning of releases below the user-count threshold.
+- Verification job : walks =blobs/= and =patches/= and re-hashes them
+  to detect bit-rot; reports mismatches.
+- Re-signing job : re-signs manifests when the signing key rotates.
+
+** Lifecycle
+
+- Create / retire a software product.
+- Rotate the server certificate and the manifest-signing key.
+- Issue / revoke client certificates (delegated to the org PKI; the
+  server only consumes the CRL/OCSP responder).
+- Channel and classification management (create, rename, change
+  membership).
+- Backup / restore : the catalogue DB plus =$OTA_ROOT/blobs= and
+  =$OTA_ROOT/patches= and =$OTA_ROOT/manifests=.  Blobs and patches
+  are content-addressed and trivially deduplicable across backups.
+
+** Disaster recovery
+
+- Re-import a release from a backup blob: the server can reconstruct
+  the manifest and re-sign it given a blob and metadata.
+- Re-build all patches for a software (cold rebuild after
+  catastrophic loss of =$OTA_ROOT/patches/=).
+
+* Stack and language choices
+
+The constraints are:
+
+- *Server* : Unix host; long-running daemon; small operational
+  footprint; good cryptography and HTTP libraries; able to call
+  =bsdiff=/=xdelta3= efficiently; fits the existing Common-Lisp /
+  AutoLISP toolchain in this repo.
+- *Admin CLI / library* : runs on Windows / macOS / Linux developer
+  workstations; same authentication and signing primitives as the
+  server.
+- *Client library* : embeddable into applications written in
+  arbitrary host languages (AutoLISP plug-ins, BricsCAD plug-ins,
+  Python tools, .NET tools), with C ABI as the lingua franca.
+- *Client agent* : single self-contained executable, distributable
+  from the install page to Windows, macOS and Linux workstations.
+
+** SBCL vs Go — analysis
+
+Two stacks were considered seriously, in light of (a) this repo's
+Common-Lisp tooling (=clautolisp=, =velisp=, AutoLISP plug-ins) and
+(b) the fact that the system has to move 2–8 GB blobs.
+
+*** A. Binary I/O in SBCL
+
+The worry that "Common Lisp is slow on file I/O because it has to
+take encodings into account" applies *only to character streams*.
+With =:element-type '(unsigned-byte 8)= the SBCL fd-stream performs
+raw byte I/O — no encoder/decoder is involved.  The historical
+pessimisation where =write-sequence= fell back to per-element output
+was fixed in =sbcl-0.9.0.36= ([[https://bugs.launchpad.net/sbcl/+bug/309136][Launchpad #309136]]); modern SBCL
+emits a single buffered system call for a =(simple-array
+(unsigned-byte 8) (*))= target.  The remaining cost is the FFI-level
+buffer copy into the stream's internal buffer, which can be bypassed
+with =fast-io= ([[https://github.com/rpav/fast-io][rpav/fast-io]]) or with direct =sb-posix:read=/=write=
+on a foreign buffer.
+
+No public MB/s benchmark for raw =read-sequence= on
+=(unsigned-byte 8)= fd-streams was found, but anecdotal evidence
+puts it in the multi-hundred-MB/s range, dominated by =memcpy= and
+disk bandwidth.  Go's =io.Copy= bottoms out at the same place and,
+when both ends are real files/sockets, additionally triggers
+=sendfile=/=splice= automatically.
+
+*Conclusion:* binary I/O is not where SBCL loses to Go.
+
+*** B. HTTP server throughput — large static files
+
+Fukamachi's own [[https://github.com/fukamachi/woo/blob/master/benchmark.md][Woo benchmark]], tiny "Hello World", 8-core VPS:
+
+| Server                | 1 worker, 100 conn | Best                       |
+|-----------------------+--------------------+----------------------------|
+| Woo                   | 38 591 req/s       | 110 528 (4 workers)        |
+| Go =net/http=         | —                  | 97 647 (=GOMAXPROCS=4=)    |
+| Hunchentoot           | —                  | 29 295 (multi-threaded)    |
+| Node                  | 12 000             | 43 000                     |
+
+These are tiny-response numbers and don't translate to GB-class
+files.  No published benchmarks for any of these stacks serving
+multi-GB files were found.  At those sizes the limit is NIC and
+disk bandwidth, *provided the server uses sendfile*.
+
+*** C. =sendfile(2)= / zero-copy — the kingmaker
+
+For an 8 GB blob, whether the server has to read the file into
+userspace and write it back out again is the single most important
+performance question.  Findings:
+
+- *Woo: yes, native.*  Its source confirms =sendfile-fd=,
+  =sendfile-size=, =sendfile-offset= slots and a =wsys:sendfile=
+  call wired into the libev async-write pipeline ([[https://github.com/fukamachi/woo/blob/master/src/ev/socket.lisp][src/ev/socket.lisp]]).
+  Triggered when the Clack/Lack response body is a =pathname=.
+- *Hunchentoot: no built-in sendfile.*  Files are served through
+  Gray-stream layers (=flexi-streams=, =chunga=); userspace copy
+  for every byte ([[https://tbnl-devel.common-lisp.narkive.com/2LxifIaL/hunchentoot-devel-hunchentoot-performance][hunchentoot-devel thread]]).
+- *Clack: =pathname= response body* is the protocol-level hook for
+  "let the adapter optimise"; only Woo actually exploits it.
+- *Go: yes, automatic.*  =http.ServeFile= / =io.Copy= triggers
+  =sendfile=/=splice= when source is =*os.File= (note the Go 1.21
+  =ServeFile= regression [[https://github.com/golang/go/issues/61530][golang/go#61530]], since fixed).
+
+*Conclusion:* SBCL+Woo and Go are equivalent for plain HTTP serving
+of large blobs — both delegate to the kernel.  *Hunchentoot is the
+wrong choice* for this workload.
+
+*** D. HTTPS / TLS
+
+=cl+ssl= is a thin FFI wrapper around OpenSSL — the crypto runs at
+OpenSSL's full speed.  The bottleneck, when one exists, is the
+per-record FFI round-trip plus the Gray-stream byte plumbing on
+top.  No published cl+ssl throughput number for large transfers was
+found; empirically, 16 KB+ chunks via =read-sequence=/
+=write-sequence= close most of the gap with bare OpenSSL.  Go's
+=crypto/tls= is pure Go and lands within 10–20 % of OpenSSL on
+AES-NI hardware for bulk transfers, and =tls.Conn= does *not*
+support sendfile (TLS encrypts in userspace) — *so Go also loses
+zero-copy under HTTPS*.
+
+*Conclusion:* under HTTPS both stacks pay userspace copy costs.  Go
+has a modest edge but it is not a kingmaker the way C is.
+
+*** E. Distribution of executables to clients
+
+| Aspect                       | SBCL                                                                           | Go                                                       |
+|------------------------------+--------------------------------------------------------------------------------+----------------------------------------------------------|
+| Binary size                  | 30–60 MB raw image; ~12 MB with =:compression t= (zstd) ([[https://github.com/lisp-tips/lisp-tips/issues/20][lisp-tips #20]])    | 5–15 MB static binary                                    |
+| Startup time                 | ~30 ms uncompressed; ~180 ms with compression                                  | a few ms                                                 |
+| Tree-shaking                 | not really — the whole runtime ships                                           | dead-code elimination by the linker                      |
+| Cross-compilation            | bootstrap with another CL, in practice "build natively on each target" ([[https://www.sbcl.org/porting.html][sbcl.org/porting]]); for Windows the practical recipe is to build under Wine ([[https://www.fosskers.ca/en/blog/cl-windows][Woodbury]]) | =GOOS=windows GOARCH=amd64 go build= cross-compiles in seconds with no toolchain gymnastics |
+| Single CI job → 3 binaries?  | no, three separate native builds (Linux, macOS, Windows)                       | yes, one CI job emits Win/macOS/Linux binaries           |
+| External runtime dependencies | OpenSSL DLLs / dylibs / .so for cl+ssl                                        | none (pure-Go =crypto/tls=)                              |
+
+*Conclusion:* for a *client* CLI shipped to Windows/macOS/Linux end
+users, Go is materially better.  Smaller download, no native build
+matrix, no OpenSSL distribution problem on Windows.
+
+*** F. SBCL on Windows — current state
+
+Windows x86-64 is on the [[https://www.sbcl.org/platform-table.html][official platform table]] with current
+binaries (2.6.x).  Caveats:
+
+- Threads on Windows are progressively integrated (the historical
+  staging ground was [[https://github.com/akovalenko/sbcl-win32-threads][sbcl-win32-threads]]) but no clear announcement
+  of full feature parity with the Linux thread implementation as of
+  2024–2026.
+- =sb-bsd-sockets= and =cl+ssl= work on Windows.
+- No native sendfile on Windows in any case (Windows has
+  =TransmitFile=); Woo is libev-based and Unix-targeted, so the
+  *server* is not deployed on Windows anyway.
+
+*Conclusion:* SBCL on Windows is workable but second-class; this is
+relevant to the *client* CLI, not the server.
+
+*** Summary
+
+- *Server side*: SBCL+Woo and Go are roughly equivalent for the
+  GB-class blob case because both delegate to =sendfile=.  Go has a
+  modest edge under HTTPS bulk transfers.  The choice is therefore
+  governed by code-sharing with the rest of this repo (which favours
+  SBCL) rather than by raw performance.
+- *Client side*: Go wins decisively on cross-platform CLI
+  distribution.  Smaller binary, trivial cross-compile, no runtime
+  dependencies, easier deployment to non-technical Windows users.
+
+** Recommended defaults
+
+| Component             | Language               | Rationale                                                                |
+|-----------------------+------------------------+--------------------------------------------------------------------------|
+| =ota-server=          | Common Lisp (SBCL) + Woo | sendfile-equipped, ≈ Go on raw throughput, shares code with admin CLI; aligns with the repo's Lisp tooling.  *Not Hunchentoot* — userspace copy disqualifies it for GB blobs |
+| Patch builder workers | =bsdiff= / =xdelta3= upstream binaries called from the server | proven, no reinvention                              |
+| =ota-admin= CLI       | Common Lisp (SBCL)       | shares the catalogue / signing / manifest code with =ota-server= via a common Lisp library; admins are developers and can install a Lisp |
+| =libota= core         | Go (=c-shared= buildmode) → static lib + shared lib + C header | pure-Go =crypto/tls=, trivial cross-compilation, sub-15 MB; exposes a C ABI for embedding |
+| =libota= bindings     | C header generated by =cgo=, idiomatic wrappers for Python (=ctypes=), .NET (P/Invoke), Common Lisp (=cffi=); AutoLISP integrates via shell-out to =ota-agent= | reach the host languages used in our plug-ins |
+| =ota-agent= CLI       | Go, statically linked     | single ~10 MB binary per OS produced by one CI job; no runtime VM, no OpenSSL DLL dance on Windows |
+| Web install page      | Static HTML + minimal JS, served by =ota-server= | trivial, cacheable                                       |
+| Catalogue DB          | SQLite by default; PostgreSQL when scaled | zero-ops single-host; standard scale-out path                            |
+
+This is a deliberate split: *server in Lisp* (it lives in our
+ecosystem, runs on a single host we control, sendfile makes the
+language overhead irrelevant), *client in Go* (it ships to thousands
+of unmanaged Windows desktops where binary size, dependency-free
+distribution, and trivial cross-compilation matter most).
+
+The =libota= core and the =ota-server= speak only the HTTP/JSON
+API and the signed-manifest schema, so the language gap does not
+leak into the contract.
+
+** Acceptable alternatives
+
+- *Server in Go too* : collapses the toolchain to one language;
+  loses the code-sharing with the rest of the Lisp tooling in this
+  repo.  Use this if a separate ops team takes over operation.
+- *Server in Rust* : similar tradeoffs to Go, plus the strongest
+  guarantees on the patch worker side; higher up-front cost.
+- =libota= *core in Rust* (=cdylib=) : drop-in replacement for the
+  Go core if memory-safety guarantees are a hard requirement; the
+  C ABI surface is the same.
+- =libota= *core in C11* : smallest possible binary, but pulls in
+  the OpenSSL distribution problem on Windows that Go avoids.
+- =ota-admin= CLI *in Go* (sharing =libota=) : if we decide developers
+  should not have to install a Lisp to publish releases.
+
+Whatever the language, the *contract* is the HTTP/JSON API, the
+manifest schema, and the =libota= C ABI — these are the things the
+rest of the system must agree on.  The implementation language
+behind each contract is an internal decision and may change.
+
+* Security
+
+** Threats considered
+
+- *Tampered release on the wire* : every artefact is hashed in the
+  manifest; the manifest itself is signed.  The client refuses any
+  artefact whose hash does not match.
+- *Tampered manifest* : detached signature with a key whose public
+  half is pinned in the client.  Key rotation is supported via a
+  signed key-list bundled with the client (initial trust) and
+  refreshed through the same channel.
+- *Replay / downgrade* : the client refuses to "upgrade" to a version
+  whose =published_at= is older than the currently installed
+  release's, unless the user explicitly passes =--allow-downgrade=.
+- *Compromised dev workstation* : admin endpoints require both mTLS
+  and a short-lived bearer token; publishing a release leaves an
+  audit trail (=published_by=, certificate fingerprint).
+- *Compromised server* : an attacker who controls the server can
+  serve malicious blobs.  Defence in depth: the manifest-signing key
+  is on a hardware token, not on the server's filesystem; the server
+  proxies signing through a co-located signer process when the key
+  rotates.
+- *Path traversal at extraction* : the client refuses any tar entry
+  whose normalised path escapes the distribution root, or whose name
+  is a reserved Windows device name (=CON=, =PRN=, …).
+
+** Required minimum cryptography
+
+- Transport : TLS 1.3, mTLS optional but recommended.
+- Hashes : SHA-256 throughout.
+- Signatures : Ed25519 for manifests; X.509/RSA-2048 or ECDSA-P256
+  for transport certificates (whatever the org PKI mandates).
+
+* Self-containment and vendoring
+
+The system must be deployable on workstations without
+pre-installed tooling.  In particular:
+
+- the *client* (=ota-agent= and =libota=) must be a single
+  self-contained binary per OS, with /no/ runtime dependency on
+  =bsdiff=, =bspatch=, =xdelta3=, =tar=, OpenSSL, or any other
+  external tool or shared library;
+- the *server* may rely on the OS (Unix, OpenSSL via =cl+ssl=) but
+  must not require system-installed =bsdiff=, =xdelta3=, or =tar=
+  binaries either — they are vendored and built as part of the
+  server's own build.
+
+** Vendoring policy
+
+- Every third-party source vendored into the project must be
+  *permissively licensed*: MIT, BSD-2/3-Clause, Apache-2.0, or ISC.
+  GPL / LGPL / AGPL sources are *prohibited*.  This excludes in
+  particular =jmacd/xdelta-gpl= (GPLv2); we vendor the Apache-2.0
+  =jmacd/xdelta= repo.
+- Vendored sources live under =vendor/= (server) and =client/internal/vendor/=
+  (client), one subdirectory per upstream, each carrying a verbatim
+  copy of the upstream =LICENSE= file plus a =VENDORED.md= metadata
+  file (upstream URL, commit/tag pinned, date of import, any local
+  patches).
+- Updates are infrequent, deliberate, and pass through code review
+  exactly like first-party code.  No automatic upstream pulls.
+- The build does not reach the network.  All sources required to
+  build are committed (or fetched once into a local cache by an
+  explicit =make vendor= step that records hashes).
+
+** Selected vendored components
+
+| Component                       | Upstream                       | License       | Lang     | Used by                       |
+|---------------------------------+--------------------------------+---------------+----------+-------------------------------|
+| bsdiff / bspatch (client)       | =gabstv/go-bsdiff=             | MIT           | pure Go  | =libota= patch applier        |
+| bsdiff / bspatch (server)       | =mendsley/bsdiff=              | BSD-2-Clause  | C        | server patch builder          |
+| xdelta3 (server)                | =jmacd/xdelta= (=xdelta3/=)    | Apache-2.0    | C        | server patch builder          |
+| VCDIFF decoder (client)         | =ably/vcdiff-go=               | Apache-2.0    | pure Go  | =libota= patch applier        |
+| tar reader/writer (server)      | =sharplispers/archive=         | BSD-3-Clause  | Common Lisp | server release ingestion / extraction tests |
+| tar reader/writer (client)      | Go =archive/tar= (stdlib)      | BSD-3-Clause  | pure Go  | =libota= extractor — not vendored, stdlib |
+| Ed25519, SHA-256 (server)       | =ironclad=                     | BSD-3-Clause  | Common Lisp | manifest signing/verify     |
+| Ed25519, SHA-256 (client)       | Go =crypto/ed25519=, =crypto/sha256= (stdlib) | BSD-3-Clause | pure Go | manifest verify     |
+
+Notes :
+
+- The Go client is *cgo-free*.  =go-bsdiff= and =vcdiff-go= are pure
+  Go; tar, ed25519, sha256, http and tls all come from the stdlib.
+  This is what gives us a single static binary per OS produced by
+  one CI job.
+- The server vendors C sources for =bsdiff= and =xdelta3= and
+  builds tiny CLI binaries from them at server build time.  The
+  binaries are invoked as subprocesses by the patch worker.  This
+  isolates the C code in short-lived processes and avoids =cffi=
+  bindings in the SBCL build.  Both are small (=mendsley/bsdiff=
+  ~700 lines, =xdelta3/= ~30 KLoC) and build with a vendored
+  =Makefile=.
+- =jmacd/xdelta-gpl= is *not* used.  All references to "xdelta3"
+  in this document mean the Apache-2.0 =jmacd/xdelta= repository.
+- =VCDIFF= encoding (server side, when =Software.default_patcher = xdelta3=)
+  is performed by the vendored =xdelta3= binary.  The client only
+  needs to /apply/ the patch, which =vcdiff-go= does in pure Go.
+- If =sharplispers/archive= proves insufficient for some PAX edge
+  case at server-side extraction (long paths, sparse files), the
+  fallback is to vendor and FFI =libarchive= (BSD-2-Clause); this is
+  not expected to be necessary for our deterministic-tar inputs.
+- Optional future upgrade : =sisong/HDiffPatch= (MIT, ~30 KLoC
+  C++) if =bsdiff4= compression turns out to be insufficient.  Adds
+  a =cgo= dependency for the client, so we accept it only if
+  measured savings justify it.
+
+** Build-time provenance
+
+Every vendored component is recorded in =docs/dependencies.org=
+with: upstream URL, exact pinned commit hash, license SPDX id,
+import date, and the SHA-256 of the imported tree.  The CI builds
+the same hash from the in-tree source and fails if it diverges,
+preventing silent edits to vendored code.
+
+* Performance, sizing and operational limits
+
+** Steady state
+
+- Diff size for a 2 GB package, monthly cadence, mostly recompiled
+  binaries: 5–50 MB with =bsdiff= is realistic; assume 20 MB
+  median.
+- 10 000 clients all upgrading at 09:00 Monday : 10 000 × 20 MB
+  = 200 GB egress.  At 2 × 10 Gb/s the server saturates for
+  ~80 s, which is acceptable.  No staggering needed at this scale.
+
+** Initial install
+
+- Full 2 GB blob × 10 000 first-time clients = 20 TB egress, which is
+  /not/ acceptable as a thundering herd.  Initial-install rollouts
+  /are/ staggered when the install page hands out tokens (token
+  bucket per channel; queued tokens get a "your install will start
+  in N minutes" message).
+
+** Limits to enforce
+
+- Maximum blob size : 8 GB by default (rejects pathologically large
+  releases).
+- Maximum patch size : 50% of target blob (above that, the server
+  /also/ surfaces the full blob URL and lets the client fall back).
+- Concurrent uploads per admin identity : 1.
+- Concurrent downloads per client identity : 4.
+
+* Resolved design decisions
+
+The following questions were considered and resolved.  They are
+recorded here (rather than in the body of the spec) so that the
+reasoning behind each choice remains visible.
+
+** No swarm distribution (BitTorrent / IPFS)
+
+Decision :: HTTP only.
+
+Rationale : the expected volume does not justify the operational
+cost.  Most clients connect through corporate VPN over a wide
+spread of access types — fibre to flaky Wi-Fi, with laptops that go
+on- and offline unpredictably — which is exactly the access profile
+swarm protocols handle worst.  Staggered HTTP from the server is
+sufficient at the 10 000-client scale (see [[*Performance, sizing and operational limits][Performance, sizing
+and operational limits]]).
+
+** No re-delta of patches on manifest re-signing
+
+Decision : on key rotation we re-sign manifests in place; the
+patches themselves do not change.
+
+Rationale : patches are content-addressed by =sha256=.  A re-signed
+manifest still references the same patch hashes, so nothing about
+the patch payload needs to move.  Note for the implementation:
+=bsdiff= and =xdelta3= are fast enough that we can /regenerate/
+patches on demand if any are lost or corrupted.  See [[*Reverse patches (downgrade)][Reverse
+patches (downgrade)]] for a related, optional capability.
+
+** Reverse patches (downgrade)
+
+Decision : keep the option open.  Forward (upgrade) patches are the
+normal case and the only required one for v1.  Reverse patches
+(=Y → X= where =Y > X=) are easy to generate with the same tools and
+may be added when the recovery tool (below) needs them.
+
+Rationale : the normal user case is upgrading to the latest
+version; we do not want to spend storage and patch-build cycles on
+a path that may never be used.  When recovery scenarios require a
+downgrade, the recovery tool can either reverse-patch from the
+current blob to a known-good earlier blob, or download the earlier
+blob outright.  The server already retains old blobs (they are
+sources for upgrade patches), so the recovery path always has a
+target.
+
+** Recovery tool with multi-step rollback
+
+Decision : ship a recovery tool, =ota-agent doctor --recover=,
+that can revert across more than one release.
+
+Behaviour : the tool lists every locally available distribution
+(=current=, =previous=, any =distribution-*.archived= still on
+disk) plus a small server-curated list of "known-good anchor
+versions" for the software (typically the most recent
+=uncollectable= releases per channel).  The user picks one.  If the
+chosen version is not locally materialised, the tool downloads its
+blob (full or via a chain of patches/reverse-patches) before
+flipping =current=.
+
+Rationale : local retention only keeps one previous distribution by
+default ([[*Local retention][Local retention]]).  Users in trouble may need to go
+further back, especially when a recent release is the cause of the
+problem.  The "anchor versions" list is a server-side hint, not a
+hard rule, and is exposed at =GET /v1/software/{software}/anchors=.
+
+** Channel promotion policy
+
+Decision : deferred.
+
+The system supports both manual promotion and automated promotion
+("after N days in =canary= with no failure events, promote to
+=beta=") at the API level.  Choosing one as the default policy is
+left for a later operational decision once we have telemetry data
+on what failure rates and soak times look like in practice.
+
+** AutoLISP integration shape
+
+Decision : *shell-out* to =ota-agent= is the supported integration.
+
+Rationale : it is dramatically simpler than wiring an =ads_invoke= /
+BRX wrapper around a Go =c-shared= DLL, has no in-process failure
+modes that can crash BricsCAD, and the cost (an exec per check) is
+negligible compared with the network round-trip the agent will
+perform anyway.  The =libota= C ABI exists for non-AutoLISP hosts
+(Python, .NET) and remains available if a future need for in-process
+progress callbacks during a long-running BricsCAD session emerges.
+
+** =libota= core language
+
+Decision : Go, built with =-buildmode=c-shared= (and =c-archive=
+where a static link is preferred).
+
+Rationale : single CI job emits the three platform binaries; the
+pure-Go TLS stack avoids shipping OpenSSL DLLs to Windows users;
+binary size (~10 MB) is acceptable for an embedded library.
+Revisit only if (a) we need binaries below 5 MB, or (b) we end up
+doing significant low-level work (sendfile, mmap) that is friendlier
+in C or Rust.
+
+* Appendix A — Original sketch (preserved)
+
+The original free-form sketch this document expanded from is kept,
+verbatim, alongside this file as =ota-specifications.org.draft1=.
+The formal specification above supersedes it.

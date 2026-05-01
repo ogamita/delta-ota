@@ -1,0 +1,212 @@
+
+* Specifications for an OTA system
+
+** Purpose
+
+We want to distribute a software package.
+This packages is composed of several failes, sources, compiled files,
+resources, binary libraries.
+It amounts up to more than 2 GB.
+
+New versions are released periodically (say monthly).
+
+Users have variable bandwidth and latency, so they cannot get the
+files on-demand reliably, and they cannot download the whole package
+at each release.
+
+Therefore we need an OTA system that will let users download only the
+changes from one release to the other, which should be smaller patch
+files easily managed by the network and users.
+
+** Features
+
+We may use xdelta3 or perhaps better (compression-wise): bsdiff to
+implement the system.
+
+*** Server side
+
+Since users may not all upgrade in sync, the server will have to keep
+several versions (as long as some user has this version installed),
+along with the diff from these versions to the latest version.
+
+**** function publish-new-release (name version-number set-of-files)
+
+- =name= names the software.
+- =version-number= specifies the version of the release.
+- =set-of-file= is a set of files composing the release of the software.
+
+This function stores in the server a new release of the software.
+It may prepare new diffs for distribution.
+It may send notifications or otherwise prepare for the users to detect
+the new release.
+
+**** function mark-uncollectable (name version-number)
+
+- =name= names the software.
+- =version-number= specifies the version of the release.
+
+This function indicates that this relaase of the software may never be
+erased from the server (it's a permanent archive).
+
+**** function count-user-at-release (name version-number) -> integer
+
+- =name= names the software.
+- =version-number= specifies the version of the release.
+
+Statistics of user fetching releases are kept, so we may infer a count
+of users still using a given release of the software.
+Note: this is approximate, since users who disappear (erase their
+software) are not accounted for.
+
+**** function garbage-collect (name [min-user-count = 0])
+
+- =name= names the software.
+- =min-user-count= specifies the version of the release.
+
+Erase the releases of the softare that have at most min-user-count users
+
+*** Client side
+
+Clients may install software packages.
+The first time a full download of the package is needed.
+When a new release is available, the user may upgrade.
+It is possible to skip an release or more.
+The user system must keep the binary blob of the release he uses, so
+patches against it may be performed to obtain a new release binary
+blob, before installation of the upgrade.
+When an upgrade is downloaded, only a small patch file is obtained,
+and used to patch the saved binary blob.
+
+As OTA, we must ensure that the user always has a working software
+release, so:
+
+1- the download of the patch is asynchronous and nothing is ever
+   upgrade before full completion and validation of the download is
+   obtained.
+
+2- the patching of the binary blob is asynchronous and nothing is ever
+   upgrade before full completion and validation of the new binary
+   blob.
+
+3- we don't upgrade by overriding the exising installation, but
+   install the new release in a parallel distribution directory, and
+   only when this distribution directory is completed and validated,
+   the switch over to the new release is performed (the old
+   distribution directory can be archived and scheduled for
+   later suppression).
+
+For release n active:
+
+- blob-n
+- distribution-n
+
+When upgrade from n to m:
+
+- blob-n
+- distribution-n
+- diff-n-m
+then:
+- blob-m
+then:
+- distribution-m
+then (switch over):
+- distribution-n.archived
+
+So for release m active:
+
+- blob-n
+- distribution-n.archived
+- diff-n-m
+- blob-m
+- distribution-m
+
+When upgrade from m to o:
+
+- delete blob-n
+- delete distribution-n.archived
+- delete diff-n-m
+
+and proceeed like from n to m.
+
+**** function list-software () -> list-of-software-name            ; remote
+
+Queries the server to return list of software names available.
+
+**** function list-release (name) -> list-of-version-number        ; remote
+
+- =name= names the software.
+
+Queries the server to return the list of release =version-number=
+available.
+
+**** function latest-release (name) -> version-number              ; remote
+
+- =name= names the software.
+
+Queries the server to return just the =version=number= of the last
+release.
+
+**** function install-or-upgrade-software (name version-number)    ; mixed
+
+- =name= names the software.
+- =version-number= specifies the version of the release.
+
+If a binary blob is not available locally, then
+
+   download a full release, and install it.
+
+else
+
+  find the diff we need to use
+  download this diff
+  apply it to build the wanted binary blob
+  and install it.
+
+end
+
+Successful installation implies archiving the previous installation.
+
+**** function revert-previous-release (name)                       ; local
+
+- =name= names the software.
+
+Archive the current installation, and
+unarchive the previous installation.
+
+**** function downloaded-releases (name) -> list-of-version-number ; local
+
+- =name= names the software.
+
+Internal function.
+Return the list of releases that we have locally.
+
+**** function downloaded-upgrades (name) -> list-of-pair-of-version-number ; local
+
+- =name= names the software.
+
+Internal function.
+Return the list of diff that we have locally.
+((from-n to-m) (from-m to-o) …)
+
+*** Interaction - Authetication - Security
+
+The system may be configured to use authentication of the client and
+server (certificates), and to check them.
+
+The server may be configured so that availability of software and
+version depend on a classification of the client.  So functions such
+as list-software, list-release, latest-release and
+install-or-upgrade-software
+may return different result depending on the client and time when the
+request is made.
+
+In some circumstances, we may want to stagger distributions of
+releases amongst numerous clients.
+
+But note that if a diff is about 1 MB, 10_000 client downloading it AT
+THE SAME TIME (eg. 9:00 on Monday morning), will involve a traffic of
+only 10 GB on the server side, which is entirely supported by current
+high end internet server in internet server centers.  Such servers
+have 2 x 10 Gb/s ethernet connections and the internet bandwidth to
+feed them. So staggering would hardly be needed. (Perhaps only for new
+software where full downloads would be needed).

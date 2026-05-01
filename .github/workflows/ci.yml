@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Smoke-test workflow for the GitHub mirror of delta-ota.
+# The authoritative pipeline is on GitLab — this workflow only runs
+# the cheap checks so that PRs from contributors who only see the
+# mirror still get fast feedback.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  vendor-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify vendored sources are unmodified
+        run: tools/vendor-verify.sh
+
+  go-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build client (Linux)
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          cd client
+          go build -trimpath -tags=netgo,osusergo ./...
+      - name: Vet
+        run: cd client && go vet ./...
+      - name: Test
+        run: cd client && go test ./...
+
+  go-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Cross-compile ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cd client
+          go build -trimpath -tags=netgo,osusergo -o ../build/${{ matrix.goos }}-${{ matrix.goarch }}/ ./...
+
+  licence-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX headers
+        run: tools/check-licence-headers.sh

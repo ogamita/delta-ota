@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+
+# Build outputs
+/build/
+/server/build/
+/admin/build/
+/client/build/
+/bin/
+/dist/
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/client/coverage.out
+/client/vendor/                  # we use client/internal/vendor/, never client/vendor/
+
+# SBCL / Common Lisp
+*.fasl
+*.fas
+*.lx32fsl
+*.lx64fsl
+*.dx32fsl
+*.dx64fsl
+*.dfsl
+*.pfsl
+*.d64fsl
+*.p64fsl
+*.lisp-temp
+.cache/
+.qlot/
+
+# Editor backups (project rule: never read these)
+*~
+*.~[0-9]*~
+*.bak
+.#*
+\#*\#
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artefacts
+/tests/tmp/
+/tests/e2e/run/
+*.log
+
+# Local development
+/.env
+/.envrc
+/local/
+*.local.toml
+
+# Claude Code per-developer config
+/.claude/settings.local.json
+
+# Spec draft snapshot is kept beside the spec (referenced by Appendix A)
+# but is not auto-generated; it stays tracked.

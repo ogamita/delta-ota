@@ -1,0 +1,487 @@
+#+TITLE: OTA — Implementation Plan
+#+AUTHOR: Pascal Bourguignon
+#+OPTIONS: toc:3 num:t
+#+STARTUP: showall
+
+This plan turns [[file:ota-specifications.org][ota-specifications.org]] into a delivery sequence.
+Phases are *vertical slices*: each one ends on a working,
+demonstrable system, not on a layer.
+
+* Guiding principles
+
+- /Contract first/ : the HTTP/JSON API, the manifest schema, and
+  the =libota= C ABI are written down before code touches the
+  network.  Anything else can be rewritten cheaply.
+- /Boring first/ : SQLite + filesystem blobs + Woo + Go are the
+  default; postpone PostgreSQL, S3, mTLS hardware tokens, automated
+  channel promotion, and the recovery tool to phases where their
+  cost is paid by a real need.
+- /End-to-end early/ : phase 1 already does upload → patch →
+  download → install on one OS, even though half the code is stubs.
+  Every later phase keeps that pipeline green.
+- /Test what hurts/ : determinism (blob byte-identity), atomicity
+  (failure mid-install never breaks =current=), patch correctness
+  (reconstructed blob hash matches manifest).  Integration tests run
+  on real disk; unit tests stay narrow.
+
+* Repository layout
+
+#+begin_src
+src/ota/
+├── docs/                       specifications, this plan, ADRs
+├── server/                     SBCL project (asdf system "ota-server")
+│   ├── ota-server.asd
+│   ├── src/
+│   │   ├── catalogue/          schema, queries (sqlite/postgres)
+│   │   ├── storage/            blob/patch CAS, deterministic tar
+│   │   ├── manifest/           build/sign/verify, schema
+│   │   ├── http/               Woo handlers, routing, auth
+│   │   ├── workers/            patch-build, gc, verify
+│   │   └── admin/              shared with ota-admin (CLI)
+│   └── tests/
+├── admin/                      ota-admin CLI (SBCL, depends on server)
+│   ├── ota-admin.asd
+│   ├── src/
+│   └── tests/
+├── client/                     Go module
+│   ├── go.mod
+│   ├── libota/                 public Go package + cgo c-shared entrypoints
+│   ├── agent/                  ota-agent CLI (main package)
+│   ├── internal/
+│   │   ├── manifest/           parse + verify (Ed25519)
+│   │   ├── transport/          HTTP client, resume, retry
+│   │   ├── patch/              bsdiff/xdelta3 wrappers
+│   │   ├── tarx/               deterministic extract, path sanitiser
+│   │   ├── state/              state.json, current/previous symlinks
+│   │   └── platform/           win/macos/linux specifics (junction, …)
+│   └── tests/
+├── schemas/
+│   ├── manifest.schema.json
+│   └── api.openapi.yaml
+├── vendor/                     vendored sources for the SERVER side
+│   ├── mendsley-bsdiff/        BSD-2-Clause C, ~700 LoC
+│   │   ├── LICENSE
+│   │   ├── VENDORED.md         upstream URL, commit, SHA-256, import date
+│   │   └── src/
+│   ├── jmacd-xdelta3/          Apache-2.0 C (xdelta3/ subdir of upstream)
+│   │   ├── LICENSE
+│   │   ├── VENDORED.md
+│   │   └── xdelta3/
+│   └── sharplispers-archive/   BSD-3-Clause Common Lisp, ~1.5 KLoC
+│       ├── LICENSE
+│       └── VENDORED.md
+├── client/internal/vendor/     vendored sources for the CLIENT side
+│   ├── gabstv-go-bsdiff/       MIT pure-Go, ~1 KLoC
+│   │   ├── LICENSE
+│   │   ├── VENDORED.md
+│   │   └── pkg/
+│   └── ably-vcdiff-go/         Apache-2.0 pure-Go decoder
+│       ├── LICENSE
+│       └── VENDORED.md
+├── tools/                      build helpers (vendor importer, hash check)
+├── tests/                      cross-component integration tests
+└── ci/                         GitHub Actions / GitLab CI configs
+#+end_src
+
+The =server/= and =admin/= subtrees are SBCL-only; =client/= is a
+single Go module that builds three artefacts: the =libota= shared
+library, the =libota.h= header, and the =ota-agent= CLI.
+
+* External dependencies
+
+The project is *self-contained*: the client ships as a single
+static binary with no runtime dependencies, and the server builds
+its own =bsdiff= and =xdelta3= helper binaries from vendored
+sources rather than relying on what the host distro packages.
+See [[file:ota-specifications.org::*Self-containment and vendoring][Self-containment and vendoring]] for the policy.
+
+** Build-time, available from package managers (server only)
+
+| Concern             | Library                           | Pin             | License       |
+|---------------------+-----------------------------------+-----------------+---------------|
+| HTTP server         | Woo (Clack adapter), libev        | latest stable   | LLGPL/MIT — verify per-component before pin |
+| TLS (server)        | cl+ssl + system OpenSSL ≥ 3.0     | OS package      | MIT (cl+ssl) + OpenSSL (Apache-2.0) |
+| JSON                | =jzon=                            | latest stable   | MIT           |
+| SQL (server)        | cl-dbi + cl-sqlite + cl-postgres  | latest stable   | LLGPL / MIT   |
+| Crypto/signing      | =ironclad=                        | latest stable   | BSD-3-Clause  |
+
+These are normal Quicklisp / system dependencies pulled at build
+time on the build host.  They are /not/ shipped in the client
+binary.
+
+** Vendored into the repo (committed under =vendor/= and =client/internal/vendor/=)
+
+| Component                       | Upstream                       | License       | Lang     | Used by                                   |
+|---------------------------------+--------------------------------+---------------+----------+-------------------------------------------|
+| bsdiff / bspatch (client)       | =gabstv/go-bsdiff=             | MIT           | pure Go  | =libota= patch applier                    |
+| VCDIFF decoder (client)         | =ably/vcdiff-go=               | Apache-2.0    | pure Go  | =libota= patch applier                    |
+| bsdiff / bspatch (server)       | =mendsley/bsdiff=              | BSD-2-Clause  | C        | server patch builder (built as small CLI) |
+| xdelta3 (server)                | =jmacd/xdelta= (=xdelta3/= subdir, *not* =xdelta-gpl=) | Apache-2.0 | C | server patch builder (built as small CLI) |
+| tar (server)                    | =sharplispers/archive=         | BSD-3-Clause  | Common Lisp | server ingestion / extraction tests   |
+
+All licences verified permissive (MIT, BSD-2/3-Clause, Apache-2.0).
+GPL/LGPL/AGPL is /prohibited/ by the vendoring policy; in
+particular =jmacd/xdelta-gpl= (GPLv2) is *not* vendored.
+
+The Go client uses the stdlib =archive/tar=, =crypto/ed25519=,
+=crypto/sha256=, =net/http=, =crypto/tls= — no third-party
+dependencies for these concerns, no =cgo=.
+
+A versions matrix with pinned commit hashes and SHA-256 of each
+imported tree is maintained in =docs/dependencies.org= and verified
+by CI (see Phase 0).
+
+* Phase 0 — Foundations & vendoring  (1 week)
+
+Goal :: nothing runs yet, but the contracts, skeletons, /and the
+vendored third-party sources/ are in place and verified.
+
+** Skeletons and contracts
+
+- [ ] =docs/= : this plan + ADR-0001 "stack split: SBCL server / Go
+  client"; ADR-0002 "Woo + sendfile, not Hunchentoot"; ADR-0003
+  "vendor permissively-licensed sources, no system tools at runtime".
+- [ ] =schemas/manifest.schema.json= : JSON Schema for the manifest
+  (every field from the spec).  Validated by both server and client
+  test suites.
+- [ ] =schemas/api.openapi.yaml= : OpenAPI 3.1 description of the
+  v1 endpoints.
+- [ ] =server/ota-server.asd=, =admin/ota-admin.asd=, empty packages.
+- [ ] =client/go.mod=, three top-level packages (=libota=, =agent=,
+  =internal/...=).
+- [ ] CI config that builds Lisp and Go, runs an empty test suite,
+  cross-compiles the client to Win/macOS/Linux.
+- [ ] Reproducible local dev setup : a =Makefile= with =setup=,
+  =build=, =test=, =run-server= targets.
+
+** Vendoring
+
+- [ ] =tools/vendor-import.sh= : helper that, given an upstream URL
+  and a commit hash, fetches a tarball, extracts under
+  =vendor/<name>/= or =client/internal/vendor/<name>/=, copies the
+  upstream =LICENSE=, and writes =VENDORED.md= with URL, commit,
+  date, and SHA-256 of the imported tree.  Idempotent.  Uses only
+  =curl=, =tar=, =sha256sum= — runnable on any developer
+  workstation without admin rights.
+- [ ] =tools/vendor-verify.sh= : recomputes the SHA-256 of every
+  =vendor/*= and =client/internal/vendor/*= subtree and diffs it
+  against the recorded value in =docs/dependencies.org=.  Run by
+  CI; fails the build on any mismatch.
+- [ ] Import the five vendored components, in order:
+  - [ ] =vendor/mendsley-bsdiff/= — BSD-2-Clause, C
+  - [ ] =vendor/jmacd-xdelta3/= — Apache-2.0, C, =xdelta3/= subdir
+    only (verify we are *not* on the =-gpl= branch)
+  - [ ] =vendor/sharplispers-archive/= — BSD-3-Clause, CL
+  - [ ] =client/internal/vendor/gabstv-go-bsdiff/= — MIT, pure Go
+  - [ ] =client/internal/vendor/ably-vcdiff-go/= — Apache-2.0,
+    pure Go (decoder only)
+- [ ] =docs/dependencies.org= : table of the five vendored
+  components, each row carrying: upstream URL, pinned commit hash,
+  SPDX licence id, import date, SHA-256 of the imported tree.
+- [ ] =docs/THIRD_PARTY_LICENSES.org= : aggregated licence text for
+  every vendored component, suitable for ship with the client
+  binary (consumed at build time to embed into =ota-agent licenses=
+  output).
+- [ ] =server/Makefile= target =vendor-build= : builds the C
+  =bsdiff= helper (from =vendor/mendsley-bsdiff=) and the C
+  =xdelta3= helper (from =vendor/jmacd-xdelta3/xdelta3/=) into
+  =server/build/bin/=.  Server boots with the path to those
+  binaries baked into config; nothing on the host's =$PATH= is
+  consulted.
+- [ ] =client/Makefile= target =build= : =go build -trimpath
+  -tags=netgo,osusergo= producing a single static binary per OS
+  with no =cgo= and no dynamic linkage.
+
+Exit criterion : =make build && make test && make vendor-verify=
+passes on a fresh machine without =bsdiff=, =xdelta3=, =tar=
+installed system-wide; CI green; the manifest schema validates a
+hand-written sample; =ldd ota-agent= (Linux) and =otool -L
+ota-agent= (macOS) show no third-party dynamic dependencies.
+
+* Phase 1 — End-to-end happy path on Linux  (3 weeks)
+
+Goal :: a single developer can publish a release from the same Linux
+box, and a single client on the same box can install it.  No TLS, no
+auth, no patches yet.
+
+** Server (week 1)
+
+- [ ] *Catalogue* : SQLite schema for =Software=, =Release=,
+  =Channel=, =Classification=, =Client=, =DownloadEvent= (no
+  =Patch= yet).  Migrations are SQL files numbered =0001_…=.
+- [ ] *Storage* : content-addressed =blobs/= directory, =put-blob=,
+  =get-blob=, =has-blob= primitives.
+- [ ] *Deterministic tar writer* : built on top of the vendored
+  =sharplispers-archive=; produces the canonical =.tar= as
+  specified ([[file:ota-specifications.org::*Blob format and determinism][Blob format and determinism]]).  Property test : tar
+  twice, bytes are equal; tar with shuffled directory entries,
+  bytes are equal.  If a PAX edge case forces a fallback, that
+  fallback is recorded in an ADR and a libarchive FFI shim is
+  added to =vendor/=; not expected to be needed.
+- [ ] *Manifest* : build + Ed25519-sign + verify.  Signing key is a
+  test key on disk for now.
+- [ ] *HTTP* : Woo + Clack adapter; routes for =GET /v1/health=,
+  =POST /v1/admin/software/{software}/releases= (multipart upload),
+  =GET /v1/software/{software}/releases=, =GET .../latest=,
+  =GET .../{version}/manifest=, =GET /v1/blobs/{sha256}= (sendfile
+  path verified by =strace=).
+- [ ] *No auth yet* — a single hardcoded admin token in config.
+
+** Client (week 2)
+
+- [ ] *Manifest verify* : parse JSON, verify Ed25519 signature
+  against a pinned public key embedded in the binary.
+- [ ] *Transport* : HTTP GET with =Range:= resume, sha256 streaming
+  verifier, progress callback.
+- [ ] *State* : =$OTA_HOME/<software>/state.json= read/write,
+  =current= / =previous= symlinks (junction code stubbed for
+  Windows, exercised in phase 3).
+- [ ] *Tar extract* : safe extractor (rejects path traversal,
+  Windows reserved names, absolute paths, =..= entries).
+- [ ] *=ota-agent install <name>=* : full flow, no patches, no
+  channels.
+
+** Glue (week 3)
+
+- [ ] *=ota-admin publish <dir> --software=X --version=Y=* against
+  the local server.
+- [ ] *Integration test harness* : =tests/e2e/install.sh= that
+  starts the server in a temp =$OTA_ROOT=, publishes a 50 MB
+  release, runs =ota-agent install=, asserts =current= points at
+  the right tree, asserts every file's bytes match, kills server
+  mid-download and asserts resume works.
+- [ ] Telemetry stubs (=POST /v1/events/install=) wired but no-op.
+
+Exit criterion : on a fresh Linux VM, =make e2e= boots a server,
+publishes a 50 MB sample, installs it, and the installed tree's
+sha256 over deterministic-tar matches the published blob's sha256.
+
+* Phase 2 — Patches  (2 weeks)
+
+Goal :: upgrades transfer only the binary delta; full-blob fallback
+exists and is exercised.
+
+- [ ] =Patch= entity, schema migration, =patches/= CAS directory.
+- [ ] *Patch builder worker* : background pool that consumes a job
+  queue (in-memory for now, Postgres-backed in phase 5).  Invokes
+  the *vendored* =bsdiff= binary built in phase 0
+  (=server/build/bin/bsdiff=) — never the host's =$PATH=.  Falls
+  back to the vendored =xdelta3= binary
+  (=server/build/bin/xdelta3=) when =Software.default_patcher= says
+  so.  Patches are content-addressed by =sha256(patch-bytes)=.
+- [ ] *Patch path resolver* : graph search over available patches
+  to find the cheapest =from → to= path; includes the full-blob
+  fallback ratio (=fallback_ratio=, default 0.7).
+- [ ] *=GET /v1/software/{software}/upgrade?from=…&to=…=* returns
+  302 to the concrete artefact, or the resolved chain in the JSON
+  body if =Accept: application/json=.
+- [ ] Manifest =patches_in= is rewritten and re-signed each time a
+  patch finishes building.
+- [ ] *Client* : =install_or_upgrade= takes the upgrade path,
+  applies =bspatch= (vendored =gabstv-go-bsdiff=, in-process,
+  pure-Go) to =blob-vX= → =blob-vY= when the patch is bsdiff-format,
+  or applies =vcdiff-go= (vendored, pure-Go decoder) when the patch
+  is xdelta3/VCDIFF-format.  Verifies the result hash against the
+  manifest before extracting.  No subprocess, no shared library,
+  no host =$PATH= dependency.
+- [ ] *Local retention* code in the client : after a successful
+  upgrade, drop =vX-2= material per [[file:ota-specifications.org::*Local retention][Local retention]].
+- [ ] Integration test : publish three releases, install v1, upgrade
+  to v2 (single patch), upgrade to v3 (chained patch), simulate
+  missing patch and verify full-blob fallback.
+
+Exit criterion : an upgrade transfer is < 5 % of the full blob size
+on the synthetic test (recompiled-binaries-style payload), and the
+reconstructed blob hash always matches the manifest.
+
+* Phase 3 — Cross-platform client  (2 weeks)
+
+Goal :: =ota-agent= and =libota= work on Windows and macOS; one CI
+job emits all three platform binaries.
+
+- [ ] *Symlink/junction abstraction* : Windows =CreateSymbolicLinkW=
+  (developer-mode or admin) with junction fallback for non-admin
+  installs; macOS / Linux are POSIX.  Fallback launcher shim that
+  reads =current.path= for environments where neither is available.
+- [ ] *Path handling* : long-path support on Windows
+  (=\\?\=-prefix), case-preserving comparisons, BOM-free UTF-8.
+- [ ] *=libota= as =c-shared=* : =go build -buildmode=c-shared= on
+  all three OSes; =cgo= entrypoints for the public API listed in
+  the spec; generated =libota.h= committed and used by the test
+  rig.
+- [ ] *Cross-compilation matrix* in CI :
+  =GOOS=linux,darwin,windows= × =GOARCH=amd64,arm64=.  Static link
+  on Linux, =-mmacosx-version-min= on macOS, code-signed only on
+  release.
+- [ ] Integration tests run on Windows and macOS runners (the
+  install / upgrade / fallback flows from phases 1–2).
+
+Exit criterion : a cold install on Windows 11 from the install page
+URL completes without admin rights and without a pre-installed
+runtime.
+
+* Phase 4 — Auth, classifications, channels  (2 weeks)
+
+Goal :: the server can decide /who/ sees /what/.
+
+- [ ] *TLS* : server-side TLS 1.3, optional mTLS toggled by config.
+- [ ] *Cert-based identity* : =cert_subject= → =Client.client_id=
+  resolution; bearer token endpoint for admins (short TTL).
+- [ ] *Classifications & channels* : CRUD admin endpoints, tag
+  releases, filter every catalogue read by intersection of caller's
+  classifications with release classifications and channel
+  membership.
+- [ ] *Install token* : one-shot, short-TTL, minted by the public
+  install page; agent exchanges it for a per-workstation bearer
+  token on first call.
+- [ ] *Rate limits* : token bucket per identity at the HTTP front.
+- [ ] *Audit log* : every admin write records =published_by= +
+  cert fingerprint + timestamp; viewable via =GET
+  /v1/admin/software/{software}/audit=.
+
+Exit criterion : a release published to channel =canary= is
+invisible to a client whose classifications don't include
+=canary=, regardless of how the client phrases the query.
+
+* Phase 5 — Operations  (2 weeks)
+
+Goal :: the server is production-shaped.
+
+- [ ] *PostgreSQL backend* for =catalogue= behind the same DBI
+  layer; SQLite remains the default for single-host deployments.
+- [ ] *S3 backend* for =blobs/= and =patches/= behind the same CAS
+  interface (filesystem stays the default).
+- [ ] *Garbage collection* : scheduled =gc= job per the spec, with
+  =dry-run=, =min-user-count=, =min_age=; exposed at =POST
+  /v1/admin/software/{software}/gc=.
+- [ ] *Verification job* : walks blobs and patches, re-hashes them,
+  reports mismatches.
+- [ ] *Backup/restore script* : dumps the catalogue + lists blob
+  hashes; a restore re-hydrates from any storage backend.
+- [ ] *Manifest re-sign* on key rotation, in place.
+- [ ] *Operational doc* : =docs/operations.org= covering deploy,
+  cert rotation, key rotation, GC tuning, disaster recovery.
+
+Exit criterion : a one-page runbook walks an ops engineer through
+deploy, cert rotation, and disaster recovery from a backup, and the
+runbook's commands are exercised by an integration test.
+
+* Phase 6 — Recovery tool & polish  (1 week)
+
+Goal :: the recovery story works for users, not just engineers.
+
+- [ ] =GET /v1/software/{software}/anchors= : returns a curated
+  list of known-good versions (default: latest =uncollectable= per
+  channel; admin override).
+- [ ] =ota-agent doctor=, =ota-agent doctor <name> --recover= :
+  interactive multi-step rollback.  Lists local distributions,
+  fetches the anchors, lets the user pick, downloads the chosen
+  version (full blob or patch chain) if not local, flips =current=.
+- [ ] Optional reverse-patch generation : admin endpoint =POST
+  /v1/admin/software/{software}/patches/reverse?from=Y&to=X= builds
+  the reverse patch on demand and stores it in CAS.  The recovery
+  tool may pull these.
+- [ ] =ota-agent watch= background watcher (cron / Task Scheduler /
+  launchd integration helpers).
+- [ ] Install page polish : OS detection, install-token UX, "your
+  install will start in N minutes" queue message at high load.
+
+Exit criterion : a user with a broken install can run =ota-agent
+doctor <name> --recover=, pick an anchor, and end up on a working
+older release without engineer help.
+
+* Phase 7 — Hardening, documentation, 1.0  (1 week)
+
+- [ ] Threat-model walk-through against the spec's [[file:ota-specifications.org::*Threats considered][Threats
+  considered]] list; close every gap or accept it explicitly in an
+  ADR.
+- [ ] Performance pass : =strace= the server under a synthetic
+  10 000-client soak to verify =sendfile= really fires; measure
+  egress, CPU, memory; document the result in =docs/perf.org=.
+- [ ] Fuzz the manifest parser, the tar extractor, and the patch
+  applier with =go-fuzz= / =cl-quickcheck=.
+- [ ] User documentation : a short "as a user" guide for the
+  install page and =ota-agent=, plus a "as a developer" guide for
+  =ota-admin= and the =libota= bindings.
+- [ ] *1.0 cut* : tag, freeze the API, write the changelog policy.
+
+* Cross-cutting concerns
+
+** Telemetry & metrics
+
+- Server : Prometheus =/metrics= endpoint (request counts,
+  =sendfile= bytes, patch-build queue depth, GC outcomes, signature
+  failures).
+- Client : opt-in =POST /v1/events/...= reports as already specified.
+- No third-party telemetry; everything stays inside the
+  organisation.
+
+** Logging
+
+- Server : structured logs (JSON to stdout), rotated by the OS.
+- Client : a small ring buffer in =$OTA_HOME/<software>/logs/= so
+  =ota-agent doctor= can show "what happened last time".
+
+** Configuration
+
+- Server : single TOML file at =$OTA_ROOT/etc/ota.toml= as in the
+  spec.  No environment-variable mode in v1 — config drift is
+  worse than restart-on-change.
+- Client : per-user =$OTA_HOME/config.toml=, plus a system-wide
+  =/etc/ota/config.toml= (or =%ProgramData%\OTA\config.toml=) for
+  shared deployments.
+
+** Build & release of the OTA system itself
+
+- Server : Lisp images built with =sb-ext:save-lisp-and-die=,
+  packaged as a tarball + systemd unit.
+- Client : Go binaries cross-compiled in one CI job, code-signed
+  per OS, uploaded to the install page's CDN.  The aggregated
+  =docs/THIRD_PARTY_LICENSES.org= is embedded into the binary at
+  build time; =ota-agent licenses= prints it.
+- Versions of the OTA system itself are tracked under =VERSION.txt=
+  at the repo root and bumped manually at each phase boundary; the
+  system's own installer can use =ota-server= to distribute itself
+  once phase 7 closes.
+
+** Testing pyramid
+
+- *Unit* : pure functions in =catalogue/=, =manifest/=,
+  =transport/=, =patch/=, =tarx/=.  Fast, no I/O.
+- *Property* : determinism of the tar writer; round-trip of
+  manifest sign/verify; "patch then verify" never produces a
+  blob whose hash does not match.
+- *Integration* : on-disk e2e tests on each of Linux/macOS/Windows
+  in CI.  These are the canaries; they are slow and that is fine.
+- *Fuzz* : on inputs from the network (manifest, tar, patch).
+
+* Risks and open items
+
+| Risk                                                         | Mitigation                                                                            |
+|--------------------------------------------------------------+---------------------------------------------------------------------------------------|
+| Woo's sendfile path silently breaks under TLS                | Phase 7 strace soak; if confirmed broken under TLS, terminate TLS at a reverse proxy that does =sendfile + kTLS= |
+| SBCL on Windows for an admin who can't install Lisp          | =ota-admin= Go binary in the alternative-stacks list (spec)                          |
+| Ed25519 key rotation breaks pinned clients                   | Initial trust = bundled key list; rotation = signed key-list update over the same channel |
+| =bsdiff= memory blow-up on 8 GB blobs                        | Cap blob size at 8 GB; document RAM requirement on the patch worker; consider =bsdiff= replacement (=hdiffpatch=) only if it bites |
+| Patch chains get long for users who skipped many releases    | Full-blob fallback ratio (default 0.7); supercheckpoint patches from latest =uncollectable= |
+| Windows symlink restrictions in unprivileged contexts        | Junction + launcher shim fallback (phase 3)                                          |
+| =vcdiff-go= is decoder-only — no pure-Go VCDIFF /encoder/    | Client only ever applies patches, never builds them; encoding stays server-side, where the C =xdelta3= helper does it.  If a future feature needs client-side VCDIFF encoding, switch that path to bsdiff. |
+| Vendored upstream gets a security fix we miss                | =docs/dependencies.org= recorded; quarterly review documented in =docs/operations.org=. |
+
+* Calendar (rough)
+
+| Phase | Theme                            | Wks  | Cum  |
+|-------+----------------------------------+------+------|
+| 0     | Foundations                       |    1 |    1 |
+| 1     | E2E happy path on Linux           |    3 |    4 |
+| 2     | Patches                           |    2 |    6 |
+| 3     | Cross-platform client             |    2 |    8 |
+| 4     | Auth, classifications, channels   |    2 |   10 |
+| 5     | Operations                        |    2 |   12 |
+| 6     | Recovery tool & polish            |    1 |   13 |
+| 7     | Hardening, docs, 1.0              |    1 |   14 |
+
+≈ 14 person-weeks for one engineer; collapse to ~8 calendar weeks
+with one Lisp-leaning engineer on the server/admin tracks and one
+Go-leaning engineer on the client track running in parallel from
+phase 1 onward.
