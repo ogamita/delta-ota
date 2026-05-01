@@ -6,9 +6,11 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,10 +19,13 @@ import (
 	"time"
 )
 
-// Client wraps a server URL and a *http.Client.
+// Client wraps a server URL and a *http.Client. The optional Auth
+// token, when set, is sent on every request as "Authorization:
+// Bearer <token>".
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	Auth    BearerAuth
 }
 
 func New(baseURL string) *Client {
@@ -35,7 +40,7 @@ func New(baseURL string) *Client {
 // X-Ota-Public-Key headers (hex). Verification is the caller's job.
 func (c *Client) GetManifest(ctx context.Context, software, version string) (data []byte, sigHex, pubHex string, err error) {
 	url := fmt.Sprintf("%s/v1/software/%s/releases/%s/manifest", c.BaseURL, software, version)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -54,10 +59,62 @@ func (c *Client) GetManifest(ctx context.Context, software, version string) (dat
 	return data, resp.Header.Get("X-Ota-Signature"), resp.Header.Get("X-Ota-Public-Key"), nil
 }
 
+// BearerAuth, if set, is appended to every outgoing request as
+// "Authorization: Bearer <token>".
+type BearerAuth string
+
+func (c *Client) authedRequest(ctx context.Context, method, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	return req, nil
+}
+
+// ExchangeInstallToken trades a short-lived install token (minted by
+// the install page or by ota-admin) for a per-client bearer token
+// and a stable client_id. Stores nothing — the caller is responsible
+// for persisting the bearer.
+type ExchangeResult struct {
+	ClientID        string   `json:"client_id"`
+	BearerToken     string   `json:"bearer_token"`
+	Classifications []string `json:"classifications"`
+}
+
+func (c *Client) ExchangeInstallToken(ctx context.Context, installToken, hwinfo string) (*ExchangeResult, error) {
+	body, _ := json.Marshal(map[string]string{
+		"install_token": installToken,
+		"hwinfo":        hwinfo,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/v1/exchange-token", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("exchange: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("exchange: %s: %s", resp.Status, string(raw))
+	}
+	var out ExchangeResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("exchange decode: %w", err)
+	}
+	return &out, nil
+}
+
 // LatestRelease fetches /v1/software/<sw>/releases/latest as raw JSON.
 func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, error) {
 	url := fmt.Sprintf("%s/v1/software/%s/releases/latest", c.BaseURL, software)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +145,7 @@ func (c *Client) DownloadBlob(ctx context.Context, sha256Hex, dstPath string, pr
 // downloadHashed is the shared implementation for DownloadBlob and
 // DownloadPatch.
 func (c *Client) downloadHashed(ctx context.Context, url, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
 	if err != nil {
 		return 0, err
 	}

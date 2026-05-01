@@ -225,11 +225,12 @@ e2e:
     - mkdir -p $HOME && [ -e $HOME/quicklisp ] || ln -s /opt/quicklisp $HOME/quicklisp
   script:
     - tests/e2e/run.sh
+    - tests/e2e/auth.sh
   artifacts:
     when: always
     paths:
       - tests/e2e/run/logs/
-      - tests/e2e/run/server-root/keys/
+      - tests/e2e/run-auth/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

@@ -83,46 +83,64 @@ func reorderFlags(args []string) []string {
 	return append(flags, pos...)
 }
 
-func parseInstallFlags(args []string) (name, version, server string) {
+type installArgs struct {
+	name, version, server, installToken, hwinfo string
+}
+
+func parseInstallFlags(args []string) installArgs {
 	args = reorderFlags(args)
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	v := fs.String("version", "", "explicit version (defaults to latest)")
 	latest := fs.Bool("latest", false, "explicitly request latest")
 	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL")
+	tok := fs.String("install-token", os.Getenv("OTA_INSTALL_TOKEN"),
+		"one-shot install token issued by the install page")
+	hw := fs.String("hwinfo", "", "free-form workstation identifier (defaults to hostname)")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "install: missing <name>")
 		os.Exit(2)
 	}
-	name = fs.Arg(0)
-	version = *v
-	if *latest {
-		version = "latest"
+	out := installArgs{
+		name:         fs.Arg(0),
+		version:      *v,
+		server:       *srv,
+		installToken: *tok,
+		hwinfo:       *hw,
 	}
-	server = *srv
-	if server == "" {
+	if *latest {
+		out.version = "latest"
+	}
+	if out.server == "" {
 		fmt.Fprintln(os.Stderr, "install: --server or $OTA_SERVER required")
 		os.Exit(2)
 	}
-	return
+	if out.hwinfo == "" {
+		if h, err := os.Hostname(); err == nil {
+			out.hwinfo = h
+		}
+	}
+	return out
 }
 
 func installCmd(args []string) {
-	name, version, server := parseInstallFlags(args)
+	a := parseInstallFlags(args)
 	cfg := libota.Config{
-		ServerURL:      strings.TrimRight(server, "/"),
+		ServerURL:      strings.TrimRight(a.server, "/"),
 		OTAHome:        os.Getenv("OTA_HOME"),
 		TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
 		Timeout:        2 * time.Minute,
+		InstallToken:   a.installToken,
+		Hwinfo:         a.hwinfo,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	v, err := libota.Install(ctx, cfg, name, version)
+	v, err := libota.Install(ctx, cfg, a.name, a.version)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "install: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("installed %s %s\n", name, v)
+	fmt.Printf("installed %s %s\n", a.name, v)
 }
 
 func upgradeCmd(args []string) {

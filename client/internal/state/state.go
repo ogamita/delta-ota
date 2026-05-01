@@ -60,6 +60,8 @@ type State struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 	ServerURL      string    `json:"server_url,omitempty"`
 	ServerPubKeyHX string    `json:"server_pubkey_hex,omitempty"`
+	ClientID       string    `json:"client_id,omitempty"`
+	BearerToken    string    `json:"bearer_token,omitempty"`
 }
 
 func (l *Layout) Load() (*State, error) {

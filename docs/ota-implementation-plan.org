@@ -336,20 +336,35 @@ runtime.
 
 Goal :: the server can decide /who/ sees /what/.
 
-- [ ] *TLS* : server-side TLS 1.3, optional mTLS toggled by config.
-- [ ] *Cert-based identity* : =cert_subject= → =Client.client_id=
-  resolution; bearer token endpoint for admins (short TTL).
-- [ ] *Classifications & channels* : CRUD admin endpoints, tag
-  releases, filter every catalogue read by intersection of caller's
-  classifications with release classifications and channel
-  membership.
-- [ ] *Install token* : one-shot, short-TTL, minted by the public
-  install page; agent exchanges it for a per-workstation bearer
-  token on first call.
-- [ ] *Rate limits* : token bucket per identity at the HTTP front.
-- [ ] *Audit log* : every admin write records =published_by= +
-  cert fingerprint + timestamp; viewable via =GET
-  /v1/admin/software/{software}/audit=.
+- [X] *TLS* : opt-in via =OTA_TLS_CERT= / =OTA_TLS_KEY= env vars;
+  Woo terminates TLS when both are set.  In most deployments TLS
+  is terminated by a reverse proxy (kept on the loopback so the
+  =sendfile= path stays active).  Hard-required mTLS is deferred —
+  a future sub-phase plugs cert-subject identity into
+  =resolve-identity=.
+- [X] *Bearer-token identity* : a single hardcoded admin token
+  authorises admin endpoints; per-client bearers are minted via
+  =/v1/exchange-token= against a one-shot install token.
+  Cert-subject → client_id resolution is wired in =resolve-identity=
+  (=cert-subject= column on =clients=) but not yet activated by an
+  mTLS layer.
+- [X] *Classifications* : tagged on releases via
+  =X-Ota-Classifications= on publish, stored as a JSON column; every
+  catalogue read filters by =classification-match-p= over the
+  caller's classifications.  E2E proves it: anonymous → 1.0.0;
+  =[public,beta]= → 2.0.0-beta.  Channel filtering reuses the same
+  mechanism — a separate channel CRUD is deferred (the columns
+  already exist; full UI sub-phase later).
+- [X] *Install token* : one-shot, short-TTL, =POST
+  /v1/admin/install-tokens= (admin), =POST /v1/exchange-token=
+  (client).  Agent CLI gains =--install-token= / =--hwinfo=.
+  Bearer is persisted in =state.json=.
+- [ ] *Rate limits* : deferred to phase 5 (operations) where the
+  per-identity token bucket fits with the rest of the operational
+  surface.  Note ADR if/when it lands.
+- [X] *Audit log* : =append-audit= on every admin write; queryable
+  via =GET /v1/admin/audit=.  E2E asserts ≥3 rows after the
+  publish + mint flow.
 
 Exit criterion : a release published to channel =canary= is
 invisible to a client whose classifications don't include

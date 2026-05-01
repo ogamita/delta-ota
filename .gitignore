@@ -54,6 +54,7 @@ Thumbs.db
 # Test artefacts
 /tests/tmp/
 /tests/e2e/run/
+/tests/e2e/run-auth/
 *.log
 
 # Local development

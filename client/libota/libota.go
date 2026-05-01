@@ -44,6 +44,17 @@ type Config struct {
 	TrustedPubKeys []string
 	Timeout        time.Duration
 	FallbackRatio  float64
+
+	// InstallToken, if set, is exchanged for a per-client bearer
+	// token on first contact.  Once a bearer is recorded in
+	// state.json it is used for all subsequent requests and
+	// InstallToken is ignored.
+	InstallToken string
+
+	// Hwinfo is sent with the install-token exchange so an admin can
+	// recognise the workstation in the audit log.  Free-form short
+	// string (hostname is fine).
+	Hwinfo string
 }
 
 func (c Config) fallbackRatio() float64 {
@@ -77,6 +88,29 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 		tr.HTTP.Timeout = cfg.Timeout
 	}
 
+	// Bearer token from prior state, or freshly exchanged from an
+	// install token.  The state layout is per-software; we load it
+	// before doing anything else so we can attach Auth.
+	layout := state.New(cfg.OTAHome, software)
+	if err := layout.Ensure(); err != nil {
+		return "", err
+	}
+	st, err := layout.Load()
+	if err != nil {
+		return "", err
+	}
+	if st.BearerToken != "" {
+		tr.Auth = transport.BearerAuth(st.BearerToken)
+	} else if cfg.InstallToken != "" {
+		ex, err := tr.ExchangeInstallToken(ctx, cfg.InstallToken, cfg.Hwinfo)
+		if err != nil {
+			return "", err
+		}
+		st.ClientID = ex.ClientID
+		st.BearerToken = ex.BearerToken
+		tr.Auth = transport.BearerAuth(ex.BearerToken)
+	}
+
 	// Resolve target version.
 	if version == "" || version == "latest" {
 		raw, err := tr.LatestRelease(ctx, software)
@@ -100,16 +134,8 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 	if err != nil {
 		return "", err
 	}
-	layout := state.New(cfg.OTAHome, software)
-	if err := layout.Ensure(); err != nil {
-		return "", err
-	}
 
 	// Public-key trust gate.
-	st, err := layout.Load()
-	if err != nil {
-		return "", err
-	}
 	if err := checkTrust(st, cfg.TrustedPubKeys, pubHex); err != nil {
 		return "", err
 	}

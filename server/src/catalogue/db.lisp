@@ -25,7 +25,8 @@
 (defun run-migrations (db)
   "Apply all schema migrations idempotently."
   (dolist (mig '("src/catalogue/migrations/0001_init.sql"
-                 "src/catalogue/migrations/0002_patches.sql"))
+                 "src/catalogue/migrations/0002_patches.sql"
+                 "src/catalogue/migrations/0003_auth.sql"))
     (dolist (stmt (split-statements (read-migration-file mig)))
       (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) stmt)))
         (when (plusp (length trimmed))
@@ -158,3 +159,94 @@
    "INSERT INTO install_events (client_id, software_name, release_id, kind, from_release_id, status, error, at) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
    client-id software release-id (string-downcase (string kind))
    from-release-id (string-downcase (string status)) error))
+
+;; ---------------- Phase-4 auth ----------------
+
+(defun random-hex (n)
+  "Return 2*N hex chars of cryptographic randomness."
+  (let ((bytes (make-array n :element-type '(unsigned-byte 8))))
+    (loop for i below n
+          do (setf (aref bytes i)
+                   (ldb (byte 8 0) (ironclad:strong-random 256))))
+    (ironclad:byte-array-to-hex-string bytes)))
+
+(defun mint-install-token (db &key (classifications #("public")) (ttl-seconds 900) created-by)
+  "Generate a one-shot install token; return (values token expires-at)."
+  (let* ((token (random-hex 24))
+         (expires (universal-to-iso8601
+                   (+ (get-universal-time) ttl-seconds))))
+    (sqlite:execute-non-query
+     db
+     "INSERT INTO install_tokens (token, classifications, expires_at, created_by, created_at) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+     token
+     (com.inuoe.jzon:stringify (coerce classifications 'vector) :pretty nil)
+     expires
+     (or created-by "admin"))
+    (values token expires)))
+
+(defun universal-to-iso8601 (univ)
+  (multiple-value-bind (s m h d mo y) (decode-universal-time univ 0)
+    (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ" y mo d h m s)))
+
+(defun claim-install-token (db token)
+  "Mark an install token as used (one-shot).  Returns the token's
+   classifications as a vector, or NIL if the token is unknown,
+   already used, or expired."
+  (let ((row (first (sqlite:execute-to-list
+                     db
+                     "SELECT classifications, expires_at, used_at FROM install_tokens WHERE token = ?"
+                     token))))
+    (when row
+      (destructuring-bind (cls expires used) row
+        (when (and (null used)
+                   (string< (universal-to-iso8601 (get-universal-time)) expires))
+          (sqlite:execute-non-query
+           db
+           "UPDATE install_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE token = ?"
+           token)
+          (com.inuoe.jzon:parse cls))))))
+
+(defun create-client (db &key classifications hwinfo cert-subject)
+  "Create a new client row; return (values client-id bearer-token)."
+  (let ((client-id (concatenate 'string "c-" (random-hex 8)))
+        (bearer    (random-hex 32)))
+    (sqlite:execute-non-query
+     db
+     "INSERT INTO clients (client_id, bearer_token, classifications, hwinfo, cert_subject, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+     client-id bearer
+     (com.inuoe.jzon:stringify (or classifications #("public")) :pretty nil)
+     hwinfo cert-subject)
+    (values client-id bearer)))
+
+(defun get-client-by-token (db bearer-token)
+  (let ((row (first (sqlite:execute-to-list
+                     db
+                     "SELECT client_id, classifications, cert_subject FROM clients WHERE bearer_token = ?"
+                     bearer-token))))
+    (when row
+      (destructuring-bind (client-id cls cert) row
+        (list :client-id client-id
+              :classifications (com.inuoe.jzon:parse cls)
+              :cert-subject cert)))))
+
+(defun touch-client (db client-id)
+  (sqlite:execute-non-query
+   db
+   "UPDATE clients SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE client_id = ?"
+   client-id))
+
+(defun append-audit (db &key identity action target detail)
+  (sqlite:execute-non-query
+   db
+   "INSERT INTO audit_log (identity, action, target, detail, at) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+   identity action target detail))
+
+(defun list-audit (db &optional (limit 100))
+  (mapcar (lambda (row)
+            (destructuring-bind (id identity action target detail at) row
+              (list :id id :identity identity :action action
+                    :target target :detail detail :at at)))
+          (sqlite:execute-to-list
+           db
+           "SELECT id, identity, action, target, detail, at FROM audit_log ORDER BY id DESC LIMIT ?"
+           limit)))

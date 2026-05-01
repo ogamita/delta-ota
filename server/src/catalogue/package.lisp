@@ -15,6 +15,14 @@
            #:get-latest-release
            #:record-install-event
            #:insert-patch
-           #:list-patches-to))
+           #:list-patches-to
+           ;; phase-4 auth
+           #:mint-install-token
+           #:claim-install-token
+           #:create-client
+           #:get-client-by-token
+           #:touch-client
+           #:append-audit
+           #:list-audit))
 
 (in-package #:ota-server.catalogue)

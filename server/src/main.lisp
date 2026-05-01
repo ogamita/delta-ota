@@ -27,7 +27,9 @@
   (list :host (env-or-default "OTA_HOST" "0.0.0.0")
         :port (env-port "OTA_PORT" 8080)
         :data-dir (env-or-default "OTA_ROOT" "./build/dev/ota-data")
-        :admin-token (env-or-default "OTA_ADMIN_TOKEN" "dev-token")))
+        :admin-token (env-or-default "OTA_ADMIN_TOKEN" "dev-token")
+        :tls-cert (uiop:getenv "OTA_TLS_CERT")
+        :tls-key  (uiop:getenv "OTA_TLS_KEY")))
 
 (defun main (&key config)
   "Boot the server. CONFIG is a plist; otherwise environment vars are
@@ -45,7 +47,9 @@
                  :keypair kp
                  :manifests-dir (merge-pathnames "manifests/" root)
                  :admin-token (getf cfg :admin-token)
-                 :hostname (or (getf cfg :hostname) "localhost"))))
+                 :hostname (or (getf cfg :hostname) "localhost")
+                 :tls-cert (getf cfg :tls-cert)
+                 :tls-key  (getf cfg :tls-key))))
     (ota-server.catalogue:run-migrations db)
     (ensure-directories-exist
      (ota-server.http::app-state-manifests-dir state))

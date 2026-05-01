@@ -12,7 +12,11 @@
   keypair
   manifests-dir
   admin-token
-  hostname)
+  hostname
+  ;; phase-4
+  (default-client-classifications #("public") :type vector)
+  tls-cert
+  tls-key)
 
 (defparameter *app* nil)
 
@@ -86,14 +90,71 @@
      (values :admin-publish-release (list :software (fourth segments))))
     ((and (eq method :post) (equal segments '("v1" "events" "install")))
      :events-install)
+    ((and (eq method :post) (equal segments '("v1" "exchange-token")))
+     :exchange-token)
+    ((and (eq method :post) (equal segments '("v1" "admin" "install-tokens")))
+     :admin-mint-install-token)
+    ((and (eq method :get) (equal segments '("v1" "admin" "audit")))
+     :admin-list-audit)
     (t nil)))
 
+(defun bearer-of (env)
+  "Pull the Bearer credentials out of the request, regardless of how
+   Clack delivered the headers."
+  (let* ((headers (getf env :headers))
+         (auth (or (header-of headers "authorization")
+                   (env-get env :|authorization|))))
+    (when (and auth (alexandria:starts-with-subseq "Bearer " auth))
+      (subseq auth 7))))
+
 (defun authorised-admin-p (env app)
-  (let ((auth (getf env :|authorization|)))
-    (unless auth
-      (setf auth (gethash "authorization" (getf env :headers (make-hash-table)))))
-    (and auth
-         (string= auth (concatenate 'string "Bearer " (app-state-admin-token app))))))
+  (let ((tok (bearer-of env)))
+    (and tok (string= tok (app-state-admin-token app)))))
+
+(defun resolve-identity (env app)
+  "Return a plist describing the calling identity:
+     (:kind :anonymous|:client|:admin
+      :classifications #(...)
+      :client-id <string-or-nil>)."
+  (let ((tok (bearer-of env)))
+    (cond
+      ((null tok)
+       (list :kind :anonymous
+             :classifications (app-state-default-client-classifications app)
+             :client-id nil))
+      ((string= tok (app-state-admin-token app))
+       (list :kind :admin
+             ;; Admins implicitly see everything: all classifications match.
+             :classifications :all
+             :client-id "admin"))
+      (t
+       (let ((c (ota-server.catalogue:get-client-by-token
+                 (app-state-catalogue app) tok)))
+         (cond (c
+                (ota-server.catalogue:touch-client
+                 (app-state-catalogue app) (getf c :client-id))
+                (list :kind :client
+                      :classifications (or (getf c :classifications)
+                                           (app-state-default-client-classifications app))
+                      :client-id (getf c :client-id)))
+               (t
+                (list :kind :anonymous
+                      :classifications (app-state-default-client-classifications app)
+                      :client-id nil))))))))
+
+(defun classification-match-p (identity-classifications release-classifications)
+  "True if the identity is allowed to see the release.  An admin
+   (:all) sees everything.  Any other identity must share at least
+   one classification with the release.  A release with no
+   classifications is treated as 'public' for back-compat."
+  (cond ((eq identity-classifications :all) t)
+        (t (let ((rcls (if (or (null release-classifications)
+                               (zerop (length release-classifications)))
+                           #("public")
+                           release-classifications)))
+             (loop for ic across (or identity-classifications #())
+                   thereis (loop for rc across rcls
+                                 thereis (string= ic rc)))))))
 
 (defun read-request-body-bytes (env)
   "Read the raw request body into a byte vector."
@@ -147,31 +208,48 @@
         (json-response 200 (plist-to-json-software sw))
         (error-response 404 "software not found"))))
 
-(defun handle-list-releases (app params)
-  (let ((rs (ota-server.catalogue:list-releases
-             (app-state-catalogue app) (getf params :software))))
+(defun visible-release-p (identity rel)
+  (classification-match-p (getf identity :classifications)
+                          (getf rel :classifications)))
+
+(defun handle-list-releases (app env params)
+  (let* ((id (resolve-identity env app))
+         (rs (remove-if-not
+              (lambda (r) (visible-release-p id r))
+              (ota-server.catalogue:list-releases
+               (app-state-catalogue app) (getf params :software)))))
     (json-response 200
                    (coerce (mapcar (lambda (r) (plist-to-json-release r app)) rs)
                            'vector))))
 
-(defun handle-latest-release (app params)
-  (let ((r (ota-server.catalogue:get-latest-release
-            (app-state-catalogue app) (getf params :software))))
-    (if r
-        (json-response 200 (plist-to-json-release r app))
+(defun handle-latest-release (app env params)
+  (let* ((id (resolve-identity env app))
+         ;; Latest visible release: walk releases newest-first and return
+         ;; the first one the identity may see.
+         (rs (ota-server.catalogue:list-releases
+              (app-state-catalogue app) (getf params :software)))
+         (vis (find-if (lambda (r) (visible-release-p id r)) rs)))
+    (if vis
+        (json-response 200 (plist-to-json-release vis app))
         (error-response 404 "no release"))))
 
-(defun handle-get-release (app params)
-  (let ((r (ota-server.catalogue:get-release
-            (app-state-catalogue app) (getf params :software) (getf params :version))))
-    (if r
-        (json-response 200 (plist-to-json-release r app))
-        (error-response 404 "release not found"))))
+(defun handle-get-release (app env params)
+  (let* ((id (resolve-identity env app))
+         (r (ota-server.catalogue:get-release
+             (app-state-catalogue app)
+             (getf params :software) (getf params :version))))
+    (cond ((null r) (error-response 404 "release not found"))
+          ((not (visible-release-p id r)) (error-response 404 "release not found"))
+          (t (json-response 200 (plist-to-json-release r app))))))
 
-(defun handle-get-manifest (app params)
+(defun handle-get-manifest (app env params)
   "Return the signed manifest JSON, with the signature in the
    X-Ota-Signature header (hex-encoded Ed25519)."
-  (let* ((dir (app-state-manifests-dir app))
+  (let* ((id (resolve-identity env app))
+         (rel (ota-server.catalogue:get-release
+               (app-state-catalogue app)
+               (getf params :software) (getf params :version)))
+         (dir (app-state-manifests-dir app))
          (path (merge-pathnames
                 (format nil "~A/~A.json"
                         (getf params :software) (getf params :version))
@@ -180,13 +258,12 @@
                     (format nil "~A/~A.sig"
                             (getf params :software) (getf params :version))
                     dir)))
-    (cond ((not (probe-file path))
+    (cond ((or (null rel) (not (visible-release-p id rel)))
+           (error-response 404 "manifest not found"))
+          ((not (probe-file path))
            (error-response 404 "manifest not found"))
           (t
            (let ((sig (read-bytes sig-path)))
-             ;; Returning a pathname lets Woo serve the file via
-             ;; sendfile.  The detached Ed25519 signature is in a
-             ;; response header.
              (list 200
                    (list :content-type "application/json; charset=utf-8"
                          :|x-ota-signature| (ironclad:byte-array-to-hex-string sig)
@@ -237,6 +314,9 @@
             (app-state-catalogue app)
             :name name
             :display-name (or display name))
+           (ota-server.catalogue:append-audit
+            (app-state-catalogue app)
+            :identity "admin" :action "create-software" :target name :detail nil)
            (json-response 201 (obj "name" name "display_name" (or display name)))))))
 
 (defun handle-admin-publish-release (app env params)
@@ -293,7 +373,14 @@
               :version version
               :blob-sha256 sha :blob-size size
               :manifest-sha256 manifest-sha
+              :classifications (parse-csv (or (header-of headers "x-ota-classifications") ""))
+              :channels        (parse-csv (or (header-of headers "x-ota-channels") ""))
               :notes notes)
+             (ota-server.catalogue:append-audit
+              (app-state-catalogue app)
+              :identity "admin" :action "publish-release"
+              :target release-id
+              :detail (format nil "blob=~A size=~A" sha size))
              ;; Build patches from every prior release of the same
              ;; (software, os, arch) to this new release, then
              ;; re-render the manifest with patches_in populated and
@@ -379,6 +466,80 @@
                       (uiop:split-string s :separator ","))
               'vector)))
 
+(defun handle-exchange-token (app env)
+  "Trade a one-shot install token for a per-client bearer token.
+   Body: { \"install_token\": \"...\", \"hwinfo\": \"...\" }."
+  (let* ((body (read-request-body-bytes env))
+         (json (and body (ignore-errors
+                           (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8)))))
+         (token (and (hash-table-p json) (gethash "install_token" json)))
+         (hwinfo (and (hash-table-p json) (gethash "hwinfo" json))))
+    (cond
+      ((or (null token) (zerop (length token)))
+       (error-response 400 "missing install_token"))
+      (t
+       (let ((classifications
+               (ota-server.catalogue:claim-install-token
+                (app-state-catalogue app) token)))
+         (cond
+           ((null classifications)
+            (error-response 401 "invalid or expired install_token"))
+           (t
+            (multiple-value-bind (cid bearer)
+                (ota-server.catalogue:create-client
+                 (app-state-catalogue app)
+                 :classifications classifications
+                 :hwinfo hwinfo)
+              (ota-server.catalogue:append-audit
+               (app-state-catalogue app)
+               :identity cid :action "exchange-token"
+               :target nil :detail (format nil "hwinfo=~A" (or hwinfo "")))
+              (json-response 200
+                             (obj "client_id"     cid
+                                  "bearer_token"  bearer
+                                  "classifications"
+                                  (coerce classifications 'vector)))))))))))
+
+(defun handle-admin-mint-install-token (app env)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-mint-install-token (error-response 401 "unauthorised")))
+  (let* ((body (read-request-body-bytes env))
+         (json (and body (ignore-errors
+                           (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8)))))
+         (cls (and (hash-table-p json) (gethash "classifications" json)))
+         (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json))
+                  900)))
+    (multiple-value-bind (token expires)
+        (ota-server.catalogue:mint-install-token
+         (app-state-catalogue app)
+         :classifications (or cls #("public"))
+         :ttl-seconds ttl
+         :created-by "admin")
+      (ota-server.catalogue:append-audit
+       (app-state-catalogue app)
+       :identity "admin" :action "mint-install-token"
+       :target nil :detail (format nil "ttl=~A" ttl))
+      (json-response 201 (obj "install_token" token "expires_at" expires)))))
+
+(defun handle-admin-list-audit (app env)
+  (unless (authorised-admin-p env app)
+    (return-from handle-admin-list-audit (error-response 401 "unauthorised")))
+  (let ((rows (ota-server.catalogue:list-audit (app-state-catalogue app))))
+    (json-response 200
+                   (coerce
+                    (mapcar
+                     (lambda (r)
+                       (obj "id" (getf r :id)
+                            "identity" (getf r :identity)
+                            "action" (getf r :action)
+                            "target" (or (getf r :target) "")
+                            "detail" (or (getf r :detail) "")
+                            "at" (getf r :at)))
+                     rows)
+                    'vector))))
+
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
   (let* ((body (read-request-body-bytes env))
@@ -422,18 +583,21 @@
           (t
            (handler-case
                (case route
-                 (:health                 (handle-health))
-                 (:list-software          (handle-list-software state))
-                 (:get-software           (handle-get-software state params))
-                 (:list-releases          (handle-list-releases state params))
-                 (:latest-release         (handle-latest-release state params))
-                 (:get-release            (handle-get-release state params))
-                 (:get-manifest           (handle-get-manifest state params))
-                 (:get-blob               (handle-get-blob state params))
-                 (:get-patch              (handle-get-patch state params))
-                 (:admin-create-software  (handle-admin-create-software state env))
-                 (:admin-publish-release  (handle-admin-publish-release state env params))
-                 (:events-install         (handle-events-install state env)))
+                 (:health                       (handle-health))
+                 (:list-software                (handle-list-software state))
+                 (:get-software                 (handle-get-software state params))
+                 (:list-releases                (handle-list-releases state env params))
+                 (:latest-release               (handle-latest-release state env params))
+                 (:get-release                  (handle-get-release state env params))
+                 (:get-manifest                 (handle-get-manifest state env params))
+                 (:get-blob                     (handle-get-blob state params))
+                 (:get-patch                    (handle-get-patch state params))
+                 (:admin-create-software        (handle-admin-create-software state env))
+                 (:admin-publish-release        (handle-admin-publish-release state env params))
+                 (:admin-mint-install-token     (handle-admin-mint-install-token state env))
+                 (:admin-list-audit             (handle-admin-list-audit state env))
+                 (:exchange-token               (handle-exchange-token state env))
+                 (:events-install               (handle-events-install state env)))
              (error (e)
                (format *error-output* "handler error on ~A: ~A~%" path e)
                (error-response 500 "internal error" (princ-to-string e))))))))))
@@ -441,9 +605,22 @@
 (defparameter *handler* nil)
 
 (defun start-server (state &key (host "0.0.0.0") (port 8080))
+  "Start the HTTP/JSON API.  TLS is opt-in: when both tls-cert and
+   tls-key are set on the app state, Woo terminates TLS itself; in
+   most deployments TLS is terminated by a reverse proxy and the
+   server speaks plain HTTP on the loopback (which keeps the
+   sendfile path active)."
   (setf *app* state)
-  (setf *handler*
-        (clack:clackup (make-app state) :server :woo :address host :port port))
+  (let* ((cert (app-state-tls-cert state))
+         (key  (app-state-tls-key  state))
+         (extra (when (and cert key (probe-file cert) (probe-file key))
+                  (list :ssl t :ssl-cert (namestring cert)
+                        :ssl-key (namestring key)))))
+    (setf *handler*
+          (apply #'clack:clackup
+                 (make-app state)
+                 :server :woo :address host :port port
+                 (or extra '()))))
   *handler*)
 
 (defun stop-server (&optional (handler *handler*))
