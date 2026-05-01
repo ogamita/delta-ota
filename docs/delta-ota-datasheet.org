@@ -1,0 +1,126 @@
+#+TITLE: Ogamita Delta OTA — Datasheet
+#+SUBTITLE: System limits and operational boundaries
+#+AUTHOR: Ogamita Ltd.
+#+EMAIL: support@ogamita.com
+#+OPTIONS: toc:2 num:t
+
+* What it is
+
+Ogamita Delta OTA (=delta-ota=) is an over-the-air software-
+distribution system for large packages (≥ 2 GB).  After an initial
+full download, every upgrade transfers only a binary delta between
+the user's installed release and the targeted release — typically
+a few percent of the full payload.
+
+The product comprises:
+
+- a *server* (=ota-server=) that ingests release tarballs, builds
+  patches against prior releases, signs manifests, and serves
+  blobs/patches with kernel-level zero-copy on plain HTTP;
+- a *client* — =libota= (embeddable C-ABI shared library) and
+  =ota-agent= (single-file CLI) — that pulls and applies patches
+  in process, with no runtime dependencies and atomic switch-over;
+- an *admin CLI* (=ota-admin=) for publishing releases and
+  managing classifications, channels, install tokens, audit.
+
+* Server limits
+
+| Property                   | Value                                  | Notes |
+|----------------------------+----------------------------------------+-------|
+| Operating system           | Linux x86_64, Linux arm64              | Other POSIX may work; Windows server is *not* supported |
+| Concurrent connections     | thousands per host                     | bound by NIC and =ulimit -n=; no per-connection fork |
+| HTTP serving               | =sendfile(2)= for blobs and patches    | language overhead irrelevant on plain HTTP |
+| TLS                        | optional, TLS 1.3                      | typical deployments terminate TLS at a reverse proxy |
+| Maximum blob (release) size | *8 GB* (configurable)                  | bsdiff RAM ≈ 2 × blob size at build time |
+| Maximum patch size         | 50 % of target blob                    | larger patches surface a full-blob fallback URL |
+| Catalogue backend          | SQLite (default) · PostgreSQL (sub-phase) | switched in =ota.toml= |
+| Blob storage backend       | filesystem (default) · S3-compatible (sub-phase) | switched in =ota.toml= |
+| Patch format               | bsdiff/BSDIFF40 + bzip2                | only patcher in v1 (see ADR-0004) |
+| Manifest signing           | Ed25519, detached signature            | hex-encoded in =X-Ota-Signature= header |
+| Audit                      | append-only =audit_log= table          | every admin write recorded |
+| Container image            | multi-arch (linux/amd64 + linux/arm64) | =registry.gitlab.com/ogamita/delta-ota/server= |
+
+* Client limits
+
+| Property                  | Value                                       | Notes |
+|---------------------------+---------------------------------------------+-------|
+| Operating system          | Windows 10/11, macOS 11+, Linux             | both x86_64 and arm64; arm64 Windows not in v1 |
+| Distribution              | single static binary per OS                 | no installer, no admin rights required |
+| Binary size               | ~10 MB (=ota-agent=), ~6 MB (=libota.{so,dylib,dll}=) | trimmed, no debug |
+| Runtime dependencies      | *none*                                      | cgo-free; no OpenSSL, no =bsdiff=, no =tar= on PATH |
+| TLS                       | pure-Go =crypto/tls=                        | no system OpenSSL on Windows |
+| Hashing                   | SHA-256 (Go stdlib)                         | streaming verification of every download |
+| Disk footprint per install | ≤ ~2 × blob size + small overhead          | one previous distribution kept by default |
+| Atomicity                 | =current= symlink/junction/shim flip        | failure leaves the prior install untouched |
+| C ABI                     | five exported functions: =ota_install/upgrade/revert/version/last_error= | =libota.h= committed |
+
+* Operational figures
+
+The numbers below are conservative for a 2 GB-class software
+product with a monthly release cadence and ~10 000 clients.
+
+| Workload                         | Per-host figure                      |
+|----------------------------------+--------------------------------------|
+| Steady-state upgrade transfer    | 20 MB median per client (~1 % of blob) |
+| 10 000 simultaneous upgrades     | ~200 GB egress over ~80 s @ 2×10 GbE |
+| Cold install (first-time user)   | up to 2 GB transfer (rate-limited)   |
+| Cold install fleet (10 000)      | 20 TB total — staggered via install-token bucket |
+| Disk: per release archive        | ≈ blob size                          |
+| Disk: per active patch           | 5–50 MB median                       |
+| RAM: patch worker                | ≈ 2 × blob size at build time        |
+| CPU: ongoing                     | low; bursts on publish               |
+| Garbage collection               | scheduled, idempotent                |
+| Verification                     | re-hash all artefacts, report mismatches |
+| Backup/restore                   | tarball of db + blobs + patches + manifests + keys |
+
+* Boundaries — what =delta-ota= does *not* do
+
+| Out of scope                                    | Use instead |
+|-------------------------------------------------+--------------|
+| OS-level package management                     | =apt=/=msi=/=pkg= |
+| Code-signing PKI (issuance, CRL, revocation)    | the deployer provides signing material; delta-ota *uses* it |
+| Per-user license enforcement                    | delta-ota classifications gate /visibility/, not licensing |
+| Real-time push                                  | clients pull on a configurable schedule |
+| Automated channel promotion (canary→stable)     | manual in v1; the API surface is ready, default policy is a deferred decision |
+| BitTorrent / IPFS swarm distribution            | judged unnecessary at the documented scale |
+| Driver / kernel-level updates                   | not in scope |
+| Uninstallation across the whole OS              | not in scope |
+
+* Compatibility commitments
+
+- *Wire format* (HTTP/JSON API): stable on =schema_version: 1=.
+  Bumped only on breaking field changes.
+- *Manifest schema*: JSON Schema at
+  =schemas/manifest.schema.json=, draft 2020-12.
+- *Patch format*: BSDIFF40 + bzip2.  Forward-compatible if a
+  future =Patch.patcher= value is introduced.
+- *=libota= C ABI*: stable across patch-level versions.  Adding
+  new functions is non-breaking; renaming or changing signatures
+  is a major-version event.
+- *State file* (=state.json=): forward-compatible (new fields are
+  ignored by older agents).
+- *=delta-ota= operating-system support* may be /extended/ in
+  point releases (e.g. arm64 Windows), but never narrowed within
+  a major version.
+
+* Standards and licences
+
+- *Licence* — AGPL-3.0-or-later (open-source distribution) /
+  commercial licence from Ogamita Ltd. (proprietary
+  distribution).  Dual-licensing terms in the project [[file:../README.md][README]].
+- *Standards* — TLS 1.3 (RFC 8446), Ed25519 (RFC 8032),
+  SemVer 2.0.0, JSON (RFC 8259), POSIX ustar tar, BSDIFF40, bzip2.
+- *Vendoring policy* — every vendored upstream is permissively
+  licensed (MIT / BSD / Apache-2.0).  GPL-class code is forbidden
+  in =vendor/= (one-way compatible with our AGPL); see
+  [[file:adr/0003-vendoring-policy.org][ADR-0003]].
+
+* Support and contacts
+
+| Channel             | Address                                                      |
+|---------------------+--------------------------------------------------------------|
+| Bug reports         | [[https://gitlab.com/ogamita/delta-ota/-/issues]]                |
+| Mirror (read-only)  | [[https://github.com/ogamita/delta-ota]]                         |
+| Container registry  | =registry.gitlab.com/ogamita/delta-ota/{server,dev}=         |
+| Commercial licence  | [[mailto:sales@ogamita.com][sales@ogamita.com]]                                            |
+| General support     | [[mailto:support@ogamita.com][support@ogamita.com]]                                          |

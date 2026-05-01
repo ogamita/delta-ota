@@ -1,0 +1,440 @@
+#+TITLE: Ogamita Delta OTA — User Manual
+#+SUBTITLE: For network administrators and software integrators
+#+AUTHOR: Ogamita Ltd.
+#+EMAIL: support@ogamita.com
+#+OPTIONS: toc:3 num:t
+
+* About this manual
+
+This manual is for two audiences:
+
+1. *Network administrators* who deploy and operate a delta-ota
+   server for their organisation, decide who can publish releases,
+   and manage client classifications.
+2. *Software integrators* who ship a desktop application and want
+   their users to receive over-the-air updates with bandwidth
+   smaller than the full payload.
+
+For internal engineering and architecture details see
+[[file:ota-specifications.org][ota-specifications.org]] and [[file:operations.org][operations.org]] (the operator
+runbook).  This document is the customer-facing reference.
+
+* Concepts
+
+** Software, release, blob, patch
+
+A *software* product is identified by a short kebab-case name
+(=schms=, =plugin-cao=).
+
+A *release* is one immutable build of one software for one
+=(operating system, architecture)= target — for example
+=schms/windows-x86_64/3.4.1=.  Each release ships as:
+
+- A *blob*: a deterministic =.tar= archive of the release tree,
+  uploaded to the server.  The same source produces the same bytes,
+  every time — this is what makes the binary deltas tight.
+- A *manifest*: a small JSON document that describes the release
+  and lists the patches available to it.  Every manifest is signed
+  with the server's Ed25519 key.
+
+A *patch* is a binary delta from one blob to another.  v1 uses
+=bsdiff= patches (BSDIFF40 + bzip2).  Each patch is referenced from
+the destination release's manifest.
+
+** Channels and classifications
+
+A *channel* is a named subset of releases visible to a class of
+clients — e.g. =stable=, =beta=, =canary=, =internal=.
+
+A *classification* is the equivalent label on the *client* side.
+A client carrying classification =[stable, beta]= sees every
+release tagged =stable= OR =beta=.
+
+Classifications are assigned to a client when its install token is
+minted.  This is how you ship beta builds to a known group of
+testers without exposing them to the general public.
+
+** Install token, bearer token
+
+To pick up a software for the first time, an unmanaged client
+needs an *install token* — short-lived, one-shot, minted by an
+admin.  When the agent uses it, the server exchanges it for a
+*bearer token* unique to that workstation.  Subsequent calls (list,
+manifest, blob, patch downloads) carry the bearer; the install
+token is consumed and discarded.
+
+The bearer is persisted in the agent's =state.json= and is reused
+for every later upgrade.  Rotating it requires re-running install
+with a fresh install token.
+
+* For the network administrator
+
+** Hosting choices
+
+Two supported topologies (see [[file:operations.org::*Deployment topologies][operations.org]] for detail):
+
+- *Single dedicated host* — the simplest deployment.  SQLite
+  catalogue, filesystem blob storage, systemd unit, Linux x86_64 or
+  arm64.
+- *Kubernetes cluster* — for cloud deployments behind a load
+  balancer.  PostgreSQL catalogue, S3-compatible blob storage.
+  (PG and S3 backends ship in a sub-phase between v1 and v1.1; v1
+  is the single-host topology.)
+
+The same container image (=registry.gitlab.com/ogamita/delta-ota/server=)
+is published as a multi-arch manifest (linux/amd64 + linux/arm64)
+and serves both topologies.  Storage and database backends are
+selected in =ota.toml=.
+
+** Network requirements
+
+Inbound :
+
+- *TCP/443 (HTTPS)* :: the public download port.  TLS termination
+  is typically done at a reverse proxy (nginx, HAProxy, a cloud
+  LB).  When TLS is offloaded, the OTA server speaks plain HTTP
+  on the loopback so the kernel =sendfile= path stays active for
+  blob downloads.
+- *TCP/443 admin path* :: separate admin endpoints under
+  =/v1/admin/...= require an admin bearer token.  Restrict at the
+  proxy layer to known admin networks.
+
+Outbound :
+
+- *DNS / NTP* :: standard.
+- *Container registry* :: pulling the server image
+  (=registry.gitlab.com/ogamita/...=).  No outbound dependency at
+  runtime once the image is on disk.
+
+The server makes *no* outbound calls during normal operation:
+publishing happens via inbound POST, builds happen synchronously,
+and clients pull.
+
+** Capacity planning
+
+The numbers below are conservative for a 2 GB-class software
+product with a monthly release cadence and ~10 000 clients.
+
+| Workload                        | Per-host figure                          |
+|---------------------------------+------------------------------------------|
+| Steady-state upgrade            | 20 MB median per client (1 % of blob)    |
+| 10 000 simultaneous upgrades    | ~200 GB egress over ~80 s @ 2×10 GbE     |
+| Cold install (first-time user)  | up to 2 GB transfer (rate-limited)       |
+| Disk: per release archive       | ~ blob size                              |
+| Disk: per active patch          | 5–50 MB median                           |
+| RAM: patch worker               | ≈ 2 × blob size at build time            |
+| CPU: ongoing                    | low; bursts on publish                   |
+
+For larger fleets or faster cadences, scale storage first (blobs
+add up over time) and add patch-build workers (sub-phase 5).
+
+** Day-to-day operations
+
+The full operator runbook lives in [[file:operations.org][operations.org]].  The actions
+you'll perform most often:
+
+*** Publish a release (developer or CI)
+
+#+begin_src sh
+ota-admin publish ./build/release/                  \
+    --software=schms                                \
+    --version=3.4.1                                 \
+    --os=windows --arch=x86_64                      \
+    --os-versions=10,11                             \
+    --classifications=stable
+#+end_src
+
+*** Mint an install token for a new user
+
+#+begin_src sh
+curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN"        \
+     -H "Content-Type: application/json"                        \
+     -d '{"classifications":["stable"],"ttl_seconds":900}'      \
+     https://ota.example.com/v1/admin/install-tokens
+#+end_src
+
+The response carries a one-shot =install_token= valid for 15
+minutes (configurable).  Hand it to the user via a one-time link
+or pasted into your install-page URL.
+
+*** Garbage-collect old releases
+
+#+begin_src sh
+curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN"        \
+     -H "Content-Type: application/json"                        \
+     -d '{"min_user_count":0,"min_age_days":30}'                \
+     https://ota.example.com/v1/admin/software/schms/gc
+#+end_src
+
+Idempotent.  Run weekly from cron / systemd timer.
+
+*** Verify storage integrity
+
+#+begin_src sh
+curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN"        \
+     https://ota.example.com/v1/admin/verify
+#+end_src
+
+Reports any artefact whose on-disk hash no longer matches its
+content-addressed name (= disk corruption).
+
+*** Inspect the audit log
+
+#+begin_src sh
+curl -H "Authorization: Bearer $OTA_ADMIN_TOKEN"                \
+     https://ota.example.com/v1/admin/audit
+#+end_src
+
+Every admin write is recorded with identity + timestamp.
+
+** Backup and restore
+
+#+begin_src sh
+sudo tools/backup.sh /var/lib/ota /var/backups/ota
+sudo tools/restore.sh /var/backups/ota/ota-backup-XXXX.tar.gz /var/lib/ota
+#+end_src
+
+The catalogue plus all blobs/patches/manifests/keys are bundled
+into a single tarball with a SHA-256 sidecar.  See [[file:operations.org::*Backup and disaster recovery][operations.org →
+Backup]] for details.
+
+** Key rotation
+
+The server's Ed25519 manifest-signing key lives at
+=$OTA_ROOT/etc/keys/=.  Rotation procedure with zero downtime is
+documented in [[file:operations.org::*Key rotation][operations.org → Key rotation]].  Distribute the new
+public key to clients *before* rotating, then re-sign every
+manifest in place with =ota-server.workers:resign-manifests=.
+
+* For the software integrator
+
+You ship a desktop application; you want it to update itself in
+the field.  delta-ota gives you two integration shapes:
+
+1. *Shell out to =ota-agent='* (recommended).
+2. *Link =libota='* into your application via the C ABI.
+
+Pick (1) unless you have a specific reason to need in-process
+progress callbacks during a long-running session of your app.
+
+** Option 1 — shell out to =ota-agent=
+
+The =ota-agent= binary is a single static executable per OS.
+Bundle it next to your application, or place it on =PATH=.
+
+A typical update flow from inside your application is:
+
+#+begin_src sh
+# In your application, on a daily timer or "Check for updates" menu:
+ota-agent upgrade my-software --to=latest
+case "$?" in
+  0) # Update succeeded; restart the application.
+     ;;
+  1) # No update available, or transient error.  Fail soft.
+     ;;
+esac
+#+end_src
+
+For first-time installation by a user, point them at the URL of
+the install page.  The page hands the user a one-shot install
+token and the agent binary; the agent runs:
+
+#+begin_src sh
+ota-agent install my-software                                   \
+    --server https://ota.example.com                            \
+    --install-token $TOKEN                                      \
+    --hwinfo "$(hostname)"
+#+end_src
+
+After this, the agent writes a =state.json= containing the
+per-workstation bearer token; subsequent =upgrade= calls reuse
+that bearer and require no further authentication.
+
+The agent installs into =$OTA_HOME/<software>/= (default
+=~/.ota/<software>/=) and exposes the active distribution as
+=$OTA_HOME/<software>/current= — a symlink on POSIX, or, on
+Windows non-admin/non-developer-mode installs, a =current.path=
+text file holding the absolute path.
+
+Your application launcher reads =$OTA_HOME/<software>/current=
+and execs the binary inside.  See [[*Launcher patterns]].
+
+** Option 2 — link =libota= via the C ABI
+
+Use this when your application needs to drive the upgrade in-
+process (e.g. a long-running CAD plug-in that wants to display
+progress in its own UI).
+
+The C header is generated by the Go build:
+
+#+begin_src
+// libota.h — five exported functions:
+extern char* ota_last_error(void);
+extern char* ota_version(void);
+extern int   ota_install(char* cfg_json, char* name, char* version);
+extern int   ota_upgrade(char* cfg_json, char* name, char* version);
+extern int   ota_revert (char* cfg_json, char* name);
+#+end_src
+
+Each function returns =0= on success, =-1= on failure; on failure
+=ota_last_error()= returns a thread-safe pointer to the most
+recent error string.  =cfg_json= is a JSON-encoded =Config=:
+
+#+begin_src json
+{
+  "ServerURL":      "https://ota.example.com",
+  "OTAHome":        "C:\\Users\\joe\\.ota",
+  "TrustedPubKeys": ["a8e1...c4"],
+  "InstallToken":   "first-time-only",
+  "Hwinfo":         "joe-laptop",
+  "FallbackRatio":  0.7
+}
+#+end_src
+
+The library is published as:
+
+| Platform        | Shared        | Static         | Header     |
+|-----------------+---------------+----------------+------------|
+| Linux amd64/arm64 | =libota.so=   | =libota.a=     | =libota.h= |
+| macOS amd64/arm64 | =libota.dylib= | =libota.a=    | =libota.h= |
+| Windows amd64   | =libota.dll=  | =libota.a=     | =libota.h= |
+
+Bindings examples (Python and .NET) live under =examples/= in the
+repository.
+
+** Launcher patterns
+
+To keep your application launching while OTA is upgrading the next
+distribution in the background, use a *launcher shim*:
+
+- The shim is a tiny binary that lives at a fixed path (the path
+  the desktop shortcut or =Open With= association points to).
+- On launch, it reads =$OTA_HOME/<software>/current= and execs the
+  real binary inside.
+- delta-ota's atomic-flip means the shim never sees a half-
+  installed tree.
+
+A reference implementation in Go (about 30 lines) ships under
+=examples/launcher-shim/=.
+
+** Trust and signing
+
+Every manifest is signed with the server's Ed25519 key.  The agent
+verifies the signature against a *trusted public-key set*:
+
+- /Pinned/: pass =--trusted-pubkeys=KEY1,KEY2= or set
+  =OTA_TRUSTED_PUBKEYS=.  The agent refuses any manifest not
+  signed by one of these keys.
+- /Trust-on-first-use/: when no trusted set is configured, the
+  agent records the first key it sees in =state.json= and pins
+  subsequent calls to that key.  A change of key (rotation, or a
+  hostile server replacement) is rejected unless the user passes
+  =--trust-new-key=.
+
+For production deployments, ship your application with the
+production key pinned.
+
+** What to put in your release tarball
+
+The release tree handed to =ota-admin publish= becomes the
+=current= distribution on every client.  It should contain
+everything your application needs at runtime — your binary, your
+DLLs/dylibs, your resources — *and nothing else*.
+
+Avoid:
+
+- machine-specific paths
+- timestamps inside files (the deterministic-tar layer takes care
+  of file metadata, but if your build produces files that embed
+  build dates, you'll defeat the delta compression)
+- unstable file ordering (e.g. randomised obfuscation seeds)
+
+The more deterministic your build, the smaller your patches.  A
+good rule of thumb is: a release that recompiles your code without
+touching a single source line should produce a < 1 %-of-blob
+patch.
+
+* Reference
+
+** HTTP/JSON API surface
+
+| Method | Path                                                  | Auth                  |
+|--------+-------------------------------------------------------+-----------------------|
+| GET    | =/v1/health=                                          | none                  |
+| GET    | =/v1/software=                                        | bearer (filtered)     |
+| GET    | =/v1/software/{sw}=                                   | bearer (filtered)     |
+| GET    | =/v1/software/{sw}/releases=                          | bearer (filtered)     |
+| GET    | =/v1/software/{sw}/releases/latest=                   | bearer (filtered)     |
+| GET    | =/v1/software/{sw}/releases/{v}=                      | bearer (filtered)     |
+| GET    | =/v1/software/{sw}/releases/{v}/manifest=             | bearer (filtered)     |
+| GET    | =/v1/blobs/{sha}=                                     | bearer                |
+| GET    | =/v1/patches/{sha}=                                   | bearer                |
+| POST   | =/v1/exchange-token=                                  | install-token (body)  |
+| POST   | =/v1/events/install=                                  | bearer (best-effort)  |
+| POST   | =/v1/admin/software=                                  | admin                 |
+| POST   | =/v1/admin/software/{sw}/releases=                    | admin                 |
+| POST   | =/v1/admin/software/{sw}/gc=                          | admin                 |
+| POST   | =/v1/admin/install-tokens=                            | admin                 |
+| POST   | =/v1/admin/verify=                                    | admin                 |
+| GET    | =/v1/admin/audit=                                     | admin                 |
+
+The full machine-readable description lives at
+[[file:../schemas/api.openapi.yaml][schemas/api.openapi.yaml]].
+
+** Manifest schema
+
+JSON Schema at [[file:../schemas/manifest.schema.json][schemas/manifest.schema.json]].  Stable on
+=schema_version: 1=; bumped only on incompatible field changes.
+
+** State file (=state.json=)
+
+| Field             | Type        | Notes                                    |
+|-------------------+-------------+------------------------------------------|
+| =software=        | string      | software name                            |
+| =current=         | string      | current installed version                |
+| =previous=        | string      | one-step revert target                   |
+| =history=         | array       | install/upgrade trail                    |
+| =server_url=      | string      | pinned at first install                  |
+| =server_pubkey_hex= | string    | trust-on-first-use pin                   |
+| =client_id=       | string      | server-issued                            |
+| =bearer_token=    | string      | per-workstation, persisted               |
+| =updated_at=      | timestamp   | UTC                                      |
+
+** Exit codes (=ota-agent=)
+
+| Code | Meaning                                          |
+|------+--------------------------------------------------|
+|    0 | Success                                          |
+|    1 | Operational failure (network, signature, hash, …) |
+|    2 | Usage error (missing args)                       |
+
+** Environment variables
+
+| Variable              | Purpose                                       |
+|-----------------------+-----------------------------------------------|
+| =OTA_HOME=            | base directory for installs (default =~/.ota=) |
+| =OTA_SERVER=          | default =--server= URL                        |
+| =OTA_INSTALL_TOKEN=   | default =--install-token= value               |
+| =OTA_TRUSTED_PUBKEYS= | comma-separated hex pubkey list (server)      |
+| =OTA_ADMIN_TOKEN=     | (admin) bearer for =ota-admin= and curl       |
+
+* Support
+
+Bug reports : [[https://gitlab.com/ogamita/delta-ota/-/issues]]
+
+Commercial support, including SLA-backed response times, on-prem
+deployment assistance, and proprietary-distribution licences, is
+available from Ogamita Ltd.  Contact [[mailto:sales@ogamita.com][sales@ogamita.com]].
+
+* Licence
+
+Copyright © 2026 Ogamita Ltd. and contributors.
+
+This software is released under the *GNU Affero General Public
+License version 3 or later* (AGPL-3.0-or-later).  See the
+[[file:../LICENSE][LICENSE]] file at the repository root.
+
+If the AGPL is incompatible with your distribution model — for
+example, if you ship =libota= linked into a proprietary
+application — *commercial licences are available from Ogamita Ltd*.
+See the project [[file:../README.md::*Licensing][README]] for the dual-licensing terms.

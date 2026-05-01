@@ -140,6 +140,51 @@ go-test:
 test: test-unit
 test-unit: lisp-check lisp-test go-test
 
+# ---------- documentation ----------
+# Generate PDFs from .org sources. Two backends:
+#   1. emacs --batch (preferred) -- richest org-mode rendering.
+#   2. pandoc (fallback) -- works on any host with TeX installed.
+# Either tool needs a working TeX (xelatex / pdflatex). On Debian:
+#   apt-get install emacs-nox texlive-xetex pandoc
+EMACS  ?= emacs
+PANDOC ?= pandoc
+DOCS_DIR := docs
+ORG_FILES := \
+    $(DOCS_DIR)/ota-specifications.org           \
+    $(DOCS_DIR)/ota-implementation-plan.org      \
+    $(DOCS_DIR)/operations.org                   \
+    $(DOCS_DIR)/delta-ota-datasheet.org          \
+    $(DOCS_DIR)/delta-ota-user-manual.org        \
+    $(DOCS_DIR)/dependencies.org                 \
+    $(DOCS_DIR)/THIRD_PARTY_LICENSES.org
+
+PDF_OUT := build/docs
+PDF_FILES := $(patsubst $(DOCS_DIR)/%.org,$(PDF_OUT)/%.pdf,$(ORG_FILES))
+
+.PHONY: docs docs-pdf docs-clean
+docs: docs-pdf
+docs-pdf: $(PDF_FILES)
+docs-clean:
+	rm -rf $(PDF_OUT)
+
+$(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
+	@mkdir -p $(PDF_OUT)
+	@if command -v $(PANDOC) >/dev/null 2>&1 && command -v xelatex >/dev/null 2>&1; then \
+	    $(PANDOC) --pdf-engine=xelatex \
+	        -V geometry:margin=1in \
+	        --toc --number-sections \
+	        -o $@ $<; \
+	elif command -v $(EMACS) >/dev/null 2>&1; then \
+	    $(EMACS) --batch --eval "(progn \
+	        (require 'ox-latex) \
+	        (find-file \"$<\") \
+	        (org-latex-export-to-pdf))" \
+	        && mv $(DOCS_DIR)/$*.pdf $@; \
+	else \
+	    echo "docs: pandoc+xelatex (or emacs+org) required" >&2; \
+	    exit 1; \
+	fi
+
 e2e: e2e-install e2e-auth e2e-ops
 e2e-install:
 	tests/e2e/run.sh
