@@ -43,13 +43,19 @@ RUN set -eux; \
     ln -s /usr/local/go/bin/go /usr/local/bin/go; \
     ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 
-# Quicklisp for SBCL (built-in libraries pulled at server build time, not
-# baked into the image — keeps the image small and the lock current).
+# Quicklisp + the server's Common Lisp dependencies, baked into the image
+# so CI builds don't pay the download cost on every run. Versions float
+# (Quicklisp dist of the day at image build time); the image tag is
+# rebuilt on master pushes so the cache stays reasonably fresh.
 RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp \
     && sbcl --non-interactive --no-userinit --no-sysinit \
         --load /tmp/quicklisp.lisp \
         --eval '(quicklisp-quickstart:install :path "/opt/quicklisp")' \
-        --eval '(let ((ql-util::*do-not-prompt* t)) (ql:add-to-init-file))' \
+        --eval '(quit)' \
+    && sbcl --non-interactive --no-userinit --no-sysinit \
+        --load /opt/quicklisp/setup.lisp \
+        --eval '(ql:quickload (list "alexandria" "ironclad" "jzon" "cl-dbi" "cl-sqlite" "cl-postgres" "clack" "woo" "cl+ssl" "dexador" "fiveam"))' \
+        --eval '(quit)' \
     && rm /tmp/quicklisp.lisp
 
 ENV GOPATH=/go

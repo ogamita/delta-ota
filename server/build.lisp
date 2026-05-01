@@ -8,16 +8,23 @@
 
 (require :asdf)
 
-;; Use Quicklisp if it's set up on the developer machine.
+;; Load Quicklisp if available (dev workstation or our CI dev image at
+;; /opt/quicklisp). The setup.lisp registers Quicklisp with ASDF, which
+;; means missing dependencies are downloaded on first ql:quickload.
 (let ((qlinit (merge-pathnames "quicklisp/setup.lisp"
                                (or (uiop:getenv "QUICKLISP_HOME")
                                    (user-homedir-pathname)))))
   (when (probe-file qlinit)
     (load qlinit)))
 
-;; Phase 0 builds an empty core just to prove the pipeline.
 (asdf:load-asd (truename "server/ota-server.asd"))
-(asdf:load-system "ota-server")
+
+;; Use Quicklisp's quickload when available so missing deps are fetched;
+;; fall back to plain ASDF when Quicklisp is not present (e.g. an air-
+;; gapped builder that has the deps pre-installed via another mechanism).
+(if (find-package :ql)
+    (uiop:symbol-call :ql :quickload "ota-server")
+    (asdf:load-system "ota-server"))
 
 (ensure-directories-exist (truename "./") :verbose nil)
 (ensure-directories-exist "server/build/")

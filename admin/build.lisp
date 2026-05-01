@@ -10,7 +10,10 @@
     (load qlinit)))
 
 (asdf:load-asd (truename "admin/ota-admin.asd"))
-(asdf:load-system "ota-admin")
+
+(if (find-package :ql)
+    (uiop:symbol-call :ql :quickload "ota-admin")
+    (asdf:load-system "ota-admin"))
 
 (ensure-directories-exist "admin/build/")
 
