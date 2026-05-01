@@ -1,0 +1,78 @@
+#+TITLE: delta-ota — Dependencies
+#+DATE: 2026-05-01
+#+AUTHOR: Ogamita Ltd.
+
+This document tracks every dependency the project ships with, both
+*build-time* (Quicklisp / Go modules pulled at build) and
+*vendored* (source-level imports under =vendor/= and
+=client/internal/vendor/=).
+
+The vendoring policy is documented in [[file:adr/0003-vendoring-policy.org][ADR-0003]] and the spec's
+[[file:ota-specifications.org::*Self-containment and vendoring][Self-containment and vendoring]] section.
+
+* Build-time dependencies
+
+These are pulled from Quicklisp (Lisp) or =go.mod= (Go) at build
+time.  They are *not* shipped in the client binary; the client is
+fully static.
+
+** Server (Common Lisp, via Quicklisp)
+
+| Library      | Purpose                                  | License       |
+|--------------+------------------------------------------+---------------|
+| alexandria   | utilities                                | Public Domain |
+| uiop         | portability                              | MIT           |
+| ironclad     | SHA-256, Ed25519, AES                    | BSD-3-Clause  |
+| jzon         | JSON                                     | MIT           |
+| cl-dbi       | DB-independent SQL                       | LLGPL         |
+| cl-sqlite    | SQLite driver                            | Public Domain |
+| cl-postgres  | PostgreSQL driver                        | zlib          |
+| clack        | HTTP middleware                          | LLGPL         |
+| woo          | HTTP server with sendfile                | MIT           |
+| cl+ssl       | OpenSSL bindings                         | MIT           |
+| fiveam       | testing                                  | BSD-3-Clause  |
+
+LLGPL deserves a note : it is the *Lisp* Lesser GPL, distinct from
+the GNU LGPL, and is widely treated as compatible with proprietary
+distribution provided that recompilation against modified versions
+remains possible.  This is consistent with our dual-licensing model.
+We do not vendor LLGPL code; it is a build-time dependency only.
+
+** Client (Go, stdlib)
+
+The client uses Go stdlib for everything but the patch appliers:
+
+| Concern             | Source                          |
+|---------------------+---------------------------------|
+| HTTP                | =net/http=                      |
+| TLS                 | =crypto/tls= (pure Go)          |
+| Hashes              | =crypto/sha256=                 |
+| Signatures          | =crypto/ed25519=                |
+| Tar                 | =archive/tar=                   |
+| JSON                | =encoding/json=                 |
+
+Stdlib is BSD-3-Clause.  No third-party Go modules at build time.
+
+* Vendored sources
+
+Each entry below corresponds to a directory under =vendor/= or
+=client/internal/vendor/= containing a verbatim copy of the upstream
+source, its =LICENSE= file, and a =VENDORED.md= with provenance.
+
+CI verifies the recorded =Tree SHA-256= against the actual content
+on every push (=tools/vendor-verify.sh=).
+
+| Component                | Path                                           | Upstream commit | License       | Imported on | Tree SHA-256 |
+|--------------------------+------------------------------------------------+-----------------+---------------+-------------+--------------|
+| mendsley-bsdiff          | =vendor/mendsley-bsdiff/=                      | (TBD)           | BSD-2-Clause  | (TBD)       | (TBD)        |
+| jmacd-xdelta3            | =vendor/jmacd-xdelta3/=                        | (TBD)           | Apache-2.0    | (TBD)       | (TBD)        |
+| sharplispers-archive     | =vendor/sharplispers-archive/=                 | (TBD)           | BSD-3-Clause  | (TBD)       | (TBD)        |
+| gabstv-go-bsdiff         | =client/internal/vendor/gabstv-go-bsdiff/=     | (TBD)           | MIT           | (TBD)       | (TBD)        |
+| ably-vcdiff-go           | =client/internal/vendor/ably-vcdiff-go/=       | (TBD)           | Apache-2.0    | (TBD)       | (TBD)        |
+
+The =(TBD)= rows are filled in when each component is imported via
+=tools/vendor-import.sh=.  See the script's output and update both
+this table and the =Tree SHA-256= in =VENDORED.md= consistently.
+
+The aggregated upstream licence text shipped with the client binary
+lives in [[file:THIRD_PARTY_LICENSES.org][docs/THIRD_PARTY_LICENSES.org]].

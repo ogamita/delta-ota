@@ -1,0 +1,55 @@
+#+TITLE: ADR-0002 — Woo, not Hunchentoot
+#+DATE: 2026-05-01
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted.
+
+* Context
+
+The server has to deliver multi-GB blobs.  The single most
+important performance question is whether the HTTP server can hand
+the open file descriptor to the kernel via =sendfile(2)= or has to
+copy every byte from the kernel into userspace and back.
+
+* Decision
+
+The =ota-server= HTTP layer is built on **Woo** (Clack adapter
+backed by libev) — *not* Hunchentoot.
+
+* Consequences
+
+** Why Woo wins for our workload
+
+- *Native sendfile*: Woo's source has =sendfile-fd=, =sendfile-size=,
+  =sendfile-offset= slots and =wsys:sendfile= calls in its libev
+  async-write pipeline.  Triggered when the Clack response body is
+  a =pathname=.
+- *Throughput on small responses* (Fukamachi's own benchmark, 8-core
+  VPS): Woo 110 528 req/s ≈ Go =net/http= 97 647 req/s, both
+  ~3× Hunchentoot's 29 295.
+
+** Why Hunchentoot is disqualified
+
+- No native =sendfile=; static-file delivery goes through
+  =flexi-streams= + =chunga= Gray-stream layers, which means a
+  userspace copy for every byte.  For an 8 GB blob this is the
+  difference between "language overhead is irrelevant" and
+  "the server is the bottleneck".
+
+** Trade-offs accepted
+
+- Woo is Unix-only (libev).  Acceptable: =ota-server= ships only
+  on Linux.
+- Woo is less battle-tested in enterprise Lisp shops than
+  Hunchentoot.  Mitigation: the Clack adapter layer is a stable
+  contract; switching adapters later is mechanical if needed.
+- Under HTTPS, neither Woo nor Go can use =sendfile= (TLS encrypts
+  in userspace).  Acceptable; both stacks are equivalent there.
+
+* References
+
+- [[file:../ota-specifications.org::*HTTP server throughput — large static files][docs/ota-specifications.org — HTTP server throughput]]
+- [[https://github.com/fukamachi/woo/blob/master/src/ev/socket.lisp][Woo socket.lisp — sendfile slots]]
+- [[https://github.com/fukamachi/woo/blob/master/benchmark.md][Woo benchmark]]

@@ -1,0 +1,71 @@
+#+TITLE: ADR-0001 — Stack split: SBCL server, Go client
+#+DATE: 2026-05-01
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted.
+
+* Context
+
+The system has to move 2–8 GB binary blobs from a Unix server to
+mostly-Windows user workstations.  Two stacks were considered
+seriously: SBCL (Common Lisp) and Go.
+
+A research pass produced concrete data: see [[file:../ota-specifications.org::*SBCL vs Go — analysis][SBCL vs Go — analysis]]
+in the spec.
+
+* Decision
+
+- *Server* in Common Lisp (SBCL) + Woo (Clack adapter), running on
+  Linux only.
+- *Admin CLI* (=ota-admin=) in Common Lisp, sharing the catalogue,
+  signing, and manifest code with the server.
+- *Client library* (=libota=) in Go, built as =c-shared= /
+  =c-archive= for non-Go hosts.
+- *Client CLI* (=ota-agent=) in Go, statically linked, no =cgo=.
+
+* Consequences
+
+** Positive
+
+- Server lives in the same Lisp ecosystem as the rest of the
+  organisation's tooling (=clautolisp=, =velisp=, AutoLISP plug-ins);
+  the catalogue / signing / manifest code is reused by =ota-admin=.
+- The client is a single static binary per OS produced by one CI
+  job, ~2.5 MB, with no runtime dependencies, no OpenSSL DLL on
+  Windows.  Cross-compilation is trivial (=GOOS=… GOARCH=… go
+  build=).
+- The HTTP/JSON API and the manifest schema are the contract; the
+  language gap does not leak into either.
+
+** Negative
+
+- Two languages and two toolchains in the project; CI must build
+  both.
+- Admins on machines without SBCL must install Lisp to use
+  =ota-admin=.  An optional Go port of =ota-admin= is listed in
+  the spec's "Acceptable alternatives" if this turns out painful.
+
+** Neutral
+
+- Both stacks delegate to =sendfile(2)= for plain HTTP, so the
+  language overhead is irrelevant for the GB-blob case (the actual
+  kingmaker).  Hunchentoot is *not* an option because it does not
+  use =sendfile=; this is recorded separately in [[file:0002-woo-not-hunchentoot.org][ADR-0002]].
+
+* Alternatives considered
+
+- Server in Go : collapses the toolchain to one language, loses the
+  Lisp code-sharing.  Open as an "acceptable alternative" if a
+  separate ops team takes over operation.
+- Server in Rust : same trade-offs as Go, plus higher up-front cost.
+- =libota= in Rust (=cdylib=) : drop-in replacement if memory-safety
+  guarantees become a hard requirement.
+- =libota= in C11 : smallest binary, but pulls in the OpenSSL
+  distribution problem on Windows that Go avoids.
+
+* References
+
+- [[file:../ota-specifications.org::*Stack and language choices][docs/ota-specifications.org — Stack and language choices]]
+- [[file:../ota-implementation-plan.org][docs/ota-implementation-plan.org]]

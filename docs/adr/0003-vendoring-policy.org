@@ -1,0 +1,78 @@
+#+TITLE: ADR-0003 — Vendor permissively-licensed sources, no system tools at runtime
+#+DATE: 2026-05-01
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted.
+
+* Context
+
+The client ships to thousands of unmanaged Windows desktops and to
+macOS / Linux user workstations.  The server is sometimes deployed
+on a customer's own host where a particular distro version of
+=bsdiff= or =xdelta3= may be unavailable, broken, or absent.  We
+also distribute the project under AGPL-3.0-or-later and offer
+commercial licences, so any vendored upstream must be compatible
+with both.
+
+* Decision
+
+1. The client binary has *no* runtime dependency on =bsdiff=,
+   =bspatch=, =xdelta3=, =tar=, OpenSSL, or any other external
+   tool or shared library.  CI enforces this with =ldd= / =otool=
+   checks.
+2. The Go client is *cgo-free* (=CGO_ENABLED=0=).
+3. The server invokes vendored =bsdiff= / =xdelta3= helper binaries
+   by *absolute path* baked into config; it never consults the
+   host's =$PATH= for them.
+4. Every vendored source under =vendor/= and =client/internal/vendor/=
+   must be permissively licensed: MIT, BSD-2/3-Clause, Apache-2.0,
+   or ISC.  *GPL / LGPL / AGPL is prohibited.*
+5. Each vendored subdir carries the verbatim upstream =LICENSE=
+   plus a =VENDORED.md= recording upstream URL, commit hash,
+   SHA-256 of the imported tree, import date, and any local patches.
+6. CI re-hashes every vendored subtree and fails on any mismatch.
+
+* Why no GPL vendoring even though we are AGPL
+
+The compatibility is one-way:
+
+- AGPL-3.0 *can* incorporate MIT / BSD / Apache-2.0 / ISC code
+  without restricting downstream use of the AGPL whole.
+- GPL-vendored code, however, would force consumers of =libota=
+  (which we ship under both AGPL and *commercial* terms) into GPL
+  for the commercial path.  This breaks the dual-licensing model.
+
+In particular: =jmacd/xdelta-gpl= (GPLv2) is *not* used.  We vendor
+=jmacd/xdelta= (Apache-2.0) instead.
+
+* Consequences
+
+** Positive
+
+- Zero-friction installs : the client is one file per OS, no
+  pre-installed runtime, no DLL hell.
+- Reproducible servers : the patch worker behaviour does not depend
+  on what the host distro happens to ship.
+- Dual licensing remains viable : upstream code we ship can be
+  combined with proprietary deployments under our commercial terms.
+
+** Negative
+
+- We carry the maintenance cost of pinned upstreams.  Mitigated by
+  =docs/dependencies.org= + a quarterly review noted in the plan's
+  risks table.
+- =vendor/= adds disk weight to checkouts.  The five components
+  selected are small (largest is xdelta3 at ~30 KLoC C).
+
+** Neutral
+
+- Vendoring is at *source* level, not via Go modules' =vendor/=
+  mechanism.  The Go module path =client/internal/vendor/<name>=
+  is part of our import graph.
+
+* References
+
+- [[file:../ota-specifications.org::*Self-containment and vendoring][docs/ota-specifications.org — Self-containment and vendoring]]
+- [[file:../dependencies.org][docs/dependencies.org]]

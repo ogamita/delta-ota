@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Sample configuration baked into the production Docker image.
+# Copied to /etc/ota/ota.toml on first boot if no config is mounted.
+
+[server]
+listen   = "0.0.0.0:8443"
+hostname = "ota.example.com"
+data_dir = "/var/lib/ota"
+log_level = "info"
+
+[tls]
+cert         = "/etc/ota/server.crt"
+key          = "/etc/ota/server.key"
+client_ca    = "/etc/ota/clients-ca.crt"
+require_mtls = false
+
+[storage]
+backend = "fs"
+# To use S3 / MinIO instead, switch to:
+#   backend     = "s3"
+#   s3_endpoint = "http://minio:9000"
+#   s3_bucket   = "delta-ota"
+#   s3_access_key_env = "OTA_S3_ACCESS_KEY"
+#   s3_secret_key_env = "OTA_S3_SECRET_KEY"
+
+[catalogue]
+db = "sqlite:/var/lib/ota/db/ota.db"
+# Or, for the Kubernetes topology:
+#   db = "${OTA_DB_URL}"
+
+[patcher]
+default       = "bsdiff"
+worker_count  = 4
+bsdiff_path   = "/opt/ota/bin/bsdiff"
+xdelta3_path  = "/opt/ota/bin/xdelta3"
+
+[gc]
+default_threshold = 0
+schedule          = "0 3 * * *"
+
+[install_token]
+ttl_seconds = 900

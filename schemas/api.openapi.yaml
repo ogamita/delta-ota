@@ -1,0 +1,357 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+openapi: 3.1.0
+info:
+  title: Ogamita Delta OTA — Server API
+  version: "1.0.0-draft"
+  description: |
+    HTTP/JSON API for the delta-ota distribution server.
+    See docs/ota-specifications.org for the formal specification.
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+  contact:
+    name: Ogamita Ltd.
+    email: support@ogamita.com
+servers:
+  - url: https://{host}/v1
+    variables:
+      host:
+        default: ota.example.com
+
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Software:
+      type: object
+      required: [name, display_name, default_patcher, created_at]
+      properties:
+        name: { type: string, pattern: "^[a-z][a-z0-9-]{1,63}$" }
+        display_name: { type: string }
+        owners: { type: array, items: { type: string } }
+        default_patcher: { type: string, enum: [bsdiff, xdelta3] }
+        created_at: { type: string, format: date-time }
+    Release:
+      type: object
+      required:
+        [release_id, software, os, arch, version, blob_sha256, blob_size, published_at]
+      properties:
+        release_id: { type: string }
+        software: { type: string }
+        os: { type: string, enum: [windows, macos, linux] }
+        arch: { type: string, enum: [x86_64, aarch64, i386] }
+        os_versions: { type: array, items: { type: string } }
+        version: { type: string }
+        blob_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        blob_size: { type: integer, minimum: 0 }
+        manifest_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        signed_manifest_url: { type: string }
+        channels: { type: array, items: { type: string } }
+        classifications: { type: array, items: { type: string } }
+        uncollectable: { type: boolean }
+        deprecated: { type: boolean }
+        published_at: { type: string, format: date-time }
+        published_by: { type: string }
+        notes: { type: string }
+    Manifest:
+      $ref: ./manifest.schema.json
+    Anchor:
+      type: object
+      required: [version, release_id]
+      properties:
+        version: { type: string }
+        release_id: { type: string }
+        channel: { type: string }
+        reason: { type: string }
+    DownloadEvent:
+      type: object
+      required: [client_id, software, release_id, kind, bytes, started_at, status]
+      properties:
+        client_id: { type: string }
+        software: { type: string }
+        release_id: { type: string }
+        kind: { type: string, enum: [full, patch] }
+        from_release_id: { type: string }
+        bytes: { type: integer }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        status: { type: string, enum: [ok, failed, aborted] }
+    InstallEvent:
+      type: object
+      required: [client_id, software, release_id, kind, status, at]
+      properties:
+        client_id: { type: string }
+        software: { type: string }
+        release_id: { type: string }
+        kind: { type: string, enum: [install, upgrade, revert, recover] }
+        from_release_id: { type: string }
+        status: { type: string, enum: [ok, failed] }
+        error: { type: string }
+        at: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+        code: { type: string }
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        "200": { description: OK }
+
+  /software:
+    get:
+      summary: List software products visible to the caller
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Software" }
+
+  /software/{software}:
+    get:
+      summary: Show a software product
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Software" }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /software/{software}/releases:
+    get:
+      summary: List releases of a software (filtered by classification/channel)
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Release" }
+
+  /software/{software}/releases/latest:
+    get:
+      summary: Latest release of a software
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Release" }
+
+  /software/{software}/releases/{version}:
+    get:
+      summary: Show one release
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Release" }
+
+  /software/{software}/releases/{version}/manifest:
+    get:
+      summary: Signed manifest for a release
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Manifest" }
+
+  /software/{software}/releases/{version}/blob:
+    get:
+      summary: Full blob for a release
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/octet-stream: {}
+
+  /software/{software}/upgrade:
+    get:
+      summary: Resolve the best upgrade path between two versions
+      parameters:
+        - { name: software, in: path,  required: true, schema: { type: string } }
+        - { name: from,     in: query, required: true, schema: { type: string } }
+        - { name: to,       in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: JSON resolution (when Accept is application/json)
+        "302":
+          description: Redirect to the concrete artefact
+
+  /software/{software}/anchors:
+    get:
+      summary: Server-curated known-good versions for the recovery tool
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Anchor" }
+
+  /blobs/{sha256}:
+    get:
+      summary: Fetch a blob by content hash
+      parameters:
+        - { name: sha256, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/octet-stream: {}
+
+  /patches/{sha256}:
+    get:
+      summary: Fetch a patch by content hash
+      parameters:
+        - { name: sha256, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/octet-stream: {}
+
+  /events/download:
+    post:
+      summary: Report a download event (telemetry)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DownloadEvent" }
+      responses:
+        "204": { description: Accepted }
+
+  /events/install:
+    post:
+      summary: Report an install/upgrade/revert event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InstallEvent" }
+      responses:
+        "204": { description: Accepted }
+
+  /admin/software:
+    post:
+      summary: Create a software product
+      security: [{ mtls: [], bearer: [] }]
+      responses:
+        "201": { description: Created }
+
+  /admin/software/{software}/releases:
+    post:
+      summary: Publish a new release (multipart upload)
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [version, os, arch, payload]
+              properties:
+                version: { type: string }
+                os: { type: string, enum: [windows, macos, linux] }
+                arch: { type: string, enum: [x86_64, aarch64, i386] }
+                os_versions: { type: string, description: "comma-separated" }
+                channels: { type: string, description: "comma-separated" }
+                classifications: { type: string, description: "comma-separated" }
+                notes: { type: string }
+                uncollectable: { type: boolean }
+                payload: { type: string, format: binary }
+      responses:
+        "201":
+          description: Release accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Release" }
+
+  /admin/software/{software}/releases/{version}:
+    patch:
+      summary: Update channels/classifications/deprecated on a release
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+    delete:
+      summary: Force-delete a release
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+
+  /admin/software/{software}/releases/{version}/uncollectable:
+    post:
+      summary: Mark a release as uncollectable
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+        - { name: version,  in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: OK }
+
+  /admin/software/{software}/gc:
+    post:
+      summary: Run garbage collection for a software
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: GC report }
+
+  /admin/software/{software}/stats:
+    get:
+      summary: Per-software download/install statistics
+      security: [{ mtls: [], bearer: [] }]
+      parameters:
+        - { name: software, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }

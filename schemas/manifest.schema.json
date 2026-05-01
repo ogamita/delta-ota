@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitlab.com/ogamita/delta-ota/-/raw/main/schemas/manifest.schema.json",
+  "title": "Ogamita Delta OTA — Release Manifest",
+  "description": "Signed manifest describing one release of one software for one OS target, including the canonical blob and the patches available to/from it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_id",
+    "software",
+    "os",
+    "arch",
+    "os_versions",
+    "version",
+    "published_at",
+    "blob",
+    "patches_in",
+    "patches_out",
+    "channels",
+    "classifications",
+    "deprecated",
+    "uncollectable"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. Bumped on incompatible changes."
+    },
+    "release_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}/(windows|macos|linux)-(x86_64|aarch64|i386)/.+$"
+    },
+    "software": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "os": {
+      "type": "string",
+      "enum": ["windows", "macos", "linux"]
+    },
+    "arch": {
+      "type": "string",
+      "enum": ["x86_64", "aarch64", "i386"]
+    },
+    "os_versions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "version": {
+      "type": "string",
+      "description": "SemVer 2.0.0",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "published_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "published_by": {
+      "type": "string",
+      "description": "Subject DN or fingerprint of the admin certificate that published this release."
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "size", "url"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "url": { "type": "string", "format": "uri-reference" }
+      }
+    },
+    "patches_in": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/patch_ref" }
+    },
+    "patches_out": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/patch_ref" }
+    },
+    "channels": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+      "uniqueItems": true
+    },
+    "classifications": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+      "uniqueItems": true
+    },
+    "deprecated": { "type": "boolean" },
+    "uncollectable": { "type": "boolean" },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "patch_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "patcher", "sha256", "size"],
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source SemVer of the patch (the 'patches_out' direction stores 'to' instead).",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+        },
+        "to": {
+          "type": "string",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+        },
+        "patcher": {
+          "type": "string",
+          "enum": ["bsdiff", "xdelta3"]
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "url": { "type": "string", "format": "uri-reference" }
+      }
+    }
+  }
+}

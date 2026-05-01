@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Local-development configuration. Used by `make run-server`.
+
+[server]
+listen   = "127.0.0.1:8443"
+hostname = "localhost"
+data_dir = "build/dev/ota-data"
+log_level = "debug"
+
+[tls]
+require_mtls = false
+
+[storage]
+backend = "fs"
+
+[catalogue]
+db = "sqlite:build/dev/ota-data/db/ota.db"
+
+[patcher]
+default      = "bsdiff"
+worker_count = 1
+bsdiff_path  = "server/build/bin/bsdiff"
+xdelta3_path = "server/build/bin/xdelta3"
+
+[gc]
+default_threshold = 0
+
+[install_token]
+ttl_seconds = 900

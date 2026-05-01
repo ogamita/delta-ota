@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# docker-compose test configuration. Mounts read-only into ota-server.
+
+[server]
+listen   = "0.0.0.0:8443"
+hostname = "localhost"
+data_dir = "/var/lib/ota"
+log_level = "debug"
+
+[tls]
+require_mtls = false
+
+[storage]
+backend     = "s3"
+s3_endpoint = "http://minio:9000"
+s3_bucket   = "delta-ota"
+
+[catalogue]
+db = "postgres://ota:ota@postgres:5432/ota"
+
+[patcher]
+default      = "bsdiff"
+worker_count = 2
+bsdiff_path  = "/opt/ota/bin/bsdiff"
+xdelta3_path = "/opt/ota/bin/xdelta3"
+
+[install_token]
+ttl_seconds = 900

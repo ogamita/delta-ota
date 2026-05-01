@@ -1,0 +1,31 @@
+#+TITLE: delta-ota — Third-party licences
+#+DATE: 2026-05-01
+
+This file aggregates the upstream licence texts of every vendored
+component.  It is embedded into the =ota-agent= binary at build time;
+=ota-agent licenses= prints it.
+
+The list of components and their import metadata is in
+[[file:dependencies.org][docs/dependencies.org]].  Vendoring policy is in
+[[file:adr/0003-vendoring-policy.org][ADR-0003]].
+
+* mendsley/bsdiff (BSD-2-Clause)
+
+To be filled in by =tools/vendor-import.sh= when the component is
+imported during phase 0.
+
+* jmacd/xdelta — xdelta3 subdir (Apache-2.0)
+
+To be filled in by =tools/vendor-import.sh=.
+
+* sharplispers/archive (BSD-3-Clause)
+
+To be filled in by =tools/vendor-import.sh=.
+
+* gabstv/go-bsdiff (MIT)
+
+To be filled in by =tools/vendor-import.sh=.
+
+* ably/vcdiff-go (Apache-2.0)
+
+To be filled in by =tools/vendor-import.sh=.
