@@ -3,6 +3,19 @@
 
 (defpackage #:ota-server.storage
   (:use #:cl)
-  (:documentation "Ogamita Delta OTA server — storage module. Phase-0 skeleton."))
+  (:export #:make-cas
+           #:cas-root
+           #:cas-blob-path
+           #:put-blob-from-file
+           #:has-blob
+           #:blob-size
+           #:sha256-hex-of-file
+           #:sha256-hex-of-bytes
+           ;; tar
+           #:tar-entry
+           #:make-tar-entry
+           #:walk-files
+           #:write-deterministic-tar
+           #:tar-directory-to-file))
 
 (in-package #:ota-server.storage)

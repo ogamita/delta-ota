@@ -100,10 +100,21 @@ build-agent:
 # ---------- lint / test ----------
 lisp-check:
 	$(SBCL) --non-interactive --no-userinit --no-sysinit \
-	    --eval '(require :asdf)' \
+	    --load $(QUICKLISP_SETUP) \
 	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
 	    --eval '(asdf:load-asd (truename "admin/ota-admin.asd"))' \
-	    --eval '(format t "lisp-check: ~A systems load OK~%" 2)'
+	    --eval '(ql:quickload "ota-server" :silent t)' \
+	    --eval '(ql:quickload "ota-admin"  :silent t)' \
+	    --eval '(format t "lisp-check: 2 systems load OK~%")'
+
+QUICKLISP_SETUP ?= $(shell test -f $(HOME)/quicklisp/setup.lisp && echo $(HOME)/quicklisp/setup.lisp || echo /opt/quicklisp/setup.lisp)
+
+lisp-test:
+	$(SBCL) --non-interactive --no-userinit --no-sysinit \
+	    --load $(QUICKLISP_SETUP) \
+	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
+	    --eval '(ql:quickload "ota-server/tests" :silent t)' \
+	    --eval '(asdf:test-system "ota-server")'
 
 go-lint:
 	cd client && $(GO) vet ./...
@@ -112,7 +123,7 @@ go-test:
 	cd client && $(GO) test ./...
 
 test: test-unit
-test-unit: lisp-check go-test
+test-unit: lisp-check lisp-test go-test
 
 e2e:
 	tests/e2e/run.sh

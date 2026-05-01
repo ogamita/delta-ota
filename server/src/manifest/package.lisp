@@ -3,6 +3,17 @@
 
 (defpackage #:ota-server.manifest
   (:use #:cl)
-  (:documentation "Ogamita Delta OTA server — manifest module. Phase-0 skeleton."))
+  (:export #:build-manifest-plist
+           #:manifest-to-json-bytes
+           #:sign-bytes
+           #:verify-bytes
+           #:load-or-generate-keypair
+           #:keypair
+           #:keypair-public
+           #:keypair-private
+           #:keypair-public-hex
+           #:keypair-private-hex
+           #:hex-to-bytes
+           #:bytes-to-hex))
 
 (in-package #:ota-server.manifest)

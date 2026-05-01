@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Ogamita Ltd.
+
+// Package transport handles HTTP fetching of manifests, blobs and
+// patches with sha256 streaming verification.
+package transport
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+// Client wraps a server URL and a *http.Client.
+type Client struct {
+	BaseURL string
+	HTTP    *http.Client
+}
+
+func New(baseURL string) *Client {
+	return &Client{
+		BaseURL: baseURL,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// GetManifest fetches /v1/software/<sw>/releases/<v>/manifest and
+// returns the raw bytes plus the X-Ota-Signature and
+// X-Ota-Public-Key headers (hex). Verification is the caller's job.
+func (c *Client) GetManifest(ctx context.Context, software, version string) (data []byte, sigHex, pubHex string, err error) {
+	url := fmt.Sprintf("%s/v1/software/%s/releases/%s/manifest", c.BaseURL, software, version)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", "", err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("manifest fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", "", fmt.Errorf("manifest fetch: %s", resp.Status)
+	}
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("manifest read: %w", err)
+	}
+	return data, resp.Header.Get("X-Ota-Signature"), resp.Header.Get("X-Ota-Public-Key"), nil
+}
+
+// LatestRelease fetches /v1/software/<sw>/releases/latest as raw JSON.
+func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, error) {
+	url := fmt.Sprintf("%s/v1/software/%s/releases/latest", c.BaseURL, software)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("latest: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("latest: %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// DownloadBlob streams the blob at /v1/blobs/<sha> into dstPath,
+// verifying that the bytes hash to expectedSHA256 (hex). Returns the
+// number of bytes written. The destination is removed on hash
+// mismatch.
+func (c *Client) DownloadBlob(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
+	url := fmt.Sprintf("%s/v1/blobs/%s", c.BaseURL, sha256Hex)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("blob fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("blob fetch: %s", resp.Status)
+	}
+
+	tmp := dstPath + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return 0, fmt.Errorf("blob create: %w", err)
+	}
+	hasher := sha256.New()
+	mw := io.MultiWriter(out, hasher)
+
+	written, err := copyWithProgress(mw, resp.Body, progress)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return written, fmt.Errorf("blob copy: %w", err)
+	}
+
+	got := hex.EncodeToString(hasher.Sum(nil))
+	if got != sha256Hex {
+		_ = os.Remove(tmp)
+		return written, fmt.Errorf("blob sha mismatch: want %s got %s", sha256Hex, got)
+	}
+	if err := os.Rename(tmp, dstPath); err != nil {
+		_ = os.Remove(tmp)
+		return written, fmt.Errorf("blob rename: %w", err)
+	}
+	return written, nil
+}
+
+func copyWithProgress(dst io.Writer, src io.Reader, progress func(written int64)) (int64, error) {
+	buf := make([]byte, 64*1024)
+	var total int64
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+			if progress != nil {
+				progress(total)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+}

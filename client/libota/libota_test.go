@@ -4,18 +4,12 @@
 package libota
 
 import (
-	"errors"
+	"context"
 	"testing"
 )
 
-func TestPhase0StubsReturnNotImplemented(t *testing.T) {
-	if err := Install("hello", "1.0.0"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Install: want ErrNotImplemented, got %v", err)
-	}
-	if err := Upgrade("hello", "1.0.0"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Upgrade: want ErrNotImplemented, got %v", err)
-	}
-	if err := Revert("hello"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Revert: want ErrNotImplemented, got %v", err)
+func TestInstallRejectsEmptyServerURL(t *testing.T) {
+	if _, err := Install(context.Background(), Config{}, "hello", "1.0.0"); err == nil {
+		t.Fatal("expected error for empty ServerURL")
 	}
 }

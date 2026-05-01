@@ -195,17 +195,22 @@ self-contained-check:
 
 e2e:
   stage: test
-  image: docker:26
-  services:
-    - docker:26-dind
+  image: $DEV_IMAGE
+  needs:
+    - job: build-dev-image
+      optional: true
   before_script:
-    - apk add --no-cache make git
+    # Quicklisp lives at /opt/quicklisp in the dev image; the e2e
+    # script's run-server.lisp expects ~/quicklisp/setup.lisp, so
+    # provide a symlink for compatibility.
+    - mkdir -p $HOME && [ -e $HOME/quicklisp ] || ln -s /opt/quicklisp $HOME/quicklisp
   script:
     - tests/e2e/run.sh
   artifacts:
     when: always
     paths:
       - tests/e2e/run/logs/
+      - tests/e2e/run/server-root/keys/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

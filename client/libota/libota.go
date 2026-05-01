@@ -3,45 +3,219 @@
 
 // Package libota is the embeddable client library of Ogamita Delta OTA.
 //
-// It is built as both a c-shared library (DLL/dylib/so) and a c-archive
-// (static .a) for embedding into host applications. A pure-Go API also
-// exists for Go consumers.
-//
-// Phase-0 skeleton: the public surface from the spec is declared but
-// every entry point is a stub. Real implementations land starting in
-// phase 1.
+// Phase 1: Install only.  Upgrade/Revert/Discovery beyond "latest"
+// land in later phases.
 package libota
 
-import "errors"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
 
-// Version follows the project version, set at link time when relevant.
-const Version = "0.1.0-dev"
+	"gitlab.com/ogamita/delta-ota/client/internal/manifest"
+	"gitlab.com/ogamita/delta-ota/client/internal/state"
+	"gitlab.com/ogamita/delta-ota/client/internal/tarx"
+	"gitlab.com/ogamita/delta-ota/client/internal/transport"
+)
 
-// ErrNotImplemented is returned by every phase-0 stub.
-var ErrNotImplemented = errors.New("libota: not implemented yet (phase 0 skeleton)")
+const Version = "0.1.0-phase1"
 
-// Install installs the named software at the given version (or "latest").
-func Install(name, version string) error {
-	_ = name
-	_ = version
-	return ErrNotImplemented
+// ErrNotImplemented is returned from API entry points still pending.
+var ErrNotImplemented = errors.New("libota: not implemented yet")
+
+// Config drives an Install. ServerURL is mandatory; OTAHome
+// defaults to ~/.ota; TrustedPubKeys gates which signing keys we
+// accept (hex-encoded). Empty TrustedPubKeys means trust-on-first-use:
+// the key the server presents is pinned and recorded in state.json.
+type Config struct {
+	ServerURL      string
+	OTAHome        string
+	TrustedPubKeys []string
+	Timeout        time.Duration
 }
 
-// Upgrade upgrades the named software to the given version (or "latest").
-func Upgrade(name, version string) error {
-	_ = name
-	_ = version
-	return ErrNotImplemented
+func defaultOTAHome() string {
+	if v := os.Getenv("OTA_HOME"); v != "" {
+		return v
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(h, ".ota")
+	}
+	return ".ota"
+}
+
+// Install installs the named software at "latest" or at the given
+// explicit version. version=="latest" or "" means latest.
+func Install(ctx context.Context, cfg Config, software, version string) (string, error) {
+	if cfg.ServerURL == "" {
+		return "", errors.New("libota: ServerURL required")
+	}
+	if cfg.OTAHome == "" {
+		cfg.OTAHome = defaultOTAHome()
+	}
+	tr := transport.New(cfg.ServerURL)
+	if cfg.Timeout > 0 {
+		tr.HTTP.Timeout = cfg.Timeout
+	}
+
+	// Resolve target version.
+	if version == "" || version == "latest" {
+		raw, err := tr.LatestRelease(ctx, software)
+		if err != nil {
+			return "", err
+		}
+		var r struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return "", fmt.Errorf("install: parse latest: %w", err)
+		}
+		if r.Version == "" {
+			return "", errors.New("install: server returned empty version")
+		}
+		version = r.Version
+	}
+
+	// Fetch manifest + signature.
+	manifestData, sigHex, pubHex, err := tr.GetManifest(ctx, software, version)
+	if err != nil {
+		return "", err
+	}
+	layout := state.New(cfg.OTAHome, software)
+	if err := layout.Ensure(); err != nil {
+		return "", err
+	}
+
+	// Public-key trust gate.
+	st, err := layout.Load()
+	if err != nil {
+		return "", err
+	}
+	if err := checkTrust(st, cfg.TrustedPubKeys, pubHex); err != nil {
+		return "", err
+	}
+
+	// Verify signature.
+	if err := manifest.Verify(manifestData, sigHex, pubHex); err != nil {
+		return "", err
+	}
+
+	// Parse manifest after signature verification.
+	m, err := manifest.Parse(manifestData)
+	if err != nil {
+		return "", err
+	}
+	if m.Software != software || m.Version != version {
+		return "", fmt.Errorf("install: manifest software/version mismatch (%s/%s vs %s/%s)",
+			m.Software, m.Version, software, version)
+	}
+
+	// Download blob, hash-verify on the way.
+	blobPath := layout.BlobPath(version)
+	if _, err := tr.DownloadBlob(ctx, m.Blob.SHA256, blobPath, nil); err != nil {
+		return "", err
+	}
+
+	// Extract into distribution-<version>.
+	dist := layout.DistributionDir(version)
+	_ = os.RemoveAll(dist)
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		return "", fmt.Errorf("install: mkdir dist: %w", err)
+	}
+	bf, err := os.Open(blobPath)
+	if err != nil {
+		return "", fmt.Errorf("install: open blob: %w", err)
+	}
+	if err := tarx.Extract(bf, dist); err != nil {
+		bf.Close()
+		return "", err
+	}
+	if err := bf.Close(); err != nil {
+		return "", err
+	}
+
+	// Atomic symlink flip.
+	if err := layout.FlipCurrent(version); err != nil {
+		return "", err
+	}
+
+	// Update state.json.
+	st.Software = software
+	if st.Current != version {
+		if st.Current != "" {
+			st.Previous = st.Current
+		}
+		st.Current = version
+		st.History = append(st.History, version)
+	}
+	st.ServerURL = cfg.ServerURL
+	st.ServerPubKeyHX = pubHex
+	if err := layout.Save(st); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+func checkTrust(st *state.State, trusted []string, presented string) error {
+	if len(trusted) > 0 {
+		for _, p := range trusted {
+			if p == presented {
+				return nil
+			}
+		}
+		return fmt.Errorf("install: server pubkey %s not in trusted set", short(presented))
+	}
+	if st.ServerPubKeyHX == "" || st.ServerPubKeyHX == presented {
+		return nil
+	}
+	return fmt.Errorf("install: server pubkey changed (was %s, now %s) — refuse",
+		short(st.ServerPubKeyHX), short(presented))
+}
+
+func short(hex string) string {
+	if len(hex) > 12 {
+		return hex[:12] + "..."
+	}
+	return hex
+}
+
+// Upgrade is reserved for phase 2 (patches).
+func Upgrade(ctx context.Context, cfg Config, software, version string) (string, error) {
+	// In phase 1, upgrade falls through to Install (full re-download).
+	return Install(ctx, cfg, software, version)
 }
 
 // Revert flips current/previous symlinks atomically.
-func Revert(name string) error {
-	_ = name
-	return ErrNotImplemented
+func Revert(cfg Config, software string) error {
+	if cfg.OTAHome == "" {
+		cfg.OTAHome = defaultOTAHome()
+	}
+	layout := state.New(cfg.OTAHome, software)
+	st, err := layout.Load()
+	if err != nil {
+		return err
+	}
+	if st.Previous == "" {
+		return errors.New("revert: no previous distribution")
+	}
+	prev := st.Previous
+	cur := st.Current
+	// Just call FlipCurrent on the previous version's distribution.
+	// FlipCurrent moves what's at current → previous, then points
+	// current to the new target.
+	if err := layout.FlipCurrent(prev); err != nil {
+		return err
+	}
+	st.Current = prev
+	st.Previous = cur
+	return layout.Save(st)
 }
 
-// CurrentRelease returns the version of the currently active install.
-func CurrentRelease(name string) (string, error) {
-	_ = name
-	return "", ErrNotImplemented
-}
+// Drain is a tiny utility to copy a stream to /dev/null counting
+// bytes (used by tests).
+func Drain(r io.Reader) (int64, error) { return io.Copy(io.Discard, r) }

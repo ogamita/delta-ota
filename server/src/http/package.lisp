@@ -3,6 +3,8 @@
 
 (defpackage #:ota-server.http
   (:use #:cl)
-  (:documentation "Ogamita Delta OTA server — http module. Phase-0 skeleton."))
+  (:export #:make-app
+           #:start-server
+           #:stop-server))
 
 (in-package #:ota-server.http)

@@ -3,6 +3,16 @@
 
 (defpackage #:ota-server.catalogue
   (:use #:cl)
-  (:documentation "Ogamita Delta OTA server — catalogue module. Phase-0 skeleton."))
+  (:export #:open-catalogue
+           #:close-catalogue
+           #:run-migrations
+           #:ensure-software
+           #:list-software
+           #:get-software
+           #:insert-release
+           #:list-releases
+           #:get-release
+           #:get-latest-release
+           #:record-install-event))
 
 (in-package #:ota-server.catalogue)

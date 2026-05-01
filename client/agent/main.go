@@ -2,14 +2,15 @@
 // Copyright (C) 2026 Ogamita Ltd.
 
 // ota-agent is the user-facing CLI of Ogamita Delta OTA.
-//
-// Phase-0 skeleton: subcommands are declared but not implemented.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"gitlab.com/ogamita/delta-ota/client/libota"
 )
@@ -17,8 +18,8 @@ import (
 const usage = `ota-agent — Ogamita Delta OTA client
 
 Usage:
-  ota-agent install   <name> [--version=X|--latest]
-  ota-agent upgrade   <name> [--to=X|--latest]
+  ota-agent install   <name> [--version=X|--latest] [--server=URL]
+  ota-agent upgrade   <name> [--to=X|--latest]      [--server=URL]
   ota-agent revert    <name>
   ota-agent list      [--remote|--local]
   ota-agent show      <name>
@@ -29,7 +30,9 @@ Usage:
   ota-agent licenses
   ota-agent version
 
-Phase-0 skeleton: only 'version' and 'licenses' do anything useful.
+Environment:
+  OTA_HOME      base directory for installs (default: ~/.ota)
+  OTA_SERVER    default server URL when --server is not given
 `
 
 func main() {
@@ -45,14 +48,144 @@ func main() {
 	case "version":
 		fmt.Printf("ota-agent %s\n", libota.Version)
 	case "licenses":
-		fmt.Println("Ogamita Delta OTA — AGPL-3.0-or-later")
-		fmt.Println("Copyright (C) 2026 Ogamita Ltd.")
-		fmt.Println("See docs/THIRD_PARTY_LICENSES.org for vendored components.")
-	case "install", "upgrade", "revert", "list", "show", "verify", "prune", "watch", "doctor":
-		fmt.Fprintf(os.Stderr, "ota-agent: %q not implemented yet (phase 0 skeleton)\n", flag.Arg(0))
+		printLicenses()
+	case "install":
+		installCmd(flag.Args()[1:])
+	case "upgrade":
+		upgradeCmd(flag.Args()[1:])
+	case "revert":
+		revertCmd(flag.Args()[1:])
+	case "list", "show", "verify", "prune", "watch", "doctor":
+		fmt.Fprintf(os.Stderr, "ota-agent: %q not implemented yet\n", flag.Arg(0))
 		os.Exit(1)
 	default:
 		flag.Usage()
 		os.Exit(2)
 	}
+}
+
+// reorderFlags moves all -- and -X-style flag tokens to the front so
+// Go's flag package (which stops at the first positional) picks them
+// up regardless of where the user wrote them.
+func reorderFlags(args []string) []string {
+	flags, pos := []string{}, []string{}
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+		} else if len(flags) > 0 && strings.HasPrefix(flags[len(flags)-1], "-") &&
+			!strings.Contains(flags[len(flags)-1], "=") {
+			// Previous flag had no '=', so this is its value.
+			flags = append(flags, a)
+		} else {
+			pos = append(pos, a)
+		}
+	}
+	return append(flags, pos...)
+}
+
+func parseInstallFlags(args []string) (name, version, server string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	v := fs.String("version", "", "explicit version (defaults to latest)")
+	latest := fs.Bool("latest", false, "explicitly request latest")
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "install: missing <name>")
+		os.Exit(2)
+	}
+	name = fs.Arg(0)
+	version = *v
+	if *latest {
+		version = "latest"
+	}
+	server = *srv
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "install: --server or $OTA_SERVER required")
+		os.Exit(2)
+	}
+	return
+}
+
+func installCmd(args []string) {
+	name, version, server := parseInstallFlags(args)
+	cfg := libota.Config{
+		ServerURL:      strings.TrimRight(server, "/"),
+		OTAHome:        os.Getenv("OTA_HOME"),
+		TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
+		Timeout:        2 * time.Minute,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	v, err := libota.Install(ctx, cfg, name, version)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "install: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("installed %s %s\n", name, v)
+}
+
+func upgradeCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
+	to := fs.String("to", "latest", "target version")
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "upgrade: missing <name>")
+		os.Exit(2)
+	}
+	name := fs.Arg(0)
+	server := *srv
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "upgrade: --server or $OTA_SERVER required")
+		os.Exit(2)
+	}
+	cfg := libota.Config{
+		ServerURL:      strings.TrimRight(server, "/"),
+		OTAHome:        os.Getenv("OTA_HOME"),
+		TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	v, err := libota.Upgrade(ctx, cfg, name, *to)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "upgrade: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("upgraded %s to %s\n", name, v)
+}
+
+func revertCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "revert: missing <name>")
+		os.Exit(2)
+	}
+	cfg := libota.Config{OTAHome: os.Getenv("OTA_HOME")}
+	if err := libota.Revert(cfg, args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "revert: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("reverted %s\n", args[0])
+}
+
+func parsePubKeys(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func printLicenses() {
+	fmt.Println("Ogamita Delta OTA — AGPL-3.0-or-later")
+	fmt.Println("Copyright (C) 2026 Ogamita Ltd.")
+	fmt.Println("See docs/THIRD_PARTY_LICENSES.org for vendored components.")
 }

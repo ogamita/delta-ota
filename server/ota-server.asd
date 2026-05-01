@@ -9,25 +9,34 @@
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
-  ;; Phase-0 minimum. Real deps land per implementation phase:
-  ;;   ironclad, com.inuoe.jzon, cl-dbi, sqlite, cl-postgres,
-  ;;   clack, woo, cl+ssl
   :depends-on ("alexandria"
-               "uiop")
+               "uiop"
+               "ironclad"
+               "com.inuoe.jzon"
+               "sqlite"
+               "clack"
+               "woo"
+               "cl-ppcre")
   :pathname "src/"
-  :components ((:module "catalogue"
-                :components ((:file "package")))
-               (:module "storage"
-                :components ((:file "package")))
+  :components ((:module "storage"
+                :components ((:file "package")
+                             (:file "cas" :depends-on ("package"))
+                             (:file "tar" :depends-on ("package"))))
                (:module "manifest"
-                :components ((:file "package")))
+                :components ((:file "package")
+                             (:file "manifest" :depends-on ("package"))))
+               (:module "catalogue"
+                :components ((:file "package")
+                             (:file "db" :depends-on ("package"))))
                (:module "http"
-                :components ((:file "package")))
+                :components ((:file "package")
+                             (:file "server" :depends-on ("package")))
+                :depends-on ("storage" "manifest" "catalogue"))
                (:module "workers"
                 :components ((:file "package")))
                (:module "admin"
                 :components ((:file "package")))
-               (:file "main"))
+               (:file "main" :depends-on ("http")))
   :in-order-to ((test-op (test-op "ota-server/tests"))))
 
 (defsystem "ota-server/tests"
@@ -35,6 +44,7 @@
   :license "AGPL-3.0-or-later"
   :depends-on ("ota-server" "fiveam")
   :pathname "tests/"
-  :components ((:file "package"))
+  :components ((:file "package")
+               (:file "smoke" :depends-on ("package")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))
