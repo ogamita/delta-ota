@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq-dev \
         coreutils \
         findutils \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Go: use the official tarball, not the distro package, to pin the version.
