@@ -47,8 +47,7 @@ RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp 
     && sbcl --non-interactive --no-userinit --no-sysinit \
         --load /tmp/quicklisp.lisp \
         --eval '(quicklisp-quickstart:install :path "/opt/quicklisp")' \
-        --eval '(let ((ql-util::*do-not-prompt* t))
-                  (ql:add-to-init-file))' \
+        --eval '(let ((ql-util::*do-not-prompt* t)) (ql:add-to-init-file))' \
     && rm /tmp/quicklisp.lisp
 
 ENV GOPATH=/go

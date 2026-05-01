@@ -130,6 +130,34 @@ These are non-negotiable.  Violations are caught in CI; do not
   authoritative.
 - Container images are built and pushed to the GitLab container
   registry: `registry.gitlab.com/ogamita/delta-ota/...`.
+- Default branch on GitLab is `master`.
+
+### Watch the pipeline after every push
+
+After pushing to `master`, *check the pipeline* —
+<https://gitlab.com/ogamita/delta-ota/-/pipelines>.  When the user's
+own GitLab API token is unavailable, the public REST API works for a
+public project:
+
+```sh
+# List the most recent pipelines on master:
+curl -sL "https://gitlab.com/api/v4/projects/ogamita%2Fdelta-ota/pipelines?ref=master&per_page=5" \
+  | python3 -c 'import json,sys
+for p in json.load(sys.stdin): print(p["id"], p["status"], p["sha"][:8])'
+
+# Jobs of a specific pipeline:
+curl -sL "https://gitlab.com/api/v4/projects/ogamita%2Fdelta-ota/pipelines/<ID>/jobs?per_page=50" \
+  | python3 -c 'import json,sys
+for j in json.load(sys.stdin):
+    print(f"{j[\"status\"]:10} {j[\"stage\"]:10} {j[\"name\"]:30} id={j[\"id\"]}")'
+
+# Raw log of a failed job (no auth needed for public projects):
+curl -sL "https://gitlab.com/ogamita/delta-ota/-/jobs/<JOB-ID>/raw"
+```
+
+Treat a red pipeline as the highest-priority issue: investigate and
+fix before continuing other work.  The pipeline is the contract that
+proves the change is shippable.
 
 ## Docker
 

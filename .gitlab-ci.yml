@@ -73,9 +73,12 @@ build-dev-image:
         - .gitlab-ci.yml
 
 # ---------- verify (cheap, stock images, no dev-image dependency) ----------
+# `needs: []` opts these jobs into DAG mode so they run immediately
+# and are NOT blocked by a failure in the `prepare` stage.
 vendor-verify:
   stage: verify
   image: alpine:3.20
+  needs: []
   before_script:
     - apk add --no-cache git coreutils findutils
   script:
@@ -84,6 +87,7 @@ vendor-verify:
 licence-headers:
   stage: verify
   image: alpine:3.20
+  needs: []
   before_script:
     - apk add --no-cache git
   script:
@@ -92,6 +96,7 @@ licence-headers:
 go-vet:
   stage: verify
   image: $GO_IMAGE
+  needs: []
   before_script:
     - apk add --no-cache git
   script:
@@ -100,6 +105,7 @@ go-vet:
 go-test:
   stage: verify
   image: $GO_IMAGE
+  needs: []
   before_script:
     - apk add --no-cache git
   script:
@@ -134,9 +140,11 @@ build-server:
     expire_in: 1 week
 
 # Client cross-compiles do not need the dev image — pure Go.
+# `needs: []` keeps them independent of the prepare stage.
 .go-cross: &go-cross
   stage: build
   image: $GO_IMAGE
+  needs: []
   before_script:
     - apk add --no-cache git make
 
