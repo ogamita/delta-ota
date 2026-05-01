@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Ogamita Ltd.
 #
-# Production image for ota-server.
+# Production image for ota-server. Multi-arch (linux/amd64, linux/arm64).
 # Multi-stage:
 #   1. builder    — full toolchain (SBCL + C compiler) builds:
 #                   * the SBCL core image for ota-server
-#                   * the vendored bsdiff/xdelta3 helper binaries
+#                   * the vendored bsdiff helper binaries
 #   2. runtime    — minimal Debian slim, only what's needed at runtime:
 #                   the SBCL runtime stub, libssl, libev, the helpers,
 #                   and the application core.

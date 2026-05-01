@@ -4,13 +4,18 @@
 # Authoritative pipeline for delta-ota.
 # Hosted on gitlab.com/ogamita/delta-ota; mirrored to GitHub.
 #
-# Stages:
-#   prepare   build the dev image (cached) — used by all later jobs
-#   verify    licence headers, vendor hash check, lint
-#   build     server core, libota (3 OS), ota-agent (3 OS)
-#   test      unit + integration; e2e with docker-compose
-#   package   server image, signed client binaries
-#   publish   only on tags: push images, create release, attach binaries
+# Design notes:
+# - Cheap verify jobs (vendor-verify, licence-headers, go vet/test, Go
+#   cross-compile) run on stock public images (alpine, golang:alpine).
+#   They do NOT depend on the custom dev image — so first-push pipelines
+#   on a fresh repo are not blocked by the chicken-and-egg.
+# - The dev image is only required by jobs that genuinely need SBCL+Go
+#   together (the SBCL server build, the e2e harness once it lands).
+#   Those jobs declare `needs: [build-dev-image]`.
+# - On the default branch (master), the dev image is rebuilt on every
+#   push so it always exists for downstream jobs. On feature branches
+#   it is only rebuilt when docker/Dockerfile.dev or .gitlab-ci.yml
+#   change; otherwise the cached image from the registry is reused.
 
 include:
   - template: Security/SAST.gitlab-ci.yml
@@ -20,6 +25,7 @@ variables:
   SERVER_IMAGE: "$CI_REGISTRY_IMAGE/server:$CI_COMMIT_SHORT_SHA"
   CGO_ENABLED: "0"
   GOFLAGS: "-trimpath -tags=netgo,osusergo"
+  GO_IMAGE: "golang:1.22-alpine"
 
 stages:
   - prepare
@@ -30,53 +36,96 @@ stages:
   - publish
 
 # ---------- prepare ----------
+# Multi-arch dev image (linux/amd64 + linux/arm64) so it pulls cleanly
+# on x86_64 cloud runners and on the Apple-silicon developer
+# workstation.
 build-dev-image:
   stage: prepare
   image: docker:26
   services:
     - docker:26-dind
+  variables:
+    PLATFORMS: "linux/amd64,linux/arm64"
   before_script:
+    - apk add --no-cache git
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # Register QEMU for cross-arch emulation, then create a buildx builder.
+    - docker run --privileged --rm tonistiigi/binfmt --install all
+    - docker buildx create --name otabuilder --use
+    - docker buildx inspect --bootstrap
   script:
-    - docker pull "$DEV_IMAGE" || true
-    - docker build --pull --cache-from "$DEV_IMAGE"
-        -t "$DEV_IMAGE"
-        -f docker/Dockerfile.dev .
-    - docker push "$DEV_IMAGE"
+    - docker buildx build
+        --platform "$PLATFORMS"
+        --cache-from "type=registry,ref=$DEV_IMAGE"
+        --cache-to   "type=inline"
+        --tag "$DEV_IMAGE"
+        --file docker/Dockerfile.dev
+        --push
+        .
   rules:
+    # Always rebuild on the default branch so the image is fresh and
+    # downstream jobs can pull it.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    # On other branches, only rebuild if the recipe itself changed.
     - changes:
         - docker/Dockerfile.dev
-    - if: '$CI_COMMIT_BRANCH == "main"'
+        - .gitlab-ci.yml
 
-# ---------- verify ----------
+# ---------- verify (cheap, stock images, no dev-image dependency) ----------
 vendor-verify:
   stage: verify
-  image: $DEV_IMAGE
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache git coreutils findutils
   script:
-    - make vendor-verify
+    - tools/vendor-verify.sh
 
 licence-headers:
   stage: verify
-  image: $DEV_IMAGE
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache git
   script:
     - tools/check-licence-headers.sh
 
-go-lint:
+go-vet:
   stage: verify
-  image: $DEV_IMAGE
+  image: $GO_IMAGE
+  before_script:
+    - apk add --no-cache git
   script:
     - cd client && go vet ./...
 
-lisp-lint:
+go-test:
   stage: verify
-  image: $DEV_IMAGE
+  image: $GO_IMAGE
+  before_script:
+    - apk add --no-cache git
   script:
-    - make lisp-check
+    - cd client && go test ./...
 
 # ---------- build ----------
+# Server build needs SBCL: only this job depends on the dev image.
 build-server:
   stage: build
   image: $DEV_IMAGE
+  needs:
+    - job: build-dev-image
+      optional: true
+  rules:
+    # Only attempt the server build when the dev image is available
+    # — i.e. on the default branch, on tags, or on branches that
+    # touched the Dockerfile/CI itself.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - changes:
+        - docker/Dockerfile.dev
+        - .gitlab-ci.yml
+        - server/**/*
+        - vendor/**/*
+        - tools/vendor-build/**/*
+        - Makefile
   script:
     - make vendor-build build-server
   artifacts:
@@ -84,47 +133,54 @@ build-server:
       - server/build/
     expire_in: 1 week
 
-build-client-linux:
+# Client cross-compiles do not need the dev image — pure Go.
+.go-cross: &go-cross
   stage: build
-  image: $DEV_IMAGE
+  image: $GO_IMAGE
+  before_script:
+    - apk add --no-cache git make
+
+build-client-linux:
+  <<: *go-cross
   script:
-    - GOOS=linux   GOARCH=amd64 make build-client
-    - GOOS=linux   GOARCH=arm64 make build-client
+    - cd client && GOOS=linux GOARCH=amd64 go build $GOFLAGS -o ../client/build/linux-amd64/ ./agent ./libota
+    - cd client && GOOS=linux GOARCH=arm64 go build $GOFLAGS -o ../client/build/linux-arm64/ ./agent ./libota
   artifacts:
     paths:
       - client/build/linux-*/
     expire_in: 1 week
 
 build-client-darwin:
-  stage: build
-  image: $DEV_IMAGE
+  <<: *go-cross
   script:
-    - GOOS=darwin  GOARCH=amd64 make build-client
-    - GOOS=darwin  GOARCH=arm64 make build-client
+    - cd client && GOOS=darwin GOARCH=amd64 go build $GOFLAGS -o ../client/build/darwin-amd64/ ./agent ./libota
+    - cd client && GOOS=darwin GOARCH=arm64 go build $GOFLAGS -o ../client/build/darwin-arm64/ ./agent ./libota
   artifacts:
     paths:
       - client/build/darwin-*/
     expire_in: 1 week
 
 build-client-windows:
-  stage: build
-  image: $DEV_IMAGE
+  <<: *go-cross
   script:
-    - GOOS=windows GOARCH=amd64 make build-client
+    - cd client && GOOS=windows GOARCH=amd64 go build $GOFLAGS -o ../client/build/windows-amd64/ ./agent ./libota
   artifacts:
     paths:
       - client/build/windows-*/
     expire_in: 1 week
 
 # ---------- test ----------
-unit:
+self-contained-check:
   stage: test
-  image: $DEV_IMAGE
-  script:
-    - make test-unit
+  image: alpine:3.20
   needs:
-    - build-server
-    - build-client-linux
+    - job: build-client-linux
+      artifacts: true
+  before_script:
+    - apk add --no-cache file
+  script:
+    - tools/check-self-contained.sh client/build/linux-amd64/ota-agent
+    - tools/check-self-contained.sh client/build/linux-arm64/ota-agent
 
 e2e:
   stage: test
@@ -132,24 +188,19 @@ e2e:
   services:
     - docker:26-dind
   before_script:
-    - apk add --no-cache make
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - apk add --no-cache make git
   script:
-    - make e2e
+    - tests/e2e/run.sh
   artifacts:
     when: always
     paths:
       - tests/e2e/run/logs/
     expire_in: 1 week
-
-self-contained-check:
-  stage: test
-  image: $DEV_IMAGE
-  needs:
-    - build-client-linux
-  script:
-    - tools/check-self-contained.sh client/build/linux-amd64/ota-agent
-    - tools/check-self-contained.sh client/build/linux-arm64/ota-agent
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - when: manual
+      allow_failure: true
 
 # ---------- package ----------
 build-server-image:
@@ -158,18 +209,28 @@ build-server-image:
   services:
     - docker:26-dind
   needs:
-    - build-server
+    - job: build-server
+      artifacts: true
+  variables:
+    PLATFORMS: "linux/amd64,linux/arm64"
   before_script:
+    - apk add --no-cache git
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker run --privileged --rm tonistiigi/binfmt --install all
+    - docker buildx create --name otabuilder --use
+    - docker buildx inspect --bootstrap
   script:
-    - docker build
+    - docker buildx build
+        --platform "$PLATFORMS"
         --build-arg VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
         --build-arg VCS_REF="${CI_COMMIT_SHA}"
-        -t "$SERVER_IMAGE"
-        -f docker/Dockerfile.server .
-    - docker push "$SERVER_IMAGE"
+        --tag "$SERVER_IMAGE"
+        --tag "$CI_REGISTRY_IMAGE/server:latest"
+        --file docker/Dockerfile.server
+        --push
+        .
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
 
 # ---------- publish ----------

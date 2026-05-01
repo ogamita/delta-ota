@@ -117,6 +117,11 @@ The same container image (`registry.gitlab.com/ogamita/delta-ota/server`)
 serves both topologies; the storage and database backends are
 selected in `ota.toml`.
 
+The server image is published as a **multi-arch manifest** for
+`linux/amd64` and `linux/arm64`, so it pulls natively on x86_64
+cloud hosts and on Apple-silicon (macOS arm64) developer machines
+under Docker Desktop.
+
 ## Hosting and contributing
 
 - Primary repository: [https://gitlab.com/ogamita/delta-ota](https://gitlab.com/ogamita/delta-ota)
