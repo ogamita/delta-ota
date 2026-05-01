@@ -114,14 +114,17 @@ binary.
 | Component                       | Upstream                       | License       | Lang     | Used by                                   |
 |---------------------------------+--------------------------------+---------------+----------+-------------------------------------------|
 | bsdiff / bspatch (client)       | =gabstv/go-bsdiff=             | MIT           | pure Go  | =libota= patch applier                    |
-| VCDIFF decoder (client)         | =ably/vcdiff-go=               | Apache-2.0    | pure Go  | =libota= patch applier                    |
 | bsdiff / bspatch (server)       | =mendsley/bsdiff=              | BSD-2-Clause  | C        | server patch builder (built as small CLI) |
-| xdelta3 (server)                | =jmacd/xdelta= (=xdelta3/= subdir, *not* =xdelta-gpl=) | Apache-2.0 | C | server patch builder (built as small CLI) |
 | tar (server)                    | =sharplispers/archive=         | BSD-3-Clause  | Common Lisp | server ingestion / extraction tests   |
 
-All licences verified permissive (MIT, BSD-2/3-Clause, Apache-2.0).
-GPL/LGPL/AGPL is /prohibited/ by the vendoring policy; in
-particular =jmacd/xdelta-gpl= (GPLv2) is *not* vendored.
+All licences verified permissive (MIT, BSD-2/3-Clause).  GPL/LGPL/
+AGPL is /prohibited/ by the vendoring policy.
+
+*v1 ships with =bsdiff= as the only patcher.*  An earlier draft
+listed =jmacd/xdelta3= (Apache-2.0) but on actual import the v3.1.0
+tree turned out to be *GPLv2-or-later*; see [[file:adr/0004-bsdiff-only-no-xdelta3.org][ADR-0004]].
+=ably/vcdiff-go= (Apache-2.0 decoder-only) is also dropped because
+without a permissive VCDIFF encoder it would be dead code.
 
 The Go client uses the stdlib =archive/tar=, =crypto/ed25519=,
 =crypto/sha256=, =net/http=, =crypto/tls= — no third-party
@@ -167,14 +170,13 @@ vendored third-party sources/ are in place and verified.
   =vendor/*= and =client/internal/vendor/*= subtree and diffs it
   against the recorded value in =docs/dependencies.org=.  Run by
   CI; fails the build on any mismatch.
-- [ ] Import the five vendored components, in order:
-  - [ ] =vendor/mendsley-bsdiff/= — BSD-2-Clause, C
-  - [ ] =vendor/jmacd-xdelta3/= — Apache-2.0, C, =xdelta3/= subdir
-    only (verify we are *not* on the =-gpl= branch)
-  - [ ] =vendor/sharplispers-archive/= — BSD-3-Clause, CL
-  - [ ] =client/internal/vendor/gabstv-go-bsdiff/= — MIT, pure Go
-  - [ ] =client/internal/vendor/ably-vcdiff-go/= — Apache-2.0,
-    pure Go (decoder only)
+- [X] Import the three vendored components:
+  - [X] =vendor/mendsley-bsdiff/= — BSD-2-Clause, C
+  - [X] =vendor/sharplispers-archive/= — BSD-3-Clause, CL
+  - [X] =client/internal/vendor/gabstv-go-bsdiff/= — MIT, pure Go
+  - Dropped: =jmacd/xdelta= (turned out GPLv2-or-later, see [[file:adr/0004-bsdiff-only-no-xdelta3.org][ADR-0004]]).
+  - Dropped: =ably/vcdiff-go= (decoder-only; useless without a
+    permissive encoder, see [[file:adr/0004-bsdiff-only-no-xdelta3.org][ADR-0004]]).
 - [ ] =docs/dependencies.org= : table of the five vendored
   components, each row carrying: upstream URL, pinned commit hash,
   SPDX licence id, import date, SHA-256 of the imported tree.
@@ -265,10 +267,10 @@ exists and is exercised.
 - [ ] *Patch builder worker* : background pool that consumes a job
   queue (in-memory for now, Postgres-backed in phase 5).  Invokes
   the *vendored* =bsdiff= binary built in phase 0
-  (=server/build/bin/bsdiff=) — never the host's =$PATH=.  Falls
-  back to the vendored =xdelta3= binary
-  (=server/build/bin/xdelta3=) when =Software.default_patcher= says
-  so.  Patches are content-addressed by =sha256(patch-bytes)=.
+  (=server/build/bin/bsdiff=) — never the host's =$PATH=.
+  =bsdiff= is the only patcher in v1 (see [[file:adr/0004-bsdiff-only-no-xdelta3.org][ADR-0004]]); the worker
+  rejects =Software.default_patcher = xdelta3= at publish time.
+  Patches are content-addressed by =sha256(patch-bytes)=.
 - [ ] *Patch path resolver* : graph search over available patches
   to find the cheapest =from → to= path; includes the full-blob
   fallback ratio (=fallback_ratio=, default 0.7).
@@ -279,11 +281,9 @@ exists and is exercised.
   patch finishes building.
 - [ ] *Client* : =install_or_upgrade= takes the upgrade path,
   applies =bspatch= (vendored =gabstv-go-bsdiff=, in-process,
-  pure-Go) to =blob-vX= → =blob-vY= when the patch is bsdiff-format,
-  or applies =vcdiff-go= (vendored, pure-Go decoder) when the patch
-  is xdelta3/VCDIFF-format.  Verifies the result hash against the
-  manifest before extracting.  No subprocess, no shared library,
-  no host =$PATH= dependency.
+  pure-Go) to =blob-vX= → =blob-vY=, verifies the result hash
+  against the manifest before extracting.  No subprocess, no
+  shared library, no host =$PATH= dependency.
 - [ ] *Local retention* code in the client : after a successful
   upgrade, drop =vX-2= material per [[file:ota-specifications.org::*Local retention][Local retention]].
 - [ ] Integration test : publish three releases, install v1, upgrade
@@ -465,7 +465,7 @@ older release without engineer help.
 | =bsdiff= memory blow-up on 8 GB blobs                        | Cap blob size at 8 GB; document RAM requirement on the patch worker; consider =bsdiff= replacement (=hdiffpatch=) only if it bites |
 | Patch chains get long for users who skipped many releases    | Full-blob fallback ratio (default 0.7); supercheckpoint patches from latest =uncollectable= |
 | Windows symlink restrictions in unprivileged contexts        | Junction + launcher shim fallback (phase 3)                                          |
-| =vcdiff-go= is decoder-only — no pure-Go VCDIFF /encoder/    | Client only ever applies patches, never builds them; encoding stays server-side, where the C =xdelta3= helper does it.  If a future feature needs client-side VCDIFF encoding, switch that path to bsdiff. |
+| Need for xdelta3-quality compression on a specific software | bsdiff is the only patcher in v1 (ADR-0004); evaluate =sisong/HDiffPatch= (MIT, C++) if measured savings on a real release set justify the cgo cost.  Customers may also build a private fork that vendors GPL xdelta3 under their own licence terms. |
 | Vendored upstream gets a security fix we miss                | =docs/dependencies.org= recorded; quarterly review documented in =docs/operations.org=. |
 
 * Calendar (rough)

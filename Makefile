@@ -61,18 +61,8 @@ setup:
 vendor-verify:
 	tools/vendor-verify.sh
 
-vendor-build: $(SERVER_BUILD_DIR)/bin/bsdiff $(SERVER_BUILD_DIR)/bin/xdelta3
-
-$(SERVER_BUILD_DIR)/bin/bsdiff: vendor/mendsley-bsdiff/Makefile
-	@mkdir -p $(SERVER_BUILD_DIR)/bin
-	$(MAKE) -C vendor/mendsley-bsdiff
-	cp vendor/mendsley-bsdiff/build/bsdiff $@
-	cp vendor/mendsley-bsdiff/build/bspatch $(SERVER_BUILD_DIR)/bin/bspatch
-
-$(SERVER_BUILD_DIR)/bin/xdelta3: vendor/jmacd-xdelta3/xdelta3/Makefile
-	@mkdir -p $(SERVER_BUILD_DIR)/bin
-	$(MAKE) -C vendor/jmacd-xdelta3/xdelta3
-	cp vendor/jmacd-xdelta3/xdelta3/xdelta3 $@
+vendor-build:
+	$(MAKE) -f tools/vendor-build/mendsley-bsdiff.mk all
 
 # ---------- build ----------
 build: build-server build-admin build-client

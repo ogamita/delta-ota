@@ -22,7 +22,8 @@ db = "sqlite:build/dev/ota-data/db/ota.db"
 default      = "bsdiff"
 worker_count = 1
 bsdiff_path  = "server/build/bin/bsdiff"
-xdelta3_path = "server/build/bin/xdelta3"
+bspatch_path = "server/build/bin/bspatch"
+# xdelta3 is intentionally not configured: see docs/adr/0004-bsdiff-only-no-xdelta3.org
 
 [gc]
 default_threshold = 0

@@ -24,7 +24,8 @@ db = "postgres://ota:ota@postgres:5432/ota"
 default      = "bsdiff"
 worker_count = 2
 bsdiff_path  = "/opt/ota/bin/bsdiff"
-xdelta3_path = "/opt/ota/bin/xdelta3"
+bspatch_path = "/opt/ota/bin/bspatch"
+# xdelta3 is intentionally not configured: see docs/adr/0004-bsdiff-only-no-xdelta3.org
 
 [install_token]
 ttl_seconds = 900

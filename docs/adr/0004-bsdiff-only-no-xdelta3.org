@@ -1,0 +1,97 @@
+#+TITLE: ADR-0004 — bsdiff only in v1; xdelta3 dropped (GPL)
+#+DATE: 2026-05-01
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted.
+
+* Context
+
+The original specification listed two interchangeable patch formats:
+
+- =bsdiff= / =bspatch= (default), and
+- =xdelta3= (selectable per software).
+
+A research pass had reported that =jmacd/xdelta= (the canonical
+upstream) had moved off GPL to Apache-2.0, while =jmacd/xdelta-gpl=
+remained on GPLv2.  This was incorporated into the spec and
+[[file:0003-vendoring-policy.org][ADR-0003]] (vendoring policy: permissive only).
+
+When we ran =tools/vendor-import.sh= against =jmacd/xdelta= at tag
+=v3.1.0= (commit =4b4aed71a959fe11852e45242bb6524be85d3709=), the
+imported tree contained:
+
+- =COPYING= : full text of *GPL v2*.
+- Source-file headers (=xdelta3.h=, =xdelta3.c=, …): "This program
+  is free software; you can redistribute it and/or modify it under
+  the terms of the *GNU General Public License* as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version."
+- =README.md= : "Xdelta3 is covered under the terms of the GPL,
+  see COPYING."
+
+The earlier research finding was therefore wrong : both
+=jmacd/xdelta= and =jmacd/xdelta-gpl= ship under GPLv2-or-later as
+of v3.1.0.
+
+GPL is forbidden by the vendoring policy ([[file:0003-vendoring-policy.org][ADR-0003]]) because of the
+project's dual licensing : we ship =delta-ota= under
+AGPL-3.0-or-later /and/ offer commercial licences for proprietary
+deployments.  Vendoring GPL'd code would force the commercial path
+into GPL terms, breaking the model.
+
+* Decision
+
+1. *xdelta3 is not vendored.*  The vendor import was reverted in
+   the same change set that adds this ADR.
+2. *=bsdiff= is the only patcher supported by =delta-ota= v1.*
+   The default value of =Software.default_patcher= remains
+   =bsdiff=; setting it to =xdelta3= is rejected at publish time
+   with an error pointing at this ADR.
+3. The spec retains the *patcher selection mechanism* (the
+   =patcher= field on the =Patch= entity, the
+   =Software.default_patcher= column) so that adding another patch
+   tool in a later version is a configuration change, not a
+   schema migration.
+4. =ably/vcdiff-go= (Apache-2.0 VCDIFF /decoder/) is *not*
+   vendored either : without a permissively-licensed VCDIFF
+   /encoder/ on the server side, the client-side decoder has no
+   counterpart and would be dead code.
+
+* Consequences
+
+** Positive
+
+- Vendoring policy stays clean ; CI continues to enforce
+  permissive-only.
+- Smaller dependency surface : one patcher, not two.
+
+** Negative
+
+- We give up the option of selecting xdelta3's better compression
+  for specific software where its payload happens to delta better
+  under VCDIFF than under bsdiff.  Empirically this matters at the
+  margins — a few percent on some payloads.
+- If a customer specifically asks for xdelta3, the answer for v1
+  is "not supported".
+
+** Mitigation / future paths
+
+- Watch =sisong/HDiffPatch= (MIT, C++).  Better compression than
+  bsdiff4 is documented; vendoring it would add a =cgo= dependency
+  for the client and force a re-evaluation of the cgo-free rule.
+- If a permissive VCDIFF implementation appears, it can be added
+  *as another patcher* without removing bsdiff.  No spec change
+  beyond accepting a new value of =Software.default_patcher= is
+  needed.
+- Customers with strong xdelta3 needs may compile a private fork
+  of =delta-ota= that vendors =jmacd/xdelta= under GPL terms,
+  accepting the corresponding licence implications themselves.
+  We do not ship that build.
+
+* References
+
+- [[file:0003-vendoring-policy.org][ADR-0003 — Vendoring policy]]
+- [[file:../ota-specifications.org::*Self-containment and vendoring][docs/ota-specifications.org — Self-containment and vendoring]]
+- [[https://github.com/jmacd/xdelta/blob/v3.1.0/xdelta3/COPYING][jmacd/xdelta v3.1.0 COPYING (GPLv2)]]

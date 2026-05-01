@@ -55,14 +55,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Application bits
 COPY --from=builder --chown=root:root /src/server/build/ota-server.core /opt/ota/ota-server.core
 COPY --from=builder --chown=root:root /src/server/build/bin/bsdiff      /opt/ota/bin/bsdiff
-COPY --from=builder --chown=root:root /src/server/build/bin/xdelta3     /opt/ota/bin/xdelta3
+COPY --from=builder --chown=root:root /src/server/build/bin/bspatch     /opt/ota/bin/bspatch
 COPY --chown=root:root server/etc/ota.docker.toml                       /etc/ota/ota.toml.sample
 COPY --chown=root:root docker/entrypoint.sh                             /usr/local/bin/ota-entrypoint
 
 ENV OTA_ROOT=/var/lib/ota
 ENV OTA_CONFIG=/etc/ota/ota.toml
 ENV OTA_BSDIFF=/opt/ota/bin/bsdiff
-ENV OTA_XDELTA3=/opt/ota/bin/xdelta3
+ENV OTA_BSPATCH=/opt/ota/bin/bspatch
 
 USER ota
 EXPOSE 8443

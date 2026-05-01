@@ -62,17 +62,22 @@ source, its =LICENSE= file, and a =VENDORED.md= with provenance.
 CI verifies the recorded =Tree SHA-256= against the actual content
 on every push (=tools/vendor-verify.sh=).
 
-| Component                | Path                                           | Upstream commit | License       | Imported on | Tree SHA-256 |
-|--------------------------+------------------------------------------------+-----------------+---------------+-------------+--------------|
-| mendsley-bsdiff          | =vendor/mendsley-bsdiff/=                      | (TBD)           | BSD-2-Clause  | (TBD)       | (TBD)        |
-| jmacd-xdelta3            | =vendor/jmacd-xdelta3/=                        | (TBD)           | Apache-2.0    | (TBD)       | (TBD)        |
-| sharplispers-archive     | =vendor/sharplispers-archive/=                 | (TBD)           | BSD-3-Clause  | (TBD)       | (TBD)        |
-| gabstv-go-bsdiff         | =client/internal/vendor/gabstv-go-bsdiff/=     | (TBD)           | MIT           | (TBD)       | (TBD)        |
-| ably-vcdiff-go           | =client/internal/vendor/ably-vcdiff-go/=       | (TBD)           | Apache-2.0    | (TBD)       | (TBD)        |
+| Component                | Path                                           | Upstream commit                              | License       | Imported on | Tree SHA-256                                                       |
+|--------------------------+------------------------------------------------+----------------------------------------------+---------------+-------------+--------------------------------------------------------------------|
+| mendsley-bsdiff          | =vendor/mendsley-bsdiff/=                      | =b817e9491cf7b8699c8462ef9e2657ca4ccd7667=   | BSD-2-Clause  | 2026-05-01  | =7c6e2c72bc1c19f654a6647a9fdb5cdfc158ca2e06e4249e2b494d7c408711ef= |
+| sharplispers-archive     | =vendor/sharplispers-archive/=                 | =631271c091ed02994bec3980cb288a2cf32c7cdc=   | BSD-3-Clause  | 2026-05-01  | =c5a50c6d49c36532dbf3972eb9bd64f634294debf7176f327265a1dbd352a4b6= |
+| gabstv-go-bsdiff         | =client/internal/vendor/gabstv-go-bsdiff/=     | =d449682b2c4873092fdd69b3df05e17f5d38b76e=   | MIT           | 2026-05-01  | =291d1ebf9a1cb6a19fd85cf6aaec288e5978119155ae450f74bbde52bfcd090b= |
 
-The =(TBD)= rows are filled in when each component is imported via
-=tools/vendor-import.sh=.  See the script's output and update both
-this table and the =Tree SHA-256= in =VENDORED.md= consistently.
+** Components considered and rejected
+
+- *jmacd/xdelta* (xdelta3) — earlier reported as Apache-2.0; on
+  inspection at tag =v3.1.0=, the actual licence is *GPLv2-or-later*
+  (=COPYING= is GPL, source-file headers are GPL, README states
+  GPL).  Forbidden by the vendoring policy.  See [[file:adr/0004-bsdiff-only-no-xdelta3.org][ADR-0004]].
+- *ably/vcdiff-go* — VCDIFF /decoder/ only, Apache-2.0.  Without a
+  permissively-licensed VCDIFF /encoder/ on the server side it has
+  no counterpart and is not vendored.  Reconsider if such an encoder
+  appears.
 
 The aggregated upstream licence text shipped with the client binary
 lives in [[file:THIRD_PARTY_LICENSES.org][docs/THIRD_PARTY_LICENSES.org]].
