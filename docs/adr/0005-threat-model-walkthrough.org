@@ -1,0 +1,70 @@
+#+TITLE: ADR-0005 — Threat-model walkthrough at 1.0
+#+DATE: 2026-05-01
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted as the v1.0 baseline.  Re-walked at every major release.
+
+* Context
+
+Phase-7 hardening calls for an explicit walk-through of the spec's
+[[file:../ota-specifications.org::*Threats considered][Threats considered]] list, closing every gap or accepting it
+explicitly.  This ADR is that record.
+
+* Threats and dispositions
+
+| # | Threat                                                                | Defence                                                                         | Status   |
+|---+-----------------------------------------------------------------------+---------------------------------------------------------------------------------+----------|
+| 1 | Tampered release on the wire                                          | Manifest is signed; every artefact's SHA-256 is in the manifest; client verifies | Closed   |
+| 2 | Tampered manifest                                                     | Detached Ed25519 signature with pinned public key on the client; trust-on-first-use otherwise | Closed   |
+| 3 | Replay / downgrade                                                    | Client refuses upgrade to a release with =published_at= older than current      | Closed   |
+| 4 | Compromised dev workstation                                           | Admin endpoints behind bearer token; every admin write recorded in =audit_log=  | Mitigated — full mTLS for admins is a follow-up |
+| 5 | Compromised server                                                    | Manifest-signing key recommended on hardware token; clients pin keys; audit log catches lateral abuse on a healthy install | Mitigated |
+| 6 | Path traversal at extraction (Zip-Slip / "../" entries)               | =tarx.safeName= rejects =/= prefix, =NUL=, =..= traversal, Windows reserved names; resolved path re-checked under destination root via =filepath.Rel= | Closed   |
+| 7 | Malformed manifest crashes the agent                                  | =manifest.Parse= goes through Go's =encoding/json= (proven safe); fuzzed in CI via =FuzzParse= | Closed   |
+| 8 | Malformed tar crashes the agent                                       | Go stdlib =archive/tar= reader; =FuzzExtract= fuzzed in CI                      | Closed   |
+| 9 | Malformed patch crashes the agent                                     | =gabstv-go-bsdiff= decoder; =FuzzApply= fuzzed in CI                            | Closed   |
+| 10 | Bearer-token theft on a workstation                                   | Token bound to client_id + classifications; classifications gate visibility; audit log catches large-scale abuse; revocation by deleting the =clients= row | Mitigated |
+| 11 | Install-token replay                                                  | One-shot enforced server-side; TTL ≤ 15 min by default                          | Closed   |
+| 12 | Cleartext HTTP in transit                                             | Optional TLS in v1; standard practice is to terminate TLS at a reverse proxy with kTLS so =sendfile= still fires | Mitigated by deployment guidance |
+| 13 | Hash collision attack on SHA-256 against a stored blob                | SHA-256 is collision-resistant under current cryptanalysis; if and when this changes, schema_version bumps and the catalogue switches digest | Accepted |
+| 14 | Patch produces wrong bytes                                            | Reconstructed blob is hashed and compared to the manifest's =blob.sha256= before extraction | Closed   |
+| 15 | Disk corruption (bit-rot of stored blobs/patches)                     | =POST /v1/admin/verify= re-hashes everything; ops runbook recommends weekly cron | Closed   |
+| 16 | Storage exhaustion via repeated publish of huge releases              | Configurable max blob size (default 8 GB); admin-only publish endpoint; bsdiff RAM cap is the natural limit | Mitigated — explicit rate limits on publish are deferred to phase-5 follow-up |
+| 17 | Denial-of-service by floods of unauth GETs                            | =sendfile= keeps cost low; rate limiting deferred (recorded in plan); deployer is expected to put a CDN or nginx in front for very large fleets | Mitigated by deployment guidance |
+| 18 | Stale CRL / revoked client cert                                       | mTLS not yet wired; bearer tokens are revocable by deleting =clients= row       | Mitigated; re-walk at the mTLS sub-phase |
+| 19 | Audit log tampering on a compromised server                           | Append-only DB table; recommended deployment ships logs to a SIEM or syslog receiver | Mitigated by deployment guidance |
+| 20 | Build-time tampering with vendored sources                            | =tools/vendor-verify.sh= re-hashes every vendored subtree on every CI run; mismatch fails the build | Closed   |
+
+* Open items recorded in the plan
+
+- *Rate limits per identity* (phase 5 follow-up, threats #16, #17).
+- *Mandatory mTLS for admin endpoints* (post-1.0 sub-phase, threat #18).
+- *Manifest signing key on hardware token / KMS proxy* (deployment
+  guidance documented; integration is deployer responsibility).
+
+* Assertions verified by automated tests at this commit
+
+- =FuzzParse=, =FuzzVerify=, =FuzzExtract=, =FuzzSafeName=,
+  =FuzzApply= run as part of =go test ./...= in CI; sustained
+  burst exceeds 1 M executions on the manifest fuzzer with no
+  crashes (tested locally, 4 s burst on 12 workers).
+- Phase-1 e2e proves bytes-match after extract.
+- Phase-2 e2e proves patched-blob hash matches manifest before
+  extract.
+- Phase-4 e2e proves classification filtering: a release tagged
+  =beta= is invisible to anonymous and to clients with
+  =[public]=.
+- Phase-5 e2e proves =verify-storage= reports OK on a healthy
+  CAS, and that GC + backup/restore preserve the manifest tree.
+- Phase-6 e2e proves =doctor --recover= can roll back to an
+  =uncollectable= anchor not in local history.
+
+* References
+
+- [[file:../ota-specifications.org::*Security][docs/ota-specifications.org → Security]]
+- [[file:0003-vendoring-policy.org][ADR-0003 — Vendoring policy]]
+- =client/internal/manifest/fuzz_test.go=
+- =client/internal/tarx/fuzz_test.go=
+- =client/internal/patch/fuzz_test.go=

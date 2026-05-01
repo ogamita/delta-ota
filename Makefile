@@ -137,6 +137,16 @@ go-lint:
 go-test:
 	cd client && $(GO) test ./...
 
+# Short fuzz burst suitable for CI: each target gets FUZZTIME
+# seconds. Run it longer locally with FUZZTIME=60s make fuzz.
+FUZZTIME ?= 5s
+fuzz:
+	cd client && $(GO) test -run=- -fuzz=FuzzParse    -fuzztime=$(FUZZTIME) ./internal/manifest/
+	cd client && $(GO) test -run=- -fuzz=FuzzVerify   -fuzztime=$(FUZZTIME) ./internal/manifest/
+	cd client && $(GO) test -run=- -fuzz=FuzzExtract  -fuzztime=$(FUZZTIME) ./internal/tarx/
+	cd client && $(GO) test -run=- -fuzz=FuzzSafeName -fuzztime=$(FUZZTIME) ./internal/tarx/
+	cd client && $(GO) test -run=- -fuzz=FuzzApply    -fuzztime=$(FUZZTIME) ./internal/patch/
+
 test: test-unit
 test-unit: lisp-check lisp-test go-test
 
@@ -156,7 +166,8 @@ ORG_FILES := \
     $(DOCS_DIR)/delta-ota-datasheet.org          \
     $(DOCS_DIR)/delta-ota-user-manual.org        \
     $(DOCS_DIR)/dependencies.org                 \
-    $(DOCS_DIR)/THIRD_PARTY_LICENSES.org
+    $(DOCS_DIR)/THIRD_PARTY_LICENSES.org         \
+    $(DOCS_DIR)/perf.org
 
 PDF_OUT := build/docs
 PDF_FILES := $(patsubst $(DOCS_DIR)/%.org,$(PDF_OUT)/%.pdf,$(ORG_FILES))

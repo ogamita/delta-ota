@@ -1,0 +1,134 @@
+#+TITLE: delta-ota — Performance notes
+#+AUTHOR: Ogamita Ltd.
+#+OPTIONS: toc:2 num:t
+
+This document records the performance assumptions of the system,
+the recipe to validate them on a real deployment, and known costs
+where the assumption is conservative.
+
+* The big claim
+
+For plain HTTP transfers of blobs and patches, the language the
+server is written in does not matter — both Woo (Common Lisp) and
+Go's =net/http= delegate to =sendfile(2)=, so the bytes never
+visit user space and the kernel feeds the socket directly.  This
+is the *kingmaker* property and is recorded in [[file:adr/0002-woo-not-hunchentoot.org][ADR-0002]].
+
+For HTTPS, neither stack can use =sendfile= (TLS encrypts in user
+space).  The deployment recommendation is therefore to terminate
+TLS at a reverse proxy with kernel TLS (=kTLS=) so the user-space
+copy stays inside that proxy and the application server keeps the
+=sendfile= fast path.
+
+* How to verify =sendfile= really fires
+
+On the server host, with the server running and the client about
+to download a blob:
+
+#+begin_src sh
+# 1. Find the woo PID.
+pid=$(pgrep -f ota-server | head -1)
+
+# 2. Attach strace, filter for the relevant syscalls.
+sudo strace -p "$pid" -f -e trace=sendfile,write,writev -tt \
+     2>&1 | tee /tmp/ota-strace.log
+
+# 3. From a second terminal, trigger a blob download.
+curl -o /dev/null http://127.0.0.1:8080/v1/blobs/<sha>
+#+end_src
+
+What you should see :
+
+- exactly one =sendfile(client_fd, blob_fd, ..., size)= per
+  download (or a small number of partial-progress calls if the
+  socket buffer fills before the full blob fits);
+- *no* =write= or =writev= carrying blob payload bytes;
+- the file descriptor for the blob immediately closed after the
+  =sendfile= sequence completes.
+
+If you see the blob bytes flowing through =write= calls, the
+=sendfile= path is broken — the most likely cause is a Clack
+adapter change that no longer treats a =pathname= response body
+as a file to splice.  Open an issue and pin the previous Woo
+version while we fix it.
+
+* Sizing reference
+
+Restated from [[file:ota-specifications.org::*Performance, sizing and operational limits][ota-specifications.org]] for quick lookup:
+
+| Scenario                              | Egress / Time / Notes                                         |
+|---------------------------------------+----------------------------------------------------------------|
+| Steady-state upgrade (2 GB blob, monthly cadence) | ≈ 20 MB median per client (5–50 MB)                            |
+| 10 000 clients all upgrading at 09:00 | ≈ 200 GB egress over ~80 s on 2 × 10 GbE                       |
+| Cold install of 2 GB × 10 000 clients | ≈ 20 TB total — *requires* staggering via install-token bucket |
+| Patch worker RAM at build time        | ≈ 2 × blob size                                                |
+| Concurrent CAS reads                  | bound by NIC and =ulimit -n=                                   |
+
+* What the e2e tests measure
+
+| Metric                              | Where it shows up                                  |
+|-------------------------------------+----------------------------------------------------|
+| Patch size as fraction of blob      | =tests/e2e/run.sh= asserts < 50 % of blob          |
+| Reconstruct hash matches manifest   | =client/internal/patch/patch.go= verifies before extract |
+| Deterministic-tar byte equality     | =tests/e2e/run.sh= and the SBCL =deterministic-tar= unit test |
+| Storage integrity after backup/restore | =tests/e2e/ops.sh=                                |
+
+The synthetic payload used in the e2e is small (~10 KB) so the
+patch ratio there is dominated by bzip2 framing overhead, not the
+delta compression itself.  In practice, on a 2 GB binary that
+recompiled without source changes the v1→v2 patch is typically
+in the single-digit MB range.
+
+* Known costs and limits
+
+** Patch-build memory
+
+=bsdiff= keeps the suffix-array of one input in memory.  Empirical
+peak ≈ 2 × the larger blob's size.  For an 8 GB blob that means
+≥ 16 GB of patch-builder RAM.  This is the natural ceiling on the
+configured =max blob size= and the reason we cap at 8 GB by default.
+
+If the worker host has less RAM than 2 × blob, =bsdiff= will swap
+or be killed by the OOM killer.  Sizing the patch worker is the
+deployer's responsibility; the runbook calls this out
+([[file:operations.org::*Sizing and tuning][operations.org → Sizing and tuning]]).
+
+** TLS user-space copy
+
+Under TLS, =sendfile= cannot be used: the kernel doesn't know how
+to encrypt.  Rolling kTLS in the kernel of recent Linux moves the
+encryption back to the kernel, but it requires the userspace TLS
+stack to opt in (and works only on TCP).  Woo+cl+ssl does not
+currently use kTLS.
+
+The pragmatic deployment is therefore: TLS at the proxy, plain
+HTTP between proxy and =ota-server= on the loopback, =sendfile=
+fires.
+
+** Disk space growth
+
+Each release adds (blob-size + Σ patch-sizes) to the on-disk
+footprint.  At the steady-state numbers above, ten months of
+monthly releases means roughly:
+
+#+begin_src
+  10 × (2 GB + 9 × 20 MB) ≈ 22 GB
+#+end_src
+
+(each release builds patches from every prior release).  GC
+([[file:operations.org::*Garbage-collect old releases][operations.org → GC]]) bounds the long-tail by pruning releases with
+no active users.
+
+* Doing your own measurement
+
+A useful first measurement on a new host:
+
+1. =make build && make e2e= — confirms the full pipeline works.
+2. Replace =tests/e2e/run.sh='s payload with a copy of your own
+   release (size = blob size you care about); re-run.
+3. Watch =server_log= for the =sendfile= messages from =strace=
+   (above), confirm the patch sizes printed at publish time, and
+   note the e2e wall-clock time.
+
+Per-host sustained throughput is dominated by the NIC and the
+kernel's =sendfile= queue depth — not by =ota-server=.

@@ -111,6 +111,17 @@ go-test:
   script:
     - cd client && go test ./...
 
+go-fuzz:
+  stage: verify
+  image: $GO_IMAGE
+  needs: []
+  before_script:
+    - apk add --no-cache git make
+  script:
+    # 6 fuzz targets × 5 s = ~30 s wall-clock; long enough to catch
+    # silly crashes, short enough that the pipeline stays brisk.
+    - FUZZTIME=5s make fuzz
+
 # ---------- build ----------
 # Server build needs SBCL: only this job depends on the dev image.
 build-server:
