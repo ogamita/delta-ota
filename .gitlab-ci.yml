@@ -180,6 +180,25 @@ build-client-windows:
       - client/build/windows-*/
     expire_in: 1 week
 
+# libota as c-shared / c-archive needs cgo + a C toolchain. Only
+# build it for linux-amd64 from the cross-compile pipeline; the
+# darwin and windows variants need their native SDKs and live in
+# the per-OS test jobs below.
+build-libota-linux:
+  stage: build
+  image: golang:1.22-bookworm
+  needs: []
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git ca-certificates build-essential
+  script:
+    - mkdir -p client/build/linux-amd64
+    - (cd client && CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o ../client/build/linux-amd64/libota.so ./cmd/libota-shared)
+    - (cd client && CGO_ENABLED=1 go build -trimpath -buildmode=c-archive -o ../client/build/linux-amd64/libota.a ./cmd/libota-shared)
+  artifacts:
+    paths:
+      - client/build/linux-amd64/libota.*
+    expire_in: 1 week
+
 # ---------- test ----------
 self-contained-check:
   stage: test

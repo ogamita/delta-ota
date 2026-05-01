@@ -37,6 +37,9 @@ for f in ${files}; do
     if echo "${f}" | grep -q "${exempt_re}"; then
         continue
     fi
+    # Skip files that exist in the index but not on disk (e.g. a
+    # deletion that has not been committed yet).
+    [ -f "${f}" ] || continue
     if ! head -n 5 "${f}" | grep -q 'SPDX-License-Identifier'; then
         echo "missing SPDX header: ${f}" >&2
         failures=$((failures + 1))

@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"gitlab.com/ogamita/delta-ota/client/internal/platform"
 )
 
 // Layout holds the per-software paths.
@@ -109,39 +111,29 @@ func (l *Layout) BlobPath(version string) string {
 	return filepath.Join(l.BlobsDir, version+".blob")
 }
 
-// FlipCurrent atomically swaps the current symlink to point to
-// distribution-<version>, and moves the old current into previous.
-// If current does not exist, it is simply created.
+// FlipCurrent points the current link at distribution-<version>,
+// moving the previous current into previous. Uses the platform
+// abstraction so it works on POSIX symlinks AND on Windows where
+// non-admin users without developer mode fall back to a `.path`
+// shim file.
 func (l *Layout) FlipCurrent(version string) error {
 	target := l.absDistributionDir(version)
-	st, err := os.Lstat(l.CurrentSymlink)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		// Fresh install: just create current.
-		return atomicSymlink(target, l.CurrentSymlink)
-	case err != nil:
-		return fmt.Errorf("state: stat current: %w", err)
-	default:
-		_ = st
+	// Move the existing current (if any) into previous.
+	if err := platform.SwapCurrentToPrevious(l.CurrentSymlink, l.PreviousSymlink); err != nil {
+		return fmt.Errorf("state: swap current->previous: %w", err)
 	}
-	// Move current → previous (overwriting any old previous).
-	_ = os.Remove(l.PreviousSymlink)
-	if err := os.Rename(l.CurrentSymlink, l.PreviousSymlink); err != nil {
-		return fmt.Errorf("state: rename current->previous: %w", err)
-	}
-	if err := atomicSymlink(target, l.CurrentSymlink); err != nil {
-		// Try to roll back previous → current to keep things sane.
-		_ = os.Rename(l.PreviousSymlink, l.CurrentSymlink)
-		return err
+	if _, err := platform.SetCurrent(target, l.CurrentSymlink); err != nil {
+		return fmt.Errorf("state: set current: %w", err)
 	}
 	return nil
 }
 
-func atomicSymlink(target, link string) error {
-	tmp := link + ".tmp"
-	_ = os.Remove(tmp)
-	if err := os.Symlink(target, tmp); err != nil {
-		return fmt.Errorf("state: symlink: %w", err)
+// CurrentTarget returns the on-disk path the current link/shim
+// points to, or fs.ErrNotExist if neither exists.
+func (l *Layout) CurrentTarget() (string, error) {
+	t, err := platform.ReadCurrent(l.CurrentSymlink)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", fs.ErrNotExist
 	}
-	return os.Rename(tmp, link)
+	return t, err
 }

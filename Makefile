@@ -89,16 +89,21 @@ build-admin:
 
 build-client: build-libota build-agent
 
+# libota's C ABI is only producible with cgo enabled (and a C
+# compiler that targets GOOS/GOARCH).  The pure-Go ota-agent build
+# above remains cgo-free; only this target needs cgo.
+LIBOTA_EXT := $(if $(filter windows,$(GOOS)),dll,$(if $(filter darwin,$(GOOS)),dylib,so))
+
 build-libota:
 	@mkdir -p $(CLIENT_BUILD_DIR)/$(GOOS)-$(GOARCH)
-	cd client && GOOS=$(GOOS) GOARCH=$(GOARCH) \
-	    $(GO) build $(GOFLAGS) -buildmode=c-shared \
-	        -o ../$(CLIENT_BUILD_DIR)/$(GOOS)-$(GOARCH)/libota.$(if $(filter windows,$(GOOS)),dll,$(if $(filter darwin,$(GOOS)),dylib,so)) \
-	        ./libota
-	cd client && GOOS=$(GOOS) GOARCH=$(GOARCH) \
-	    $(GO) build $(GOFLAGS) -buildmode=c-archive \
+	cd client && GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=1 \
+	    $(GO) build -trimpath -buildmode=c-shared \
+	        -o ../$(CLIENT_BUILD_DIR)/$(GOOS)-$(GOARCH)/libota.$(LIBOTA_EXT) \
+	        ./cmd/libota-shared
+	cd client && GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=1 \
+	    $(GO) build -trimpath -buildmode=c-archive \
 	        -o ../$(CLIENT_BUILD_DIR)/$(GOOS)-$(GOARCH)/libota.a \
-	        ./libota
+	        ./cmd/libota-shared
 
 build-agent:
 	@mkdir -p $(CLIENT_BUILD_DIR)/$(GOOS)-$(GOARCH)
