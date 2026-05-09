@@ -19,6 +19,30 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **Friendly error messages for HTTP/TLS misconfiguration in
+  `ota-admin`.** Previously, the most common operator
+  bring-up mistakes (`https://` against a plain-HTTP server,
+  hostname typo, server not running) surfaced as raw cl+ssl /
+  USOCKET stack-trace fragments — `tls_validate_record_header:
+  wrong version number` or `Condition USOCKET:NS-HOST-NOT-FOUND-
+  ERROR was signalled.`. `ota-admin` now intercepts these and
+  prints a one-line actionable message that names the URL and
+  suggests the fix (e.g. *"TLS handshake failed against
+  https://… — the server appears to be serving plain HTTP, not
+  HTTPS. Try OTA_SERVER=http://… (no 's')."*).
+- The matcher dispatches on both the printed message and the
+  condition's package-qualified class name, so library-internal
+  conditions whose default print form lacks diagnostic text
+  (`USOCKET:INVALID-ARGUMENT-ERROR`, `USOCKET:NS-HOST-NOT-FOUND-
+  ERROR`, etc.) are still recognised. Unknown errors propagate
+  unchanged.
+- 33 new unit tests in
+  `admin/tests/error-friendlification-tests.lisp` cover every
+  pattern + every dispatch path (substring, class-name,
+  USOCKET-prefix fallback, pass-through). Suite is now 87 admin
+  checks (was 27).
+
 ### Changed
 - **Documentation: `OTA_ADMIN_TOKEN` is now described as the
   shared secret it actually is.** New top-level "Authentication"

@@ -17,6 +17,7 @@
   :depends-on ("ota-admin" "fiveam")
   :pathname "tests/"
   :components ((:file "package")
-               (:file "cli-smoke" :depends-on ("package")))
+               (:file "cli-smoke" :depends-on ("package"))
+               (:file "error-friendlification-tests" :depends-on ("package")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-admin.tests :run-all)))

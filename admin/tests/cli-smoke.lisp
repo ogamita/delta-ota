@@ -106,6 +106,13 @@ errors with a clear message about the token."
       (is (search "Usage:" err)))))
 
 (defun run-all ()
-  (let ((result (run! 'ota-admin-cli-smoke)))
-    (unless result
+  ;; Run every suite registered under :ota-admin.tests.  Each suite is
+  ;; run individually so a failure in one doesn't prevent the others
+  ;; from reporting; the process exits non-zero if any one failed.
+  (let ((ok t))
+    (dolist (suite '(ota-admin-cli-smoke
+                     ota-admin-error-friendlification))
+      (when (find-symbol (symbol-name suite) :ota-admin.tests)
+        (setf ok (and (run! suite) ok))))
+    (unless ok
       (uiop:quit 1))))
