@@ -583,3 +583,34 @@ older release without engineer help.
 with one Lisp-leaning engineer on the server/admin tracks and one
 Go-leaning engineer on the client track running in parallel from
 phase 1 onward.
+
+* Post-1.0 backlog
+
+Items that were noticed during v1.0.x cuts but are not blocking
+any release.  Group them into the next minor (v1.1) when one is
+scoped, or pick off opportunistically.
+
+** CI compute optimisation (noticed v1.0.4)
+
+Cutting v1.0.1 → v1.0.4 burned through the Ogamita group's
+shared-runner monthly compute allowance fast enough that the
+v1.0.4 =release= job sat queued until minutes were topped up.
+The two heaviest contributors are the =build-server-image= job
+(multi-arch buildx with QEMU-emulated arm64) and the =e2e=
+job (sequential SBCL boots per shell test).  Two cheap wins:
+
+- [ ] *Verify the dev-image cache is actually hitting in
+  practice.*  =build-dev-image= already declares
+  =--cache-from type=registry= and a =rules: changes:= gate on
+  =docker/Dockerfile.dev= and =.gitlab-ci.yml=, but the cache hit
+  rate isn't measured anywhere.  Run a no-op push, look at the
+  buildx output for "CACHED" lines, and confirm we're not
+  silently rebuilding layers.  If we are, fix the cache key /
+  source ordering.
+- [ ] *Gate =build-server-image= on tags only* (drop the
+  =$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH= rule).  Today it
+  fires on every master push *and* every tag, doubling the
+  buildx burn for no benefit -- nothing pulls
+  =server:latest= or =server:<short-sha>= operationally; the
+  publishable images are the tagged ones.  Cuts a per-pipeline
+  ~10 minutes of QEMU time.
