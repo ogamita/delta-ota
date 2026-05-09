@@ -5,36 +5,23 @@
   (:use #:cl)
   (:export #:main
            #:migrate
-           #:run-gc
-           #:*default-config*))
+           #:run-gc))
 
 (in-package #:ota-server)
 
-(defparameter *default-config*
-  (list :host "127.0.0.1"
-        :port 8080
-        :data-dir "./build/dev/ota-data"
-        :admin-token "dev-token"))
-
-(defun env-or-default (env-name fallback)
-  (or (uiop:getenv env-name) fallback))
-
-(defun env-port (env-name fallback)
-  (let ((s (uiop:getenv env-name)))
-    (if s (parse-integer s) fallback)))
-
-(defun load-config-from-env ()
-  (list :host (env-or-default "OTA_HOST" "0.0.0.0")
-        :port (env-port "OTA_PORT" 8080)
-        :data-dir (env-or-default "OTA_ROOT" "./build/dev/ota-data")
-        :admin-token (env-or-default "OTA_ADMIN_TOKEN" "dev-token")
-        :tls-cert (uiop:getenv "OTA_TLS_CERT")
-        :tls-key  (uiop:getenv "OTA_TLS_KEY")))
+(defun %resolve (config)
+  (ota-server.config:resolve-config config))
 
 (defun main (&key config)
-  "Boot the server. CONFIG is a plist; otherwise environment vars are
-   consulted (OTA_HOST, OTA_PORT, OTA_ROOT, OTA_ADMIN_TOKEN)."
-  (let* ((cfg (or config (load-config-from-env)))
+  "Boot the server. CONFIG may be:
+     - NIL                — defaults overlaid by env-vars (OTA_HOST,
+                            OTA_PORT, OTA_ROOT, OTA_ADMIN_TOKEN,
+                            OTA_TLS_CERT, OTA_TLS_KEY).
+     - a pathname/string  — path to a TOML config; env-vars override
+                            file values.
+     - a plist            — already-resolved configuration (test
+                            harness path)."
+  (let* ((cfg (%resolve config))
          (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
          (cas (ota-server.storage:make-cas root))
          (db (ota-server.catalogue:open-catalogue
@@ -63,16 +50,14 @@
                                           :port (getf cfg :port))))
       (format t "ota-server: ready.~%")
       (force-output)
-      ;; Block forever: SBCL's clackup with woo runs in the same thread
-      ;; if :worker-num is unspecified; otherwise we wait on the
-      ;; handler.  For now, sleep until interrupted.
       (handler-case
           (loop (sleep 86400))
         (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
       (ota-server.http:stop-server handler))))
 
 (defun migrate (&key config)
-  (let* ((cfg (or config (load-config-from-env)))
+  "Apply catalogue migrations and exit. CONFIG is interpreted as in MAIN."
+  (let* ((cfg (%resolve config))
          (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
          (db (ota-server.catalogue:open-catalogue
               (merge-pathnames "db/ota.db" root))))

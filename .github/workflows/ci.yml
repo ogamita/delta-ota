@@ -138,7 +138,7 @@ jobs:
                --eval '(quit)'
           sbcl --non-interactive --no-userinit --no-sysinit \
                --load ~/quicklisp/setup.lisp \
-               --eval '(ql:quickload (list "alexandria" "uiop" "fiveam" "ironclad" "com.inuoe.jzon" "sqlite" "clack" "woo" "dexador" "cl-ppcre"))' \
+               --eval '(ql:quickload (list "alexandria" "uiop" "fiveam" "ironclad" "com.inuoe.jzon" "clop" "sqlite" "clack" "woo" "dexador" "cl-ppcre"))' \
                --eval '(quit)'
       - name: Build server core + vendored helpers
         run: |

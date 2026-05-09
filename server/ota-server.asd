@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — distribution server."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "0.1.0"
+  :version "1.0.2"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
@@ -13,12 +13,16 @@
                "uiop"
                "ironclad"
                "com.inuoe.jzon"
+               "clop"
                "sqlite"
                "clack"
                "woo"
                "cl-ppcre")
   :pathname "src/"
-  :components ((:module "storage"
+  :components ((:module "config"
+                :components ((:file "package")
+                             (:file "loader" :depends-on ("package"))))
+               (:module "storage"
                 :components ((:file "package")
                              (:file "cas" :depends-on ("package"))
                              (:file "tar" :depends-on ("package"))))
@@ -39,7 +43,7 @@
                 :depends-on ("storage" "manifest" "catalogue" "workers"))
                (:module "admin"
                 :components ((:file "package")))
-               (:file "main" :depends-on ("http")))
+               (:file "main" :depends-on ("http" "config")))
   :in-order-to ((test-op (test-op "ota-server/tests"))))
 
 (defsystem "ota-server/tests"
@@ -48,6 +52,7 @@
   :depends-on ("ota-server" "fiveam")
   :pathname "tests/"
   :components ((:file "package")
-               (:file "smoke" :depends-on ("package")))
+               (:file "smoke"        :depends-on ("package"))
+               (:file "config-tests" :depends-on ("smoke")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))

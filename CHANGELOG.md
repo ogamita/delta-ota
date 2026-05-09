@@ -21,6 +21,56 @@ C ABI) follow these compatibility commitments:
 
 Nothing yet.
 
+## [1.0.2] - 2026-05-09
+
+Bugfix release. The `MAIN` function's `:config` argument was
+documented as a TOML file path (operations runbook, entrypoint
+script, `make run-server`, systemd unit) but the implementation
+treated it as a pre-built plist — `(getf "/etc/ota/ota.toml"
+:data-dir)` crashed at boot. The TOML configuration files
+(`ota.dev.toml`, `ota.docker.toml`, `ota.toml.sample`) were never
+read by anything; only the `OTA_*` environment variables actually
+configured the server.
+
+No public-contract changes (HTTP/JSON API, manifest schema, libota
+C ABI, state.json all unchanged from 1.0.0).
+
+### Added
+- `ota-server.config` package — TOML 1.0 loader (via `clop`)
+  covering every section documented in
+  [operations.org](docs/operations.org): `[server]`, `[tls]`,
+  `[storage]`, `[catalogue]`, `[patcher]`, `[gc]`,
+  `[install_token]`. Resolution order: built-in defaults → TOML
+  file → `OTA_*` env-var overrides.
+- 26 unit tests in `server/tests/config-tests.lisp` covering all
+  invocation paths: empty TOML, every documented section,
+  `listen` host/port splitting (with and without colon), shipped
+  sample files, malformed TOML, missing file, env-var overrides
+  for every documented variable, the precedence rule (env beats
+  file beats defaults), and the dispatch table for
+  `resolve-config` (nil / pathname / string / plist / bad type).
+  The full suite is now 70 checks; all pass.
+- `clop` added to the Quicklisp dependency list (Server),
+  prebaked into `docker/Dockerfile.dev` and the GitHub Actions
+  `dist-server` workflow.
+
+### Fixed
+- `ota-server:main` and `ota-server:migrate` now dispatch on the
+  `:config` argument's type via `ota-server.config:resolve-config`
+  — pathnames and strings load TOML; plists are passed through
+  for the e2e harness; `nil` falls back to env-vars + defaults.
+- `make run-server`, the systemd unit, and the Docker entrypoint
+  all now boot successfully against their respective TOML files.
+
+### Notes
+- The TOML schema documented in the operations runbook is parsed
+  in full and stored in the resolved plist, but `MAIN` only
+  consumes the subset it consumed in 1.0.0 (`:host`, `:port`,
+  `:data-dir`, `:hostname`, `:admin-token`, `:tls-cert`,
+  `:tls-key`). Wiring the additional keys (worker count, GC
+  schedule, install-token TTL, mTLS) into the running server is
+  a v1.1 sub-phase.
+
 ## [1.0.1] - 2026-05-09
 
 Operations release. No changes to the public contracts (HTTP/JSON
