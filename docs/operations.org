@@ -62,15 +62,40 @@ image serves both topologies.
 
 ** Quick start — single-host tarball (debug / test / evaluation)
 
-The =dist-server= job in CI also produces an unpacked tarball,
-=delta-ota-server-X.Y.Z.tar.gz=, that installs to =/opt/ota= and
-runs under systemd.  This path exists for evaluation, debugging,
-and air-gapped hosts where running a container is inconvenient.
-It is *not* attached to the GitLab/GitHub Release — pull it from
-the pipeline artefacts of the tag you want.
+A self-contained tarball, =delta-ota-server-X.Y.Z.tar.gz=, installs
+to =/opt/ota= and runs under systemd.  This path exists for
+evaluation, debugging, and air-gapped hosts where running a
+container is inconvenient.  It is *not* attached to the
+GitLab/GitHub Release.
+
+There are two ways to obtain it:
+
+1. *From CI* — the =dist-server= job in =.gitlab-ci.yml= and the
+   matching workflow in =.github/workflows/ci.yml= build it on
+   =master= and on tags.  Pull it from the pipeline artefacts of
+   the tag (or commit) you want.
+
+2. *Locally*, from a checkout of this repository — useful for
+   reproducing the artefact a customer is running, or for cutting
+   a debug bundle off a feature branch:
+
+   #+begin_src sh
+   # Build the SBCL core, vendored helpers, and the tarball.
+   # VERSION defaults to `git describe --tags --always --dirty`.
+   make dist-server VERSION=1.0.1
+   # -> build/dist/delta-ota-server-1.0.1.tar.gz
+   # -> build/dist/delta-ota-server-1.0.1/   (unpacked staging dir)
+   #+end_src
+
+   This requires the same toolchain as =make build-server=: SBCL +
+   Quicklisp at =~/quicklisp= or =/opt/quicklisp=, Go ≥ 1.22, and
+   a C compiler for the vendored mendsley bsdiff/bspatch helpers.
+   Cross-compiling the tarball for a different host architecture
+   is not supported — build on a host of the target arch, or use
+   the published container image instead.
 
 The tarball requires =sbcl=, =libev4=, =libssl3=, and =libsqlite3-0=
-to be installed on the host (Debian package names).
+to be installed on the install host (Debian package names).
 
 #+begin_src sh
 # 1. unpack
