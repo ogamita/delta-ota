@@ -120,20 +120,52 @@ Once the stack is up:
 
 ```sh
 # publish a sample release from a developer workstation
-./bin/ota-admin publish ./examples/hello/ \
-    --software hello --version 1.0.0
+OTA_SERVER=http://127.0.0.1:8443 \
+OTA_ADMIN_TOKEN=dev-token \
+  make publish DIR=./examples/hello \
+               SOFTWARE=hello VERSION=1.0.0 \
+               OS=linux ARCH=amd64
 
 # install it from a user workstation
-./bin/ota-agent install hello
+client/build/linux-amd64/ota-agent install hello \
+    --server=http://127.0.0.1:8443
 ```
 
 For a non-Docker development setup (SBCL + Go installed locally):
 
 ```sh
-make setup       # check toolchain, install Lisp deps via Quicklisp
-make build       # build server, admin, libota, ota-agent
-make test        # unit + integration tests
-make run-server  # start ota-server on localhost:8443
+make setup           # check toolchain, install Lisp deps via Quicklisp
+make build           # build server, admin, libota, ota-agent
+make test            # unit + integration tests (server + admin + Go)
+make run-server      # start ota-server on localhost:8443
+```
+
+The build artefacts land at:
+
+```
+server/build/ota-server.core    # SBCL image, served by `make run-server`
+admin/build/ota-admin           # standalone executable (publish, mint-tokens)
+client/build/<os>-<arch>/ota-agent  # static binary
+```
+
+Convenience targets that wrap the admin CLI:
+
+```sh
+# Publish a release. Required: DIR, SOFTWARE, VERSION, OS, ARCH.
+# Optional: OS_VERSIONS, CLASSIFICATIONS, SERVER.
+# OTA_SERVER and OTA_ADMIN_TOKEN are honoured by the binary.
+OTA_ADMIN_TOKEN=dev-token \
+  make publish DIR=./examples/hello SOFTWARE=hello \
+               VERSION=1.0.0 OS=darwin ARCH=arm64
+
+# Mint install tokens in bulk from a CSV. Required: CSV.
+# Optional: CLASSIFICATIONS, TTL ("7d"…), OUTPUT, SERVER.
+OTA_ADMIN_TOKEN=dev-token \
+  make mint-tokens CSV=users.csv CLASSIFICATIONS=stable TTL=7d
+
+# Build the single-host server install tarball (debug / test / eval only —
+# production deployments use the published container image).
+make dist-server VERSION=1.0.2
 ```
 
 ## Deployment

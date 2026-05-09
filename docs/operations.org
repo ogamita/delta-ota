@@ -143,17 +143,29 @@ Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
 
 ** Publish a release
 
-From a developer workstation that has =ota-admin= installed:
+=ota-admin= is built from this repository as a standalone executable
+at =admin/build/ota-admin=:
+
+#+begin_src sh
+make build-admin   # produces admin/build/ota-admin
+#+end_src
+
+From a developer workstation:
 
 #+begin_src sh
 export OTA_SERVER=https://ota.example.com
 export OTA_ADMIN_TOKEN=$(pass show ota/admin)
 
-ota-admin publish ./build/release/      \
-    --software=schms                    \
-    --version=3.4.1                     \
-    --os=windows --arch=x86_64          \
+# Either invoke the binary directly...
+admin/build/ota-admin publish ./build/release/  \
+    --software=schms                            \
+    --version=3.4.1                             \
+    --os=windows --arch=x86_64                  \
     --os-versions=10,11
+
+# ...or use the Makefile convenience wrapper:
+make publish DIR=./build/release SOFTWARE=schms VERSION=3.4.1 \
+             OS=windows ARCH=x86_64 OS_VERSIONS=10,11
 #+end_src
 
 The server hashes the payload, stores the blob, builds patches from
@@ -162,7 +174,9 @@ re-signs the manifest.
 
 ** Mint an install token
 
-Required for first-time installs by an unmanaged client:
+Required for first-time installs by an unmanaged client.
+
+For a single token, =curl= is enough:
 
 #+begin_src sh
 curl -X POST                                        \
@@ -170,6 +184,21 @@ curl -X POST                                        \
      -H "Content-Type: application/json"            \
      -d '{"classifications":["public"],"ttl_seconds":900}'  \
      https://ota.example.com/v1/admin/install-tokens
+#+end_src
+
+For bulk minting from a CSV of users (one row per token, name +
+email + classification), use the admin CLI -- it emits a TSV ready
+for mail-merge:
+
+#+begin_src sh
+admin/build/ota-admin mint-tokens             \
+    --csv=users.csv                           \
+    --classifications=stable                  \
+    --ttl=7d                                  \
+    --output=tokens.tsv
+
+# Or via the Makefile wrapper:
+make mint-tokens CSV=users.csv CLASSIFICATIONS=stable TTL=7d
 #+end_src
 
 The token is one-shot and short-TTL.  The user pastes it into

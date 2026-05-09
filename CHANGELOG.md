@@ -19,7 +19,31 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **`ota-admin` builds as a standalone executable.** `make build-admin`
+  now produces `admin/build/ota-admin` (a real binary), not a
+  bare SBCL `.core` image — same operator UX as `ota-agent`.
+  `admin/build.lisp` uses `:executable t` + `:toplevel`, suppressing
+  the SBCL banner and exiting on errors with a clear message.
+- `make publish` and `make mint-tokens` convenience targets that
+  wrap the admin CLI with named-argument validation. Required and
+  optional flags are documented inline and in the `make help`
+  output.
+- `make lisp-test-admin` — black-box smoke tests against the built
+  `ota-admin` executable (subprocess invocation): `help` prints
+  usage and exits 2; missing `<dir>` errors; missing
+  `OTA_ADMIN_TOKEN` errors; unknown subcommands fall through to
+  usage. 13 new checks, wired into `make test-unit`.
+- `admin/ota-admin.asd` version bumped to 1.0.2 with a `:perform
+  test-op` entry that runs the new smoke suite via
+  `asdf:test-system "ota-admin"`.
+
+### Changed
+- README.md and `docs/operations.org` quick-start sections now
+  reflect the actual binary layout (`admin/build/ota-admin`) and
+  document the `make publish` / `make mint-tokens` wrappers. The
+  prior README example called `./bin/ota-admin` — a path that
+  never existed.
 
 ## [1.0.2] - 2026-05-09
 

@@ -33,9 +33,10 @@ GOARCH ?= $(shell $(GO) env GOARCH)
 .PHONY: all help setup build test \
         vendor-verify vendor-build \
         build-server build-admin build-client build-libota \
-        lisp-check go-lint go-test \
+        lisp-check lisp-test lisp-test-admin go-lint go-test \
         test-unit e2e \
         run-server \
+        publish mint-tokens \
         dist-server \
         clean
 
@@ -48,12 +49,14 @@ help:
 	@echo "  make vendor-build    build vendored C helpers (bsdiff, xdelta3)"
 	@echo "  make build           build server, admin, libota, ota-agent"
 	@echo "  make build-server    build the SBCL server core"
-	@echo "  make build-admin     build the SBCL admin CLI"
+	@echo "  make build-admin     build the ota-admin executable"
 	@echo "  make build-client    build libota + ota-agent for GOOS/GOARCH"
 	@echo "  make test            unit tests (server + client)"
 	@echo "  make test-unit       same as test"
 	@echo "  make e2e             docker-compose end-to-end test"
 	@echo "  make run-server      start ota-server locally"
+	@echo "  make publish         publish a release via ota-admin (DIR=, SOFTWARE=, VERSION=, OS=, ARCH=)"
+	@echo "  make mint-tokens     mint install tokens via ota-admin (CSV=, CLASSIFICATIONS=, TTL=, OUTPUT=)"
 	@echo "  make dist-server     build delta-ota-server-VERSION.tar.gz (debug/test/eval install)"
 	@echo "  make clean           remove build artefacts"
 
@@ -138,6 +141,17 @@ lisp-test:
 	    --eval '(ql:quickload "ota-server/tests" :silent t)' \
 	    --eval '(asdf:test-system "ota-server")'
 
+# Admin CLI tests are black-box checks against the built executable.
+# `build-admin` is a prerequisite so the smoke tests have a binary
+# to spawn; without it they are skipped.
+lisp-test-admin: build-admin
+	$(SBCL) --non-interactive --no-userinit --no-sysinit \
+	    --load $(QUICKLISP_SETUP) \
+	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
+	    --eval '(asdf:load-asd (truename "admin/ota-admin.asd"))' \
+	    --eval '(ql:quickload "ota-admin/tests" :silent t)' \
+	    --eval '(asdf:test-system "ota-admin")'
+
 go-lint:
 	cd client && $(GO) vet ./...
 
@@ -155,7 +169,7 @@ fuzz:
 	cd client && $(GO) test -run=- -fuzz=FuzzApply    -fuzztime=$(FUZZTIME) ./internal/patch/
 
 test: test-unit
-test-unit: lisp-check lisp-test go-test
+test-unit: lisp-check lisp-test lisp-test-admin go-test
 
 # ---------- documentation ----------
 # Generate PDFs from .org sources. Two backends:
@@ -218,6 +232,47 @@ e2e-recovery:
 run-server: build-server
 	$(SBCL) --core $(SERVER_BUILD_DIR)/ota-server.core \
 	    --eval '(ota-server:main :config "server/etc/ota.dev.toml")'
+
+# ---------- ota-admin convenience targets ----------
+# Publish a new release. Required: DIR, SOFTWARE, VERSION, OS, ARCH.
+# Optional: OS_VERSIONS (comma-separated), CLASSIFICATIONS, SERVER (URL).
+# OTA_SERVER and OTA_ADMIN_TOKEN env vars are honoured by the binary.
+#
+# Example:
+#   OTA_ADMIN_TOKEN=dev-token \
+#     make publish DIR=./examples/hello SOFTWARE=hello \
+#                  VERSION=1.0.0 OS=darwin ARCH=arm64
+publish:
+	@test -x $(ADMIN_BUILD_DIR)/ota-admin || $(MAKE) build-admin
+	@test -n "$(DIR)"      || { echo "publish: DIR=... required"      >&2; exit 2; }
+	@test -n "$(SOFTWARE)" || { echo "publish: SOFTWARE=... required" >&2; exit 2; }
+	@test -n "$(VERSION)"  || { echo "publish: VERSION=... required"  >&2; exit 2; }
+	@test -n "$(OS)"       || { echo "publish: OS=... required"       >&2; exit 2; }
+	@test -n "$(ARCH)"     || { echo "publish: ARCH=... required"     >&2; exit 2; }
+	$(ADMIN_BUILD_DIR)/ota-admin publish "$(DIR)" \
+	    --software=$(SOFTWARE) \
+	    --version=$(VERSION) \
+	    --os=$(OS) --arch=$(ARCH) \
+	    $(if $(OS_VERSIONS),--os-versions=$(OS_VERSIONS),) \
+	    $(if $(CLASSIFICATIONS),--classifications=$(CLASSIFICATIONS),) \
+	    $(if $(SERVER),--server=$(SERVER),)
+
+# Mint install tokens in bulk from a CSV. Required: CSV.
+# Optional: CLASSIFICATIONS (comma-separated), TTL ("7d", "3h"…),
+# OUTPUT (default tokens.tsv), SERVER.
+#
+# Example:
+#   OTA_ADMIN_TOKEN=dev-token \
+#     make mint-tokens CSV=users.csv CLASSIFICATIONS=stable TTL=7d
+mint-tokens:
+	@test -x $(ADMIN_BUILD_DIR)/ota-admin || $(MAKE) build-admin
+	@test -n "$(CSV)" || { echo "mint-tokens: CSV=... required" >&2; exit 2; }
+	$(ADMIN_BUILD_DIR)/ota-admin mint-tokens \
+	    --csv="$(CSV)" \
+	    $(if $(CLASSIFICATIONS),--classifications=$(CLASSIFICATIONS),) \
+	    $(if $(TTL),--ttl=$(TTL),) \
+	    $(if $(OUTPUT),--output=$(OUTPUT),) \
+	    $(if $(SERVER),--server=$(SERVER),)
 
 # ---------- distribution tarball ----------
 # Bundle the SBCL core, vendored bsdiff/bspatch helpers, the sample
