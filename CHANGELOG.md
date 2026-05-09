@@ -20,6 +20,20 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Fixed
+- **`ota-admin publish` no longer times out client-side while the
+  server is still processing.** Dexador's default
+  `*default-read-timeout*` is **10 seconds** — far too short for a
+  publish whose synchronous bsdiff pass against prior releases
+  routinely takes longer. The client closed its socket, the
+  server kept working, and the 201 arrived at a half-closed
+  connection. `ota-admin` now passes a generous read-timeout
+  (default 600 s) and connect-timeout (default 30 s) to every
+  HTTP call, both tunable via env-vars `OTA_ADMIN_READ_TIMEOUT`
+  and `OTA_ADMIN_CONNECT_TIMEOUT` (seconds, integer; `0` disables
+  the deadline). Surfaces SBCL's `IO-TIMEOUT` condition with a
+  pointed message about bumping the timeout and re-running (the
+  publish handler is idempotent on `(software, os, arch,
+  version)` so a re-run after a client-side timeout is safe).
 - **Multi-worker HTTP serving — long publishes no longer wedge
   the server.** Woo had been booted in single-threaded mode, so
   the synchronous bsdiff patch build inside the publish handler

@@ -195,6 +195,82 @@ original error propagates verbatim."
   (is (null (friendlier-by-class 'some-totally-unrelated-error
                                  "http://x.example.com"))))
 
+;; ---------------------------------------------------------------------------
+;; Read-timeout (SBCL io-timeout) — a publish whose bsdiff outlasted
+;; the client's read deadline.  This is the v1.0.4 motivating case
+;; for *default-read-timeout* being bumped from 10s to 600s.
+;; ---------------------------------------------------------------------------
+
+(test io-timeout-message-is-rewritten
+  "The raw SBCL message 'I/O timeout while doing input on ...'
+gets rewritten with a hint pointing at OTA_ADMIN_READ_TIMEOUT."
+  (let ((m (friendlier
+            "I/O timeout while doing input on #<SB-SYS:FD-STREAM ...>"
+            "http://127.0.0.1:8443/v1/admin/software/x/releases")))
+    (is (stringp m))
+    (is (search "I/O timeout"               m))
+    (is (search "OTA_ADMIN_READ_TIMEOUT"    m))
+    (is (search "still processing"          m))
+    ;; The hint MUST mention the URL so the operator knows which
+    ;; server they were talking to.
+    (is (search "127.0.0.1:8443"            m))))
+
+(define-condition fake-io-timeout-error (error) ())
+(define-condition fake-deadline-timeout-error (error) ())
+
+(test io-timeout-class-dispatch
+  "Even when the printed message is opaque (the underlying condition
+class name contains IO-TIMEOUT or DEADLINE-TIMEOUT), we still
+recognise it."
+  (dolist (class '(fake-io-timeout-error fake-deadline-timeout-error))
+    (let ((m (friendlier-by-class class
+                                  "http://127.0.0.1:8443/v1/admin/x")))
+      (is (stringp m) "class ~A: expected friendly text" class)
+      (is (search "OTA_ADMIN_READ_TIMEOUT" m)))))
+
+;; ---------------------------------------------------------------------------
+;; Timeout-resolution helper.
+;; ---------------------------------------------------------------------------
+
+(test resolve-timeout-from-env
+  "%resolve-timeout reads an integer second-count from the env, with
+sane behaviour for unset / empty / 0 / non-integer values."
+  (let ((env (make-hash-table :test 'equal))
+        (orig-getenv (symbol-function 'uiop:getenv)))
+    ;; Drive uiop:getenv from the hash table for the duration of
+    ;; the test.  Keep it scoped: setf-fdefinition is reverted on
+    ;; the way out via UNWIND-PROTECT.
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'uiop:getenv)
+                 (lambda (name) (gethash name env)))
+           ;; Unset → fallback.
+           (is (= 600 (ota-admin::%resolve-timeout
+                       "OTA_ADMIN_READ_TIMEOUT" 600)))
+           ;; Empty string → fallback.
+           (setf (gethash "OTA_ADMIN_READ_TIMEOUT" env) "")
+           (is (= 600 (ota-admin::%resolve-timeout
+                       "OTA_ADMIN_READ_TIMEOUT" 600)))
+           ;; "0" → NIL (no deadline).
+           (setf (gethash "OTA_ADMIN_READ_TIMEOUT" env) "0")
+           (is (null (ota-admin::%resolve-timeout
+                      "OTA_ADMIN_READ_TIMEOUT" 600)))
+           ;; "120" → 120.
+           (setf (gethash "OTA_ADMIN_READ_TIMEOUT" env) "120")
+           (is (= 120 (ota-admin::%resolve-timeout
+                       "OTA_ADMIN_READ_TIMEOUT" 600)))
+           ;; junk → fallback.
+           (setf (gethash "OTA_ADMIN_READ_TIMEOUT" env) "not-a-number")
+           (is (= 600 (ota-admin::%resolve-timeout
+                       "OTA_ADMIN_READ_TIMEOUT" 600))))
+      (setf (symbol-function 'uiop:getenv) orig-getenv))))
+
+(test default-read-timeout-is-not-the-dexador-default
+  "+DEFAULT-READ-TIMEOUT-SECONDS+ must be much larger than dexador's
+own default (10s) — that's the whole point of this layer."
+  (is (> ota-admin::+default-read-timeout-seconds+ 60)
+      "expected > 60s, got ~A" ota-admin::+default-read-timeout-seconds+))
+
 (test scheme-swap
   (is (string= "http://x.example.com/y"
                (ota-admin::%swap-scheme "https://x.example.com/y" "http")))

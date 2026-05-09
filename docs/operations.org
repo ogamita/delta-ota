@@ -252,6 +252,40 @@ If unset, =ota-admin publish= and =ota-admin mint-tokens= refuse to
 proceed with =ota-admin: ota-admin publish: OTA_ADMIN_TOKEN env var
 or :token argument required=.
 
+** Timeouts (=OTA_ADMIN_READ_TIMEOUT=, =OTA_ADMIN_CONNECT_TIMEOUT=)
+
+A =publish= triggers a synchronous bsdiff pass on the server: one
+patch from every prior release of the same =(software, os, arch)=
+to the new one.  For a multi-megabyte blob each patch takes a few
+seconds; for a multi-gigabyte blob each can take minutes.  The
+=ota-admin= HTTP client must wait for the server to finish before
+the 201 response arrives.
+
+Default deadlines (seconds):
+
+| Variable                     | Default | =0= means       |
+|------------------------------+---------+-----------------|
+| =OTA_ADMIN_READ_TIMEOUT=     | 600     | no read deadline |
+| =OTA_ADMIN_CONNECT_TIMEOUT=  | 30      | no connect deadline |
+
+If a =publish= fails with =I/O timeout while reading the response
+from URL=, bump =OTA_ADMIN_READ_TIMEOUT= and re-run.  The server's
+publish handler is idempotent on the =(software, os, arch,
+version)= tuple — a duplicate publish whose first attempt actually
+landed on the server (which is what client-side timeouts mean) is
+dropped on retry.
+
+#+begin_src sh
+# 30-minute deadline for a 4 GiB blob with many priors.
+OTA_ADMIN_READ_TIMEOUT=1800 \
+  make publish DIR=./build/release SOFTWARE=schms VERSION=3.4.1 \
+               OS=windows ARCH=x86_64
+
+# No deadline at all (useful when piping through a slow VPN).
+OTA_ADMIN_READ_TIMEOUT=0 \
+  admin/build/ota-admin publish ...
+#+end_src
+
 ** Generating and rotating the token
 
 Generate a fresh token (32 bytes, hex) on the server host:

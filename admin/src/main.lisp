@@ -106,6 +106,24 @@ or NIL when we have nothing better to say than the raw message."
                "could not connect to ~A: connection refused. Is the server ~
                 running and listening on that host:port?"
                url))
+      ;; Read deadline elapsed.  This is by far the most likely
+      ;; cause of a publish failure once the server is up: the
+      ;; bsdiff pass on the server side outlasted the client's
+      ;; read-timeout.  The server keeps working; the 201 just
+      ;; arrives at a half-closed socket.
+      ((or (search "I/O timeout"        msg)
+           (search "IO-TIMEOUT"         cls)
+           (search "DEADLINE-TIMEOUT"   cls))
+       (format nil
+               "I/O timeout while reading the response from ~A — the ~
+                server is probably still processing the request ~
+                (a publish triggers a bsdiff against every prior ~
+                release; multi-MiB blobs can take minutes).~%~
+                Bump OTA_ADMIN_READ_TIMEOUT (seconds; 0 = no ~
+                deadline) and re-run.  The server will idempotently ~
+                drop a duplicate publish if the previous one ~
+                already landed."
+               url))
       ;; Any remaining usocket error is almost certainly some other
       ;; transport-level problem (timeout, EINVAL on a privileged port,
       ;; routing failure, …).  Don't try to guess the cause -- just say
@@ -119,15 +137,46 @@ or NIL when we have nothing better to say than the raw message."
                url cls))
       (t nil))))
 
+;; Dexador's default read-timeout is 10 seconds.  An ota-admin publish
+;; against a server that has to bsdiff a multi-megabyte (or
+;; multi-gigabyte) blob will routinely take longer than that, so we
+;; bump the default to 10 minutes.  Operators can tune via
+;; OTA_ADMIN_READ_TIMEOUT (seconds, integer; or 0 for no timeout).
+(defparameter +default-read-timeout-seconds+    600)
+(defparameter +default-connect-timeout-seconds+  30)
+
+(defun %resolve-timeout (env-name fallback)
+  "Read an integer-second timeout from ENV-NAME; fall back to FALLBACK
+when the var is unset or empty.  A value of 0 means \"no deadline\"
+and is converted to NIL for dexador."
+  (let ((v (uiop:getenv env-name)))
+    (cond
+      ((or (null v) (zerop (length v))) fallback)
+      (t (let ((n (parse-integer v :junk-allowed t)))
+           (cond
+             ((null n) fallback)
+             ((zerop n) nil)
+             (t n)))))))
+
 (defun %post (url &rest args)
   "Like DEXADOR:POST but rewrites known TLS / connection errors into
-clearer one-line messages.  Other errors propagate unchanged."
-  (handler-case (apply #'dexador:post url args)
-    (error (c)
-      (let ((friendly (%friendlier-message c url)))
-        (if friendly
-            (error friendly)
-            (error c))))))
+clearer one-line messages, and bumps the read/connect timeouts to
+sane values for slow admin operations (publish triggers a bsdiff
+pass that can take minutes).  Other errors propagate unchanged."
+  (let ((rt (%resolve-timeout "OTA_ADMIN_READ_TIMEOUT"
+                              +default-read-timeout-seconds+))
+        (ct (%resolve-timeout "OTA_ADMIN_CONNECT_TIMEOUT"
+                              +default-connect-timeout-seconds+)))
+    (handler-case
+        (apply #'dexador:post url
+               :read-timeout    rt
+               :connect-timeout ct
+               args)
+      (error (c)
+        (let ((friendly (%friendlier-message c url)))
+          (if friendly
+              (error friendly)
+              (error c)))))))
 
 (defun publish (&key dir software version os arch
                      (server "http://127.0.0.1:8080")
