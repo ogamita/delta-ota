@@ -619,6 +619,20 @@ that are not wired up; today they print
   current and (= --archive-depth) most recent for revert.  Frees
   disk on long-lived clients.  Ship target: v1.0.x.
 
+** Catalogue semantics
+
+- [ ] *Semver-aware "latest" sort.*  The server's
+  =GET /v1/software/<sw>/releases/latest= sorts by
+  =published_at DESC=, so a hotfix published to an older version
+  after a newer one is already out becomes "latest" until you
+  publish something newer.  This trips operators who don't
+  publish strictly monotonically (see operations.org § End-user
+  inspection commands).  Fix is a small Lisp semver comparator
+  in =ota-server.catalogue= + a =get-highest-version-release=
+  helper, plus a route choice (probably keep =latest= meaning
+  "most recent" and add =highest= as an alternative).  Ship
+  target: v1.2.
+
 ** ota-server — incomplete subcommands and gaps
 
 - [ ] *=ota-server gc= CLI subcommand is a stub*

@@ -19,6 +19,36 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Changed
+- **`ota-agent list --remote` now shows every release**, not just
+  the per-software latest. This is the "I can't see my four
+  releases" fix surfaced during v1.1.0 testing — operators got
+  one row per software product, with `LATEST` populated by the
+  server's `/releases/latest` endpoint, instead of one row per
+  (software, version). The new default does one
+  `GET /v1/software` + one `GET /releases` per software, then
+  prints `SOFTWARE / VERSION / OS-ARCH / BLOB / FLAGS /
+  PUBLISHED`. **Add `--latest` to opt back into the v1.1.0-rc
+  per-software view** (one row per software with latest version
+  + display name + created-at).
+- New `transport.Client.ListReleases(ctx, software)` wrapping
+  `GET /v1/software/<sw>/releases`.
+
+### Fixed
+- **Server log: "patchs" → "patches".** The progress line
+  introduced in v1.0.4 used CL's `~:P` directive, which only
+  knows the English "+s" rule, not the "-ches" exception. Spelt
+  the noun out via an `if`.
+
+### Documentation
+- **operations.org § End-user inspection commands** now flags the
+  "latest = published_at DESC" footgun: a hotfix published to an
+  older version after a newer one is already out becomes
+  "latest". Workarounds (zero-padded version strings, explicit
+  `--version`) are listed; the proper semver-aware sort is a
+  v1.2 backlog item (added to `docs/ota-implementation-plan.org`
+  § Post-1.0 backlog § Catalogue semantics).
+
 ### Added
 - **`ota-agent` gains four subcommands previously stubbed as
   "not implemented yet":**

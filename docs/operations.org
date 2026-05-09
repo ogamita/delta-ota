@@ -411,7 +411,7 @@ run against their own =$OTA_HOME= without involving the server
 | Command                              | What it does                                                                               |
 |-------------------------------------+--------------------------------------------------------------------------------------------|
 | =ota-agent list=                     | Table of every software installed under =$OTA_HOME=: current / previous / on-disk size / server URL |
-| =ota-agent list --remote --server URL= | Table of every software the server has on offer + its latest version                     |
+| =ota-agent list --remote --server URL= | Every release (one row per (software, version) pair) on the server.  Add =--latest= for one row per software with its latest version. |
 | =ota-agent show <name>=              | Per-software details: versions, server URL, last-updated, every =distribution-*= directory (=*= active, =p= previous) |
 | =ota-agent verify <name>=            | Two-phase integrity check: state file + current symlink + distribution dir, then signed manifest fetch + on-disk blob SHA-256 vs manifest |
 | =ota-agent verify <name> --offline=  | Skip the network phase (no manifest fetch)                                                 |
@@ -424,6 +424,22 @@ do not require =OTA_ADMIN_TOKEN=.
 
 For unattended dashboards / orchestration, every command exits
 non-zero on failure and writes its data to stdout.
+
+*Footgun:* the server's "latest release" endpoint
+(=GET /v1/software/<sw>/releases/latest=, used by
+=list --remote --latest= and by =ota-agent install/upgrade= when
+no explicit =--version= is given) sorts by =published_at DESC=,
+*not* by version-number ordering.  If you publish a hotfix to an
+older version after a newer one is already out, that hotfix
+becomes "latest" until you publish anything newer.  Workarounds:
+
+  - Use zero-padded version strings (=01.02.03=) so lexical and
+    semver order coincide; or
+  - Mark the wanted release as the active one explicitly
+    (=ota-agent install <sw> --version=X=); or
+  - Avoid out-of-order publishes for monotonic series.
+
+A semver-aware "latest" sort is a v1.2 backlog item.
 
 ** Garbage-collect old releases
 

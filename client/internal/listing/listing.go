@@ -169,9 +169,10 @@ func totalBytes(root string) int64 {
 	return total
 }
 
-// RemoteEntry summarises one row of the server's catalogue, optionally
-// with the latest release's version number filled in.
-type RemoteEntry struct {
+// RemoteSoftware summarises one row of GET /v1/software with the
+// latest release's version filled in.  Used by
+// `ota-agent list --remote --latest`.
+type RemoteSoftware struct {
 	Name          string
 	DisplayName   string
 	CreatedAt     string
@@ -179,18 +180,33 @@ type RemoteEntry struct {
 	LatestErr     error  // populated when the per-software latest fetch failed
 }
 
-// ListRemote calls GET /v1/software, then for each entry calls
-// /releases/latest to fill in LatestVersion.  Per-software fetch
-// failures don't fail the whole listing -- they're surfaced via
-// LatestErr on the affected row.
-func ListRemote(ctx context.Context, tr *transport.Client) ([]RemoteEntry, error) {
+// RemoteRelease is one row of GET /v1/software/<sw>/releases — every
+// version of every software product on the server.  Used by
+// `ota-agent list --remote` (the default flatter view, one row per
+// release).
+type RemoteRelease struct {
+	Software      string
+	Version       string
+	OS            string
+	Arch          string
+	BlobSize      int64
+	PublishedAt   string
+	Deprecated    bool
+	Uncollectable bool
+}
+
+// ListRemoteSoftware calls GET /v1/software, then for each entry
+// calls /releases/latest to fill in LatestVersion.  Per-software
+// fetch failures don't fail the whole listing -- they're surfaced
+// via LatestErr on the affected row.
+func ListRemoteSoftware(ctx context.Context, tr *transport.Client) ([]RemoteSoftware, error) {
 	sws, err := tr.ListSoftware(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]RemoteEntry, 0, len(sws))
+	out := make([]RemoteSoftware, 0, len(sws))
 	for _, sw := range sws {
-		re := RemoteEntry{
+		re := RemoteSoftware{
 			Name:        sw.Name,
 			DisplayName: sw.DisplayName,
 			CreatedAt:   sw.CreatedAt,
@@ -209,6 +225,52 @@ func ListRemote(ctx context.Context, tr *transport.Client) ([]RemoteEntry, error
 		}
 		out = append(out, re)
 	}
+	return out, nil
+}
+
+// ListRemoteReleases calls GET /v1/software, then for each software
+// calls /releases (the full per-software release list).  Returns one
+// row per (software, version) pair, sorted by software then by
+// published_at (newest first).
+func ListRemoteReleases(ctx context.Context, tr *transport.Client) ([]RemoteRelease, error) {
+	sws, err := tr.ListSoftware(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []RemoteRelease
+	for _, sw := range sws {
+		rels, err := tr.ListReleases(ctx, sw.Name)
+		if err != nil {
+			// Soft-fail: skip this software, surface in subsequent
+			// rows as a single placeholder entry so the operator
+			// sees the gap.
+			out = append(out, RemoteRelease{
+				Software: sw.Name,
+				Version:  "(error: " + err.Error() + ")",
+			})
+			continue
+		}
+		for _, r := range rels {
+			out = append(out, RemoteRelease{
+				Software:      r.Software,
+				Version:       r.Version,
+				OS:            r.OS,
+				Arch:          r.Arch,
+				BlobSize:      r.BlobSize,
+				PublishedAt:   r.PublishedAt,
+				Deprecated:    r.Deprecated,
+				Uncollectable: r.Uncollectable,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Software != out[j].Software {
+			return out[i].Software < out[j].Software
+		}
+		// Within one software, newest publish first (server already
+		// returned in this order; sort here for stability).
+		return out[i].PublishedAt > out[j].PublishedAt
+	})
 	return out, nil
 }
 

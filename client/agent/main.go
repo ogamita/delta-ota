@@ -387,6 +387,8 @@ func listCmd(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	remote := fs.Bool("remote", false, "list software offered by the server")
 	local := fs.Bool("local", false, "list software installed locally (default)")
+	latest := fs.Bool("latest", false,
+		"with --remote: show one row per software with its latest version (default: show every release)")
 	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL (with --remote)")
 	_ = fs.Parse(args)
 
@@ -430,28 +432,63 @@ func listCmd(args []string) {
 	tr := transport.New(strings.TrimRight(*srv, "/"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	rems, err := listing.ListRemote(ctx, tr)
+
+	if *latest {
+		// One row per software, with the most-recently-published version.
+		rems, err := listing.ListRemoteSoftware(ctx, tr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list --remote --latest: %v\n", err)
+			os.Exit(1)
+		}
+		if len(rems) == 0 {
+			fmt.Printf("(server %s has no software in its catalogue)\n", *srv)
+			return
+		}
+		fmt.Printf("%-24s %-12s %-30s %s\n",
+			"SOFTWARE", "LATEST", "DISPLAY NAME", "CREATED")
+		for _, r := range rems {
+			ver := r.LatestVersion
+			if ver == "" {
+				if r.LatestErr != nil {
+					ver = "(no release)"
+				} else {
+					ver = "(none)"
+				}
+			}
+			fmt.Printf("%-24s %-12s %-30s %s\n",
+				r.Name, ver, r.DisplayName, r.CreatedAt)
+		}
+		return
+	}
+
+	// Default --remote view: every release of every software.
+	rels, err := listing.ListRemoteReleases(ctx, tr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list --remote: %v\n", err)
 		os.Exit(1)
 	}
-	if len(rems) == 0 {
-		fmt.Printf("(server %s has no software in its catalogue)\n", *srv)
+	if len(rels) == 0 {
+		fmt.Printf("(server %s has no releases in its catalogue)\n", *srv)
 		return
 	}
-	fmt.Printf("%-24s %-12s %-30s %s\n",
-		"SOFTWARE", "LATEST", "DISPLAY NAME", "CREATED")
-	for _, r := range rems {
-		ver := r.LatestVersion
-		if ver == "" {
-			if r.LatestErr != nil {
-				ver = "(no release)"
-			} else {
-				ver = "(none)"
-			}
+	fmt.Printf("%-24s %-12s %-12s %-10s %-12s %s\n",
+		"SOFTWARE", "VERSION", "OS-ARCH", "BLOB", "FLAGS", "PUBLISHED")
+	for _, r := range rels {
+		flags := ""
+		if r.Deprecated {
+			flags += "deprecated "
 		}
-		fmt.Printf("%-24s %-12s %-30s %s\n",
-			r.Name, ver, r.DisplayName, r.CreatedAt)
+		if r.Uncollectable {
+			flags += "uncollectable "
+		}
+		flags = strings.TrimSpace(flags)
+		fmt.Printf("%-24s %-12s %-12s %-10s %-12s %s\n",
+			r.Software,
+			r.Version,
+			r.OS+"-"+r.Arch,
+			humanBytes(r.BlobSize),
+			orDash(flags),
+			r.PublishedAt)
 	}
 }
 
