@@ -19,6 +19,10 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.0.4] - 2026-05-09
+
 ### Fixed
 - **`publish` is now idempotent on `(software, os, arch, version)`
   — duplicate publishes no longer crash the server with `500
