@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# systemd unit for the single-host install of ota-server unpacked
+# from delta-ota-server-X.Y.Z.tar.gz under /opt/ota.
+#
+# Install:
+#   sudo install -m 0644 /opt/ota/etc/ota-server.service \
+#                        /etc/systemd/system/ota-server.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ota-server
+#
+# This unit is intended for evaluation / debugging hosts. Production
+# deployments should use the published container image and the
+# orchestrator's own unit / manifest — see docs/operations.org.
+
+[Unit]
+Description=Ogamita Delta OTA server
+Documentation=https://gitlab.com/ogamita/delta-ota
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ota
+Group=ota
+
+EnvironmentFile=-/etc/ota/environment
+Environment=OTA_ROOT=/var/lib/ota
+Environment=OTA_CONFIG=/etc/ota/ota.toml
+Environment=OTA_BSDIFF=/opt/ota/bin/bsdiff
+Environment=OTA_BSPATCH=/opt/ota/bin/bspatch
+
+ExecStart=/opt/ota/libexec/ota-entrypoint serve
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Hardening — keep in step with docker/Dockerfile.server.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ota /etc/ota
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# SBCL needs writable+executable pages for code generation, so
+# MemoryDenyWriteExecute=yes would crash the daemon at startup.
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,39 @@ C ABI) follow these compatibility commitments:
 
 Nothing yet.
 
+## [1.0.1] - 2026-05-09
+
+Operations release. No changes to the public contracts (HTTP/JSON
+API, manifest schema, libota C ABI, state.json).
+
+### Added
+- **Single-host install tarball** for evaluation, debugging, and
+  air-gapped deployments: `make dist-server` produces
+  `build/dist/delta-ota-server-X.Y.Z.tar.gz`, containing the SBCL
+  core, vendored `bsdiff`/`bspatch` helpers, sample config, systemd
+  unit, and a thin entrypoint wrapper shared with the Docker image.
+  The tarball is built by CI on `master` and tags but is *not*
+  attached to GitLab/GitHub Releases — production deployments
+  continue to use the published container image.
+- `server/etc/ota.toml.sample` — sample configuration for the host
+  install (localhost-by-default, sqlite, fs storage).
+- `server/etc/ota-server.service` — systemd unit for the host
+  install, with the same hardening posture as the container.
+- GitLab CI `dist-server` job (stage `package`, 30-day artefact).
+- GitHub Actions `dist-server` workflow job mirroring the GitLab
+  one (workflow artefact only, on tag).
+
+### Changed
+- `docs/operations.org` quick-start split into "container image
+  (canonical)" and "single-host tarball (debug / test /
+  evaluation)" — the previous quick-start documented an install
+  procedure for an artefact that was never built.
+
+### Fixed
+- `admin/build.lisp` now registers `server/` with Quicklisp's
+  local-projects so the admin core can resolve the `ota-server`
+  ASDF system without manual setup.
+
 ## [1.0.0] - 2026-05-01
 
 The 1.0 cut. Public contracts (HTTP/JSON API, manifest schema,

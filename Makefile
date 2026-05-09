@@ -21,6 +21,11 @@ BUILD_DIR        := build
 SERVER_BUILD_DIR := server/build
 ADMIN_BUILD_DIR  := admin/build
 CLIENT_BUILD_DIR := client/build
+DIST_DIR         := build/dist
+
+# Version stamp for distribution tarballs. Override on the command line
+# or in CI (GITLAB: CI_COMMIT_TAG; GITHUB: GITHUB_REF_NAME).
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 GOOS   ?= $(shell $(GO) env GOOS)
 GOARCH ?= $(shell $(GO) env GOARCH)
@@ -31,6 +36,7 @@ GOARCH ?= $(shell $(GO) env GOARCH)
         lisp-check go-lint go-test \
         test-unit e2e \
         run-server \
+        dist-server \
         clean
 
 all: build
@@ -48,6 +54,7 @@ help:
 	@echo "  make test-unit       same as test"
 	@echo "  make e2e             docker-compose end-to-end test"
 	@echo "  make run-server      start ota-server locally"
+	@echo "  make dist-server     build delta-ota-server-VERSION.tar.gz (debug/test/eval install)"
 	@echo "  make clean           remove build artefacts"
 
 setup:
@@ -211,7 +218,34 @@ run-server: build-server
 	$(SBCL) --core $(SERVER_BUILD_DIR)/ota-server.core \
 	    --eval '(ota-server:main :config "server/etc/ota.dev.toml")'
 
+# ---------- distribution tarball ----------
+# Bundle the SBCL core, vendored bsdiff/bspatch helpers, the sample
+# config, the systemd unit, and the entrypoint wrapper into a single
+# self-contained tarball: build/dist/delta-ota-server-$(VERSION).tar.gz
+#
+# This artefact exists for evaluation, debugging, and air-gapped
+# single-host installs. Production deployments use the published
+# container image (registry.gitlab.com/ogamita/delta-ota/server) —
+# the tarball is *not* attached to GitLab/GitHub Releases.
+DIST_STAGE := $(DIST_DIR)/delta-ota-server-$(VERSION)
+
+dist-server: build-server vendor-build
+	@rm -rf $(DIST_STAGE) $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz
+	@mkdir -p $(DIST_STAGE)/bin $(DIST_STAGE)/etc $(DIST_STAGE)/libexec
+	cp $(SERVER_BUILD_DIR)/ota-server.core   $(DIST_STAGE)/
+	cp $(SERVER_BUILD_DIR)/bin/bsdiff        $(DIST_STAGE)/bin/
+	cp $(SERVER_BUILD_DIR)/bin/bspatch       $(DIST_STAGE)/bin/
+	cp server/etc/ota.toml.sample            $(DIST_STAGE)/etc/
+	cp server/etc/ota-server.service         $(DIST_STAGE)/etc/
+	cp docker/entrypoint.sh                  $(DIST_STAGE)/libexec/ota-entrypoint
+	chmod 0755                               $(DIST_STAGE)/libexec/ota-entrypoint
+	cp LICENSE README.md CHANGELOG.md        $(DIST_STAGE)/
+	@echo $(VERSION) > $(DIST_STAGE)/VERSION
+	tar -C $(DIST_DIR) -czf $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz \
+	    delta-ota-server-$(VERSION)
+	@echo "dist-server: wrote $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz"
+
 # ---------- clean ----------
 clean:
-	rm -rf $(BUILD_DIR) $(SERVER_BUILD_DIR) $(ADMIN_BUILD_DIR) $(CLIENT_BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(SERVER_BUILD_DIR) $(ADMIN_BUILD_DIR) $(CLIENT_BUILD_DIR) $(DIST_DIR)
 	-find . -name '*.fasl' -delete

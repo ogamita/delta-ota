@@ -17,6 +17,7 @@
     (force-output)
     (load setup)))
 
+(pushnew (truename #P"server/") ql:*local-project-directories*)
 (asdf:load-asd (truename "admin/ota-admin.asd"))
 
 (if (find-package :ql)

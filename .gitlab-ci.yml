@@ -287,6 +287,33 @@ release-bundle:
   rules:
     - if: '$CI_COMMIT_TAG'
 
+# Single-host install tarball (debug / test / evaluation only).
+# Bundles the SBCL core, vendored helpers, sample config, systemd
+# unit, and entrypoint wrapper into delta-ota-server-${VERSION}.tar.gz.
+# This artefact is intentionally NOT attached to the GitLab Release
+# (production deployments use the container image below).
+dist-server:
+  stage: package
+  image: $DEV_IMAGE
+  needs:
+    - job: build-dev-image
+      optional: true
+    - job: build-server
+      artifacts: true
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git tar gzip || true
+  script:
+    - make vendor-build
+    - make dist-server VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+    - ls -la build/dist/
+  artifacts:
+    paths:
+      - build/dist/delta-ota-server-*.tar.gz
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
 build-server-image:
   stage: package
   image: docker:26
@@ -336,8 +363,13 @@ release:
     description: |
       See [CHANGELOG.md](CHANGELOG.md) for the changes in ${CI_COMMIT_TAG}.
 
-      ## Container image
+      ## Container image (canonical for the server)
       - `registry.gitlab.com/ogamita/delta-ota/server:${CI_COMMIT_TAG}` (linux/amd64 + linux/arm64)
+
+      The single-host install tarball produced by the `dist-server`
+      job is **not** attached as a release asset — it is for
+      debugging, test, and evaluation only. Pull it from the
+      pipeline artefacts of this tag if you need it.
 
       ## Documentation
       - [Datasheet](docs/delta-ota-datasheet.org)

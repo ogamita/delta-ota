@@ -32,19 +32,66 @@ selected in =ota.toml= via the =[storage]= and =[catalogue]= sections.
 - For PostgreSQL topology: PG ≥ 14; the catalogue migrations are
   applied automatically on first boot.
 
-** Quick start — single host
+** Quick start — container image (canonical)
+
+The server is shipped as a multi-arch container image
+(=linux/amd64 + linux/arm64=).  This is the supported production
+deployment for both the single-host and Kubernetes topologies.
 
 #+begin_src sh
-# 1. unpack the release tarball
-sudo mkdir -p /opt/ota /var/lib/ota /etc/ota
-sudo tar -C /opt/ota -xzf delta-ota-server-X.Y.Z.tar.gz
+# 1. pull the tagged image (replace X.Y.Z with the released version)
+docker pull registry.gitlab.com/ogamita/delta-ota/server:vX.Y.Z
 
-# 2. drop in a config
-sudo install -m 0640 etc/ota.toml.sample /etc/ota/ota.toml
+# 2. prepare the host
+sudo mkdir -p /var/lib/ota /etc/ota
+sudo install -m 0640 /dev/null /etc/ota/ota.toml
 sudoedit /etc/ota/ota.toml             # set admin_token, hostname
 
-# 3. systemd
-sudo install -m 0644 etc/ota-server.service /etc/systemd/system/
+# 3. run
+docker run -d --name ota-server                            \
+    -p 8443:8443                                           \
+    -v /var/lib/ota:/var/lib/ota                           \
+    -v /etc/ota:/etc/ota                                   \
+    --restart unless-stopped                               \
+    registry.gitlab.com/ogamita/delta-ota/server:vX.Y.Z
+#+end_src
+
+For Kubernetes, point the container at PostgreSQL and S3 in
+=ota.toml= and let the orchestrator manage scheduling — the same
+image serves both topologies.
+
+** Quick start — single-host tarball (debug / test / evaluation)
+
+The =dist-server= job in CI also produces an unpacked tarball,
+=delta-ota-server-X.Y.Z.tar.gz=, that installs to =/opt/ota= and
+runs under systemd.  This path exists for evaluation, debugging,
+and air-gapped hosts where running a container is inconvenient.
+It is *not* attached to the GitLab/GitHub Release — pull it from
+the pipeline artefacts of the tag you want.
+
+The tarball requires =sbcl=, =libev4=, =libssl3=, and =libsqlite3-0=
+to be installed on the host (Debian package names).
+
+#+begin_src sh
+# 1. unpack
+sudo mkdir -p /opt/ota /var/lib/ota /etc/ota
+sudo tar -C /opt/ota --strip-components=1 -xzf delta-ota-server-X.Y.Z.tar.gz
+
+# 2. user + permissions
+sudo groupadd --system ota || true
+sudo useradd  --system --gid ota --home-dir /var/lib/ota \
+              --shell /usr/sbin/nologin ota || true
+sudo chown -R ota:ota /var/lib/ota /etc/ota
+
+# 3. drop in a config
+sudo install -m 0640 -o ota -g ota \
+     /opt/ota/etc/ota.toml.sample /etc/ota/ota.toml
+sudoedit /etc/ota/ota.toml             # set admin_token, hostname, TLS
+
+# 4. systemd
+sudo install -m 0644 /opt/ota/etc/ota-server.service \
+     /etc/systemd/system/ota-server.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now ota-server
 #+end_src
 
