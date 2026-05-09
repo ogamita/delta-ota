@@ -19,7 +19,49 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Fixed
+- **Multi-worker HTTP serving — long publishes no longer wedge
+  the server.** Woo had been booted in single-threaded mode, so
+  the synchronous bsdiff patch build inside the publish handler
+  blocked every concurrent request for the duration of the
+  build. A second `ota-admin` invocation (or any `ota-agent`
+  read) hitting the server during that window timed out with
+  `I/O timeout while doing input on …`. The server now starts
+  Woo with `:worker-num` (default 4, configurable via
+  `[server].worker_num`); each worker runs its own libev loop
+  and shares the listening socket via `accept(2)`, so a slow
+  handler on one thread never starves the others. Verified
+  end-to-end by `tests/e2e/parallel.sh` (`make e2e-parallel`):
+  50 concurrent reads against an `/v1/install/<sw>` endpoint
+  while a multi-megabyte publish + bsdiff is in flight, all
+  reads complete inside a 3 s per-request deadline.
+
+### Changed
+- **Catalogue is now thread-safe.** `OPEN-CATALOGUE` returns a
+  struct wrapping the cl-sqlite handle plus a
+  `bordeaux-threads:make-recursive-lock`; every catalogue
+  function holds the lock while inside the C library. SQLite is
+  also opened in WAL mode with a 10 s `busy_timeout` and
+  `synchronous=NORMAL`, so concurrent readers + one writer do
+  not block each other through the journal. The public catalogue
+  API is unchanged — callers pass the same value, only the
+  internal representation changed.
+- New `[server].worker_num` TOML key (default 4) — added to all
+  three sample configs (`ota.dev.toml`, `ota.docker.toml`,
+  `ota.toml.sample`) and documented in `docs/operations.org`
+  alongside a new "Concurrency model" section with sizing
+  guidance.
+
 ### Added
+- **`tests/e2e/parallel.sh`** — proves the multi-worker server
+  keeps reads responsive while a slow publish is in flight.
+  Wired into `make e2e` as `e2e-parallel`.
+- **10 new server unit tests** in
+  `server/tests/concurrency-tests.lisp`: catalogue struct shape,
+  WAL/busy-timeout settings, parallel reader+writer race against
+  a real catalogue, recursive-lock nested-call check, `worker-num`
+  default and TOML override. Server suite is now 109 checks
+  (was 99), all green.
 - **Friendly error messages for HTTP/TLS misconfiguration in
   `ota-admin`.** Previously, the most common operator
   bring-up mistakes (`https://` against a plain-HTTP server,

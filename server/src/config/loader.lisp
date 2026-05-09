@@ -22,6 +22,7 @@
         :hostname                   "localhost"
         :data-dir                   "./build/dev/ota-data"
         :log-level                  "info"
+        :worker-num                 4
         :admin-token                "dev-token"
         :tls-cert                   nil
         :tls-key                    nil
@@ -107,6 +108,8 @@ applied here — call APPLY-ENV-OVERRIDES on the result."
                                                (getf defaults :data-dir))
          :log-level                 (%toml-get server  "log_level"
                                                (getf defaults :log-level))
+         :worker-num                (%toml-get server  "worker_num"
+                                               (getf defaults :worker-num))
          :admin-token               (getf defaults :admin-token)
          :tls-cert                  (%toml-get tls     "cert")
          :tls-key                   (%toml-get tls     "key")

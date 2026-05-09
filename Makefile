@@ -219,7 +219,7 @@ $(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
 	    exit 1; \
 	fi
 
-e2e: e2e-install e2e-auth e2e-ops e2e-recovery
+e2e: e2e-install e2e-auth e2e-ops e2e-recovery e2e-parallel
 e2e-install:
 	tests/e2e/run.sh
 e2e-auth:
@@ -228,6 +228,8 @@ e2e-ops:
 	tests/e2e/ops.sh
 e2e-recovery:
 	tests/e2e/recovery.sh
+e2e-parallel:
+	tests/e2e/parallel.sh
 
 run-server:
 	@test -x $(SERVER_BUILD_DIR)/ota-server || $(MAKE) build-server

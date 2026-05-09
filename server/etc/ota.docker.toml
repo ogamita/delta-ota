@@ -5,10 +5,15 @@
 # Copied to /etc/ota/ota.toml on first boot if no config is mounted.
 
 [server]
-listen   = "0.0.0.0:8443"
-hostname = "ota.example.com"
-data_dir = "/var/lib/ota"
-log_level = "info"
+listen     = "0.0.0.0:8443"
+hostname   = "ota.example.com"
+data_dir   = "/var/lib/ota"
+log_level  = "info"
+# Number of Woo worker threads.  Each runs its own libev loop and
+# shares the listening socket; a slow handler on one worker does
+# not block requests on the others.  Tune to roughly the number of
+# cores you want serving HTTP, capped by your patcher.worker_count.
+worker_num = 8
 
 [tls]
 cert         = "/etc/ota/server.crt"

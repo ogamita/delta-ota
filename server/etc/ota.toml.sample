@@ -19,10 +19,16 @@
 # (nginx, HAProxy, …) and binds the server to localhost. To expose
 # the server directly on the public interface, configure [tls] below
 # and switch to "0.0.0.0:8443".
-listen    = "127.0.0.1:8443"
-hostname  = "ota.example.com"
-data_dir  = "/var/lib/ota"
-log_level = "info"
+listen     = "127.0.0.1:8443"
+hostname   = "ota.example.com"
+data_dir   = "/var/lib/ota"
+log_level  = "info"
+# Number of Woo worker threads.  Each runs its own libev loop and
+# shares the listening socket; one slow handler does not wedge the
+# others.  Set to roughly your CPU count for read-heavy traffic
+# (10k clients fetching manifests + sendfile blobs on first-Monday
+# upgrades).  Defaults to 4 when omitted.
+worker_num = 4
 
 [tls]
 # Uncomment when terminating TLS in the server itself (no proxy).

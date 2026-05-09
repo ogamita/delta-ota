@@ -93,8 +93,9 @@ harness)."
     (force-output)
     (let ((handler
             (ota-server.http:start-server state
-                                          :host (getf cfg :host)
-                                          :port (getf cfg :port))))
+                                          :host       (getf cfg :host)
+                                          :port       (getf cfg :port)
+                                          :worker-num (getf cfg :worker-num))))
       (format t "ota-server: ready.~%")
       (force-output)
       (handler-case

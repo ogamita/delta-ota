@@ -11,6 +11,7 @@
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
   :depends-on ("alexandria"
                "uiop"
+               "bordeaux-threads"
                "ironclad"
                "com.inuoe.jzon"
                "clop"
@@ -52,8 +53,9 @@
   :depends-on ("ota-server" "fiveam")
   :pathname "tests/"
   :components ((:file "package")
-               (:file "smoke"        :depends-on ("package"))
-               (:file "config-tests" :depends-on ("smoke"))
-               (:file "cli-smoke"    :depends-on ("smoke")))
+               (:file "smoke"             :depends-on ("package"))
+               (:file "config-tests"      :depends-on ("smoke"))
+               (:file "cli-smoke"         :depends-on ("smoke"))
+               (:file "concurrency-tests" :depends-on ("smoke")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))

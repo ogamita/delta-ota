@@ -142,6 +142,7 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 | =[server]=         | =hostname=      | =localhost=            | used in URLs/manifests |
 | =[server]=         | =data_dir=      | =/var/lib/ota=         | OTA root |
 | =[server]=         | =log_level=     | =info=                 | trace/debug/info/warn |
+| =[server]=         | =worker_num=    | =4=                    | Woo HTTP worker threads (each runs its own libev loop) |
 | =[tls]=            | =cert=, =key=   | unset                  | optional; otherwise plain HTTP |
 | =[catalogue]=      | =db=            | =sqlite:db/ota.db=     | =postgres://...= for PG |
 | =[storage]=        | =backend=       | =fs=                   | =fs= (only one in v1) |
@@ -151,6 +152,43 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
 =OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=.  Env-vars take
 precedence over the TOML file (see [[file:../server/src/config/loader.lisp][loader.lisp]]).
+
+* Concurrency model
+
+The HTTP front-end is *multi-threaded* (since v1.0.4): Woo spawns
+=[server].worker_num= worker threads, each running its own libev
+event loop and sharing the listening socket via accept().  A slow
+handler -- typically the synchronous bsdiff patch build during
+=publish=, which can take minutes for a 2 GB blob -- occupies one
+worker thread for the duration but does *not* block the others.
+This is the property =ota-admin= relies on for a sequence of
+publishes (and =ota-agent= relies on for first-Monday-morning
+upgrade storms): one in-flight publish does not stall concurrent
+reads or admin requests.
+
+The catalogue (SQLite) is opened in *WAL mode* with a 10-second
+=busy_timeout=, so concurrent readers + one writer never block
+each other through the journal.  All catalogue access from the
+HTTP layer goes through a recursive lock so the C library is
+never re-entered concurrently from the Lisp side either.  The
+combination keeps every public endpoint responsive while a long
+publish is in flight.
+
+Sizing guidance:
+
+| Workload                            | =worker_num=                                     |
+|-------------------------------------+--------------------------------------------------|
+| Local development                   | 4 (the dev sample)                               |
+| Single-host production, mixed       | ≈ CPU cores; cap by =[patcher].worker_count= + 4 |
+| Read-heavy (10 000 clients on first Monday) | 8–16; the =sendfile(2)= fast path scales sub-linearly with worker count |
+| Behind a reverse proxy doing TLS    | ≈ proxy concurrency limit                        |
+
+The patcher worker count is *separate*: =[patcher].worker_count=
+governs how many concurrent =bsdiff(1)= subprocesses the publish
+handler is willing to spawn.  Today the patch build inside
+=publish= is still synchronous in the calling thread (one worker
+per in-flight publish); =worker_num= simply ensures other
+requests stay responsive while it runs.
 
 * Authentication — the admin token
 

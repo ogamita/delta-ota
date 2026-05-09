@@ -239,6 +239,7 @@ e2e:
     - tests/e2e/auth.sh
     - tests/e2e/ops.sh
     - tests/e2e/recovery.sh
+    - tests/e2e/parallel.sh
   artifacts:
     when: always
     paths:
@@ -246,6 +247,7 @@ e2e:
       - tests/e2e/run-auth/logs/
       - tests/e2e/run-ops/logs/
       - tests/e2e/run-recovery/logs/
+      - tests/e2e/run-parallel/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

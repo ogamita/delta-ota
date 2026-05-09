@@ -943,23 +943,33 @@ incrementally — typically a small fraction of the full payload.</small></p>
 
 (defparameter *handler* nil)
 
-(defun start-server (state &key (host "0.0.0.0") (port 8080))
-  "Start the HTTP/JSON API.  TLS is opt-in: when both tls-cert and
-   tls-key are set on the app state, Woo terminates TLS itself; in
-   most deployments TLS is terminated by a reverse proxy and the
-   server speaks plain HTTP on the loopback (which keeps the
-   sendfile path active)."
+(defun start-server (state &key (host "0.0.0.0") (port 8080) (worker-num 4))
+  "Start the HTTP/JSON API.
+
+WORKER-NUM is forwarded to Woo as :worker-num — it spawns that many
+worker threads, each running its own libev loop and sharing the
+listening socket.  Without this, a single slow handler (e.g. the
+synchronous bsdiff patch build during publish) would wedge the
+event loop and time out every concurrent request.  4 is a sane
+default for evaluation; tune via [server].worker_num.
+
+TLS is opt-in: when both tls-cert and tls-key are set on the app
+state, Woo terminates TLS itself; in most deployments TLS is
+terminated by a reverse proxy and the server speaks plain HTTP on
+the loopback (which keeps the sendfile path active)."
   (setf *app* state)
   (let* ((cert (app-state-tls-cert state))
          (key  (app-state-tls-key  state))
-         (extra (when (and cert key (probe-file cert) (probe-file key))
-                  (list :ssl t :ssl-cert (namestring cert)
-                        :ssl-key (namestring key)))))
+         (tls (when (and cert key (probe-file cert) (probe-file key))
+                (list :ssl t :ssl-cert (namestring cert)
+                      :ssl-key (namestring key))))
+         (workers (when (and worker-num (integerp worker-num) (plusp worker-num))
+                    (list :worker-num worker-num))))
     (setf *handler*
           (apply #'clack:clackup
                  (make-app state)
                  :server :woo :address host :port port
-                 (or extra '()))))
+                 (append tls workers))))
   *handler*)
 
 (defun stop-server (&optional (handler *handler*))
