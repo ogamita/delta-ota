@@ -94,8 +94,10 @@ There are two ways to obtain it:
    is not supported — build on a host of the target arch, or use
    the published container image instead.
 
-The tarball requires =sbcl=, =libev4=, =libssl3=, and =libsqlite3-0=
-to be installed on the install host (Debian package names).
+The tarball ships a *standalone* =ota-server= executable that bundles
+the SBCL runtime; the install host only needs the dynamic-library
+runtime deps =libev4=, =libssl3=, and =libsqlite3-0= (Debian package
+names).  No system =sbcl= installation is required.
 
 #+begin_src sh
 # 1. unpack

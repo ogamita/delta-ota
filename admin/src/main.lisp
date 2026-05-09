@@ -3,7 +3,7 @@
 
 (defpackage #:ota-admin
   (:use #:cl)
-  (:export #:main #:publish #:mint-tokens-from-csv))
+  (:export #:main #:publish #:mint-tokens-from-csv #:version-string))
 
 (in-package #:ota-admin)
 
@@ -122,6 +122,11 @@
         finally (push (subseq s start) acc)
                 (return (nreverse acc))))
 
+(defun version-string ()
+  "Return the version recorded in ota-admin.asd."
+  (or (asdf:component-version (asdf:find-system "ota-admin" nil))
+      "unknown"))
+
 (defun usage ()
   (format *error-output*
 "ota-admin — Ogamita Delta OTA admin CLI
@@ -133,6 +138,9 @@ Usage:
 
   ota-admin mint-tokens --csv=PATH --classifications=stable [--ttl=7d]
                         [--server=URL] [--output=tokens.tsv]
+
+  ota-admin version       print version and exit
+  ota-admin help          print this message and exit
 
 Environment:
   OTA_ADMIN_TOKEN   bearer token for admin auth (required)
@@ -155,7 +163,12 @@ Environment:
 
 (defun main (&rest argv)
   (let ((argv (or argv (uiop:command-line-arguments))))
-    (cond ((or (null argv) (string= (first argv) "help")) (usage))
+    (cond ((or (null argv)
+               (member (first argv) '("help" "-h" "--help") :test #'string=))
+           (usage))
+          ((member (first argv) '("version" "-v" "--version") :test #'string=)
+           (format t "ota-admin ~A~%" (version-string))
+           (uiop:quit 0))
           ((string= (first argv) "mint-tokens")
            (let ((rest (rest argv)))
              (mint-tokens-from-csv

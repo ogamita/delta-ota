@@ -143,10 +143,16 @@ make run-server      # start ota-server on localhost:8443
 The build artefacts land at:
 
 ```
-server/build/ota-server.core    # SBCL image, served by `make run-server`
-admin/build/ota-admin           # standalone executable (publish, mint-tokens)
-client/build/<os>-<arch>/ota-agent  # static binary
+server/build/ota-server                # standalone executable
+                                       #   subcommands: serve | migrate | gc | shell | version | help
+admin/build/ota-admin                  # standalone executable
+                                       #   subcommands: publish | mint-tokens | version | help
+client/build/<os>-<arch>/ota-agent     # standalone executable (Go, static)
+                                       #   subcommands: install | upgrade | revert | doctor | watch | … | version
 ```
+
+Each binary parses its own arguments (`./ota-server help`, `./ota-admin version`,
+etc.) — there is no SBCL invocation or wrapper script to remember.
 
 Convenience targets that wrap the admin CLI:
 

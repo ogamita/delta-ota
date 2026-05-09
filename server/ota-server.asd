@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — distribution server."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "1.0.2"
+  :version "1.0.3"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
@@ -53,6 +53,7 @@
   :pathname "tests/"
   :components ((:file "package")
                (:file "smoke"        :depends-on ("package"))
-               (:file "config-tests" :depends-on ("smoke")))
+               (:file "config-tests" :depends-on ("smoke"))
+               (:file "cli-smoke"    :depends-on ("smoke")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))

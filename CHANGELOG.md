@@ -19,31 +19,79 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.0.3] - 2026-05-09
+
+Operator-UX release. **All three executables — `ota-server`,
+`ota-admin`, `ota-agent` — now ship as standalone binaries with
+their own subcommand dispatch and CLI parsing.** No more
+`sbcl --core …` invocations or wrapper scripts to remember.
+
+The container image no longer needs the `sbcl` package; the
+`ota-server` binary bundles the SBCL runtime and parses
+`serve | migrate | gc | shell | version | help` itself, with
+`--config=PATH` and the documented `OTA_*` environment variables.
+
+No public-contract changes (HTTP/JSON API, manifest schema, libota
+C ABI, state.json all unchanged from 1.0.0).
+
 ### Added
-- **`ota-admin` builds as a standalone executable.** `make build-admin`
-  now produces `admin/build/ota-admin` (a real binary), not a
-  bare SBCL `.core` image — same operator UX as `ota-agent`.
-  `admin/build.lisp` uses `:executable t` + `:toplevel`, suppressing
-  the SBCL banner and exiting on errors with a clear message.
-- `make publish` and `make mint-tokens` convenience targets that
-  wrap the admin CLI with named-argument validation. Required and
-  optional flags are documented inline and in the `make help`
-  output.
-- `make lisp-test-admin` — black-box smoke tests against the built
-  `ota-admin` executable (subprocess invocation): `help` prints
-  usage and exits 2; missing `<dir>` errors; missing
-  `OTA_ADMIN_TOKEN` errors; unknown subcommands fall through to
-  usage. 13 new checks, wired into `make test-unit`.
-- `admin/ota-admin.asd` version bumped to 1.0.2 with a `:perform
-  test-op` entry that runs the new smoke suite via
-  `asdf:test-system "ota-admin"`.
+- **`ota-server` builds as a standalone executable.**
+  `server/build.lisp` now uses `:executable t` + `:toplevel`
+  + `:save-runtime-options t`, producing `server/build/ota-server`
+  (Mach-O / ELF). The toplevel calls `ota-server:main` on
+  `uiop:command-line-arguments`, handles `SIGINT` (exit 130), and
+  prints a one-line stderr message + exit 1 on any uncaught error.
+- **Subcommand dispatch in `ota-server`**: `serve` (default),
+  `migrate`, `gc`, `shell`, `version` / `-v` / `--version`,
+  `help` / `-h` / `--help`. Each of `serve`/`migrate`/`gc`
+  accepts `--config=PATH` (or `--config PATH`).
+- **`version` subcommand on `ota-admin`** for symmetry with the
+  other two binaries: `ota-admin version` prints the asd version
+  and exits 0; `-v` and `--version` are accepted aliases.
+- **CLI smoke suite for `ota-server`** (`server/tests/cli-smoke.lisp`)
+  — black-box subprocess tests against the built binary: every
+  alias of `help`/`version`, unknown subcommand handling, the
+  `migrate` subcommand actually creating the SQLite DB, and the
+  `--config=` error path. 6 tests / 29 checks; wired into
+  `asdf:test-system "ota-server"`. Skipped cleanly if the binary
+  is absent.
+- **CLI smoke suite for `ota-admin` extended** with the new
+  `version` subcommand (every alias). Suite is now 27 checks
+  (was 13).
+- `make lisp-test` now depends on `make build-server`, so the new
+  CLI smoke tests have a binary to spawn under `make test-unit`.
+- `MAIN`'s legacy `(:config <plist-or-path>)` calling convention
+  is preserved alongside the new `(:rest argv)` form, so the e2e
+  harness and any out-of-tree callers do not break.
 
 ### Changed
-- README.md and `docs/operations.org` quick-start sections now
-  reflect the actual binary layout (`admin/build/ota-admin`) and
-  document the `make publish` / `make mint-tokens` wrappers. The
-  prior README example called `./bin/ota-admin` — a path that
-  never existed.
+- **`make run-server`** now invokes `server/build/ota-server serve
+  --config=server/etc/ota.dev.toml` directly (no more
+  `sbcl --core … --eval …`). Builds the binary on demand if absent.
+- **`docker/entrypoint.sh`** is now a thin shim: it materialises
+  the default config from the baked-in sample if none is mounted,
+  then `exec`'s `/opt/ota/ota-server` with whatever args the
+  container received (defaults to `serve --config=$OTA_CONFIG`).
+  Removed the per-subcommand `sbcl --core` blocks.
+- **Docker image** drops the `sbcl` and `ca-certificates` apt
+  packages on the runtime side and ships the ota-server binary
+  directly under `/opt/ota/ota-server`. (`ca-certificates` is
+  retained because the server does outbound HTTPS in a few
+  admin paths.)
+- **systemd unit** invokes `/opt/ota/ota-server serve
+  --config=/etc/ota/ota.toml` directly; the previous
+  `/opt/ota/libexec/ota-entrypoint serve` reference is gone.
+- **dist-server tarball layout**: drops `libexec/ota-entrypoint`
+  and `ota-server.core`; ships the standalone `ota-server`
+  executable at the root and the systemd unit unchanged.
+
+### Notes
+- `ota-agent` is and was already a standalone Go binary with full
+  subcommand dispatch (`install | upgrade | revert | doctor |
+  watch | … | version`). The 1.0.3 work brings the SBCL binaries
+  to feature parity with it.
 
 ## [1.0.2] - 2026-05-09
 

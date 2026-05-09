@@ -27,11 +27,10 @@ Group=ota
 
 EnvironmentFile=-/etc/ota/environment
 Environment=OTA_ROOT=/var/lib/ota
-Environment=OTA_CONFIG=/etc/ota/ota.toml
 Environment=OTA_BSDIFF=/opt/ota/bin/bsdiff
 Environment=OTA_BSPATCH=/opt/ota/bin/bspatch
 
-ExecStart=/opt/ota/libexec/ota-entrypoint serve
+ExecStart=/opt/ota/ota-server serve --config=/etc/ota/ota.toml
 
 Restart=on-failure
 RestartSec=5s

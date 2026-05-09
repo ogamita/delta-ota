@@ -41,7 +41,6 @@ LABEL org.opencontainers.image.revision="${VCS_REF}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        sbcl \
         libssl3 \
         libev4 \
         libsqlite3-0 \
@@ -52,8 +51,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/lib/ota /etc/ota \
     && chown -R ota:ota /var/lib/ota /etc/ota
 
-# Application bits
-COPY --from=builder --chown=root:root /src/server/build/ota-server.core /opt/ota/ota-server.core
+# Application bits.  Since v1.0.3 the server is a standalone executable
+# that bundles the SBCL runtime and dispatches its own subcommands;
+# no `sbcl` package nor entrypoint wrapper is needed in the image.
+COPY --from=builder --chown=root:root /src/server/build/ota-server      /opt/ota/ota-server
 COPY --from=builder --chown=root:root /src/server/build/bin/bsdiff      /opt/ota/bin/bsdiff
 COPY --from=builder --chown=root:root /src/server/build/bin/bspatch     /opt/ota/bin/bspatch
 COPY --chown=root:root server/etc/ota.docker.toml                       /etc/ota/ota.toml.sample

@@ -48,7 +48,7 @@ help:
 	@echo "  make vendor-verify   re-hash vendored sources, fail on mismatch"
 	@echo "  make vendor-build    build vendored C helpers (bsdiff, xdelta3)"
 	@echo "  make build           build server, admin, libota, ota-agent"
-	@echo "  make build-server    build the SBCL server core"
+	@echo "  make build-server    build the ota-server executable"
 	@echo "  make build-admin     build the ota-admin executable"
 	@echo "  make build-client    build libota + ota-agent for GOOS/GOARCH"
 	@echo "  make test            unit tests (server + client)"
@@ -134,7 +134,7 @@ lisp-check:
 
 QUICKLISP_SETUP ?= $(shell test -f $(HOME)/quicklisp/setup.lisp && echo $(HOME)/quicklisp/setup.lisp || echo /opt/quicklisp/setup.lisp)
 
-lisp-test:
+lisp-test: build-server
 	$(SBCL) --non-interactive --no-userinit --no-sysinit \
 	    --load $(QUICKLISP_SETUP) \
 	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
@@ -229,9 +229,9 @@ e2e-ops:
 e2e-recovery:
 	tests/e2e/recovery.sh
 
-run-server: build-server
-	$(SBCL) --core $(SERVER_BUILD_DIR)/ota-server.core \
-	    --eval '(ota-server:main :config "server/etc/ota.dev.toml")'
+run-server:
+	@test -x $(SERVER_BUILD_DIR)/ota-server || $(MAKE) build-server
+	$(SERVER_BUILD_DIR)/ota-server serve --config=server/etc/ota.dev.toml
 
 # ---------- ota-admin convenience targets ----------
 # Publish a new release. Required: DIR, SOFTWARE, VERSION, OS, ARCH.
@@ -275,26 +275,30 @@ mint-tokens:
 	    $(if $(SERVER),--server=$(SERVER),)
 
 # ---------- distribution tarball ----------
-# Bundle the SBCL core, vendored bsdiff/bspatch helpers, the sample
-# config, the systemd unit, and the entrypoint wrapper into a single
-# self-contained tarball: build/dist/delta-ota-server-$(VERSION).tar.gz
+# Bundle the standalone ota-server executable, the vendored
+# bsdiff/bspatch helpers, the sample config, and the systemd unit
+# into a single self-contained tarball:
+#   build/dist/delta-ota-server-$(VERSION).tar.gz
+#
+# Since v1.0.3, ota-server is a real standalone executable that
+# dispatches its own subcommands -- there is no entrypoint wrapper
+# to ship.  The systemd unit invokes /opt/ota/ota-server serve
+# directly.
 #
 # This artefact exists for evaluation, debugging, and air-gapped
-# single-host installs. Production deployments use the published
-# container image (registry.gitlab.com/ogamita/delta-ota/server) —
+# single-host installs.  Production deployments use the published
+# container image (registry.gitlab.com/ogamita/delta-ota/server) --
 # the tarball is *not* attached to GitLab/GitHub Releases.
 DIST_STAGE := $(DIST_DIR)/delta-ota-server-$(VERSION)
 
 dist-server: build-server vendor-build
 	@rm -rf $(DIST_STAGE) $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz
-	@mkdir -p $(DIST_STAGE)/bin $(DIST_STAGE)/etc $(DIST_STAGE)/libexec
-	cp $(SERVER_BUILD_DIR)/ota-server.core   $(DIST_STAGE)/
+	@mkdir -p $(DIST_STAGE)/bin $(DIST_STAGE)/etc
+	cp $(SERVER_BUILD_DIR)/ota-server        $(DIST_STAGE)/
 	cp $(SERVER_BUILD_DIR)/bin/bsdiff        $(DIST_STAGE)/bin/
 	cp $(SERVER_BUILD_DIR)/bin/bspatch       $(DIST_STAGE)/bin/
 	cp server/etc/ota.toml.sample            $(DIST_STAGE)/etc/
 	cp server/etc/ota-server.service         $(DIST_STAGE)/etc/
-	cp docker/entrypoint.sh                  $(DIST_STAGE)/libexec/ota-entrypoint
-	chmod 0755                               $(DIST_STAGE)/libexec/ota-entrypoint
 	cp LICENSE README.md CHANGELOG.md        $(DIST_STAGE)/
 	@echo $(VERSION) > $(DIST_STAGE)/VERSION
 	tar -C $(DIST_DIR) -czf $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz \

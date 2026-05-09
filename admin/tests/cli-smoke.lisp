@@ -44,14 +44,25 @@ the rest of this suite is meaningful."
       (skip "ota-admin not built; run `make build-admin` first")))
 
 (test help-prints-usage-and-exits-2
-  "`ota-admin help` prints usage to stderr and exits with code 2."
+  "`ota-admin help` (and -h / --help) prints usage to stderr and exits 2."
   (when (binary-exists-p)
-    (multiple-value-bind (out err code) (run-admin '("help"))
-      (declare (ignore out))
-      (is (= 2 code) "expected exit 2, got ~A" code)
-      (is (search "ota-admin" err))
-      (is (search "publish"   err))
-      (is (search "mint-tokens" err)))))
+    (dolist (form '("help" "-h" "--help"))
+      (multiple-value-bind (out err code) (run-admin (list form))
+        (declare (ignore out))
+        (is (= 2 code) "form ~S: expected exit 2, got ~A" form code)
+        (is (search "ota-admin"   err))
+        (is (search "publish"     err))
+        (is (search "mint-tokens" err))))))
+
+(test version-prints-and-exits-0
+  "`ota-admin version` (and -v / --version) prints the version and exits 0."
+  (when (binary-exists-p)
+    (dolist (form '("version" "-v" "--version"))
+      (multiple-value-bind (out err code) (run-admin (list form))
+        (declare (ignore err))
+        (is (= 0 code) "form ~S: expected exit 0, got ~A" form code)
+        (is (search "ota-admin" out)
+            "form ~S: stdout missing program name" form)))))
 
 (test no-args-prints-usage
   "Invoking the binary with no arguments also prints usage and exits 2."

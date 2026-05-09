@@ -3,8 +3,15 @@
 # Copyright (C) 2026 Ogamita Ltd.
 #
 # Container entrypoint for ota-server.
-# - Materialises a default config if none is mounted.
-# - Dispatches to subcommands: serve | migrate | gc | shell.
+#
+# Since v1.0.3 the server is a standalone executable that dispatches
+# its own subcommands (serve | migrate | gc | shell | version | help)
+# and parses --config / env-vars itself.  This wrapper only:
+#
+#   1. materialises a default config from the baked-in sample if none
+#      is mounted at $OTA_CONFIG, and
+#   2. exec's the binary with whatever arguments the container was
+#      started with -- defaulting to `serve` when none are given.
 
 set -eu
 
@@ -16,32 +23,10 @@ if [ ! -f "${OTA_CONFIG}" ]; then
     cp /etc/ota/ota.toml.sample "${OTA_CONFIG}"
 fi
 
-cmd="${1:-serve}"
-shift || true
-
-case "${cmd}" in
-    serve)
-        exec sbcl --core /opt/ota/ota-server.core \
-                  --non-interactive \
-                  --no-userinit --no-sysinit \
-                  --eval "(ota-server:main :config \"${OTA_CONFIG}\")" "$@"
-        ;;
-    migrate)
-        exec sbcl --core /opt/ota/ota-server.core \
-                  --non-interactive --no-userinit --no-sysinit \
-                  --eval "(ota-server:migrate :config \"${OTA_CONFIG}\")"
-        ;;
-    gc)
-        exec sbcl --core /opt/ota/ota-server.core \
-                  --non-interactive --no-userinit --no-sysinit \
-                  --eval "(ota-server:run-gc :config \"${OTA_CONFIG}\")" "$@"
-        ;;
-    shell)
-        exec sbcl --core /opt/ota/ota-server.core
-        ;;
-    *)
-        echo "ota-entrypoint: unknown subcommand '${cmd}'" >&2
-        echo "  usage: ota-entrypoint {serve|migrate|gc|shell}" >&2
-        exit 2
-        ;;
-esac
+# When the user passes no arguments, default to `serve --config=$OTA_CONFIG`.
+# When they DO pass arguments, honour them verbatim: the binary's own
+# subcommand parser handles dispatch, --config, --help, --version, etc.
+if [ "$#" -eq 0 ]; then
+    exec /opt/ota/ota-server serve --config="${OTA_CONFIG}"
+fi
+exec /opt/ota/ota-server "$@"
