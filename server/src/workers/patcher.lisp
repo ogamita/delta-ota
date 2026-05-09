@@ -72,10 +72,11 @@ how far through the fan-in pass the publish is."
          (built '())
          (i 0))
     (when (plusp total)
-      ;; ~:P would print "patchs" (CL's pluraliser only knows "s",
-      ;; not English's "-ches" rule); spell the noun out instead.
-      (format t "publish: building ~D ~A for ~A/~A-~A/~A~%"
-              total (if (= total 1) "patch" "patches")
+      ;; ~:P would print "patchs" (CL's pluraliser only knows "+s",
+      ;; not English's "-ches" rule); use ~:[~;es~] with a (/= 1 total)
+      ;; flag instead.
+      (format t "publish: building ~D patch~:[~;es~] for ~A/~A-~A/~A~%"
+              total (/= 1 total)
               software os arch new-version)
       (force-output))
     (dolist (rel priors)
