@@ -600,21 +600,21 @@ that are not wired up; today they print
 =ota-agent: "X" not implemented yet= and exit 1
 ([[file:../client/agent/main.go::64][client/agent/main.go:64]]).
 
-- [ ] *=list [--remote|--local]=* — listing installed software
+- [X] *=list [--remote|--local]=* — listing installed software
   (=--local=) and listing what the server has on offer
   (=--remote=).  Local listing is a directory walk under
   =$OTA_HOME/=; remote listing is =GET /v1/software= followed
   by per-software =GET /v1/software/<sw>/manifest=.  Ship target:
   v1.0.x (small).
-- [ ] *=show <name>=* — print the active version, server URL,
+- [X] *=show <name>=* — print the active version, server URL,
   classifications, install date, signing key.  Reads
   =$OTA_HOME/<sw>/state.json=; pure-local, no server call.  Ship
   target: v1.0.x.
-- [ ] *=verify <name>=* — recompute SHA-256 of every file under
+- [X] *=verify <name>=* — recompute SHA-256 of every file under
   =$OTA_HOME/<sw>/distribution-<active>/=, compare against the
   manifest, report mismatches.  Operator's first move when an
   install looks corrupted.  Ship target: v1.0.x.
-- [ ] *=prune <name> [--archive-depth=N]=* — drop archived
+- [X] *=prune <name> [--archive-depth=N]=*  (landed in v1.1.0) — drop archived
   distribution-* directories beyond the depth, keeping the
   current and (= --archive-depth) most recent for revert.  Frees
   disk on long-lived clients.  Ship target: v1.0.x.

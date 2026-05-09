@@ -402,6 +402,29 @@ The token is one-shot and short-TTL.  The user pastes it into
 =ota-agent install ... --install-token=<token>=, which exchanges it
 for a per-workstation bearer that is persisted in =state.json=.
 
+** End-user inspection commands (=ota-agent= -- v1.1.0+)
+
+These are read-only / disk-management commands the end user can
+run against their own =$OTA_HOME= without involving the server
+(or, with =--remote=, against the server in read-only mode).
+
+| Command                              | What it does                                                                               |
+|-------------------------------------+--------------------------------------------------------------------------------------------|
+| =ota-agent list=                     | Table of every software installed under =$OTA_HOME=: current / previous / on-disk size / server URL |
+| =ota-agent list --remote --server URL= | Table of every software the server has on offer + its latest version                     |
+| =ota-agent show <name>=              | Per-software details: versions, server URL, last-updated, every =distribution-*= directory (=*= active, =p= previous) |
+| =ota-agent verify <name>=            | Two-phase integrity check: state file + current symlink + distribution dir, then signed manifest fetch + on-disk blob SHA-256 vs manifest |
+| =ota-agent verify <name> --offline=  | Skip the network phase (no manifest fetch)                                                 |
+| =ota-agent prune <name>=             | Delete old =distribution-*= directories.  Always keeps =current= and =previous=; =--archive-depth=N= keeps =N= most-recent extras (default 2); =--dry-run= reports without deleting |
+
+These commands are pure read-only on the server side (=list
+--remote= calls =GET /v1/software= and the latest-release
+endpoint); =verify= additionally fetches a signed manifest.  They
+do not require =OTA_ADMIN_TOKEN=.
+
+For unattended dashboards / orchestration, every command exits
+non-zero on failure and writes its data to stdout.
+
 ** Garbage-collect old releases
 
 Drops releases that are not =uncollectable=, not the latest in their

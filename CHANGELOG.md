@@ -19,7 +19,61 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **`ota-agent` gains four subcommands previously stubbed as
+  "not implemented yet":**
+  - **`list [--remote|--local]`** — `--local` (the default) walks
+    `$OTA_HOME/`, prints a table of installed software with
+    current / previous version, on-disk bytes, and server URL.
+    `--remote` calls `GET /v1/software` on the server, then
+    `GET /v1/software/<sw>/releases/latest` for each, printing
+    name / latest version / display name / created-at.
+  - **`show <name>`** — purely local: reads
+    `$OTA_HOME/<name>/state.json` and prints the active version,
+    previous version, server URL, last-updated timestamp, history
+    length, on-disk size, and every `distribution-*` directory
+    (with `*` marking active and `p` marking previous).
+  - **`verify <name> [--offline] [--server=URL]`** — two-phase
+    integrity check.  Offline phase: state.json parses, current
+    version is set, current symlink/shim resolves, distribution
+    directory exists and is non-empty.  Online phase (default):
+    fetch the manifest from the server, verify the Ed25519
+    signature, check the pubkey against
+    `OTA_TRUSTED_PUBKEYS`, and — if the saved blob is still on
+    disk — recompute its SHA-256 and compare with the manifest's
+    `blob.sha256`.  Each finding is reported as `✓` / `✗` with a
+    one-line detail.  Exit 0 if every check passes, 1 otherwise.
+  - **`prune <name> [--archive-depth=N] [--dry-run]`** — frees
+    disk by deleting old `distribution-*` directories.  Always
+    keeps the current and previous versions; `--archive-depth=N`
+    (default 2) keeps `N` additional most-recent extras.
+    `--dry-run` reports what would be deleted without touching
+    anything.  Defence-in-depth: only paths whose name starts
+    with `distribution-` can be deleted.
+- **New transport method `transport.Client.ListSoftware()`**
+  wrapping `GET /v1/software`.
+- **New `client/internal/listing` package** — pure-data helpers
+  for `list`, `show`, and `prune` (LocalEntry, RemoteEntry,
+  PruneCandidates, DeleteDistribution).
+- **New `client/internal/verify` package** — `Verify()` returns
+  a `Report` with one `Check` per finding; the CLI command just
+  formats it.
+- **15 new Go unit tests** across `internal/listing` (8 tests:
+  local listing, foreign-dir skipping, prune-candidate selection,
+  defence-in-depth) and `internal/verify` (7 tests: offline-only
+  happy path, every offline failure mode, online happy path,
+  blob-hash mismatch, untrusted pubkey, --offline really skips
+  the network).  Online tests stand up an httptest server with a
+  freshly-generated Ed25519 keypair.
+
+### Notes
+- This release **adds new CLI surfaces** (four new subcommands +
+  one new transport method).  The wire format and libota C ABI
+  are unchanged from v1.0.x, but the new subcommands warrant a
+  minor (not patch) bump per semver — hence `1.1.0` rather than
+  `1.0.5`.
+- Other items still on the post-1.0 backlog (PostgreSQL, S3,
+  mTLS, real-time publish progress, …) remain deferred.
 
 ## [1.0.4] - 2026-05-09
 

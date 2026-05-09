@@ -161,6 +161,38 @@ func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, er
 	return io.ReadAll(resp.Body)
 }
 
+// Software is one row of the catalogue list returned by GET /v1/software.
+type Software struct {
+	Name           string `json:"name"`
+	DisplayName    string `json:"display_name"`
+	DefaultPatcher string `json:"default_patcher"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// ListSoftware fetches /v1/software (the catalogue index) and returns
+// the parsed array.  Used by `ota-agent list --remote` to enumerate
+// what the server has on offer.
+func (c *Client) ListSoftware(ctx context.Context) ([]Software, error) {
+	url := c.BaseURL + "/v1/software"
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list-software: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list-software: %s", resp.Status)
+	}
+	var out []Software
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list-software decode: %w", err)
+	}
+	return out, nil
+}
+
 // DownloadPatch is like DownloadBlob but for /v1/patches/<sha>.
 func (c *Client) DownloadPatch(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
 	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/patches/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)
