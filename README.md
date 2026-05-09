@@ -119,7 +119,10 @@ docker compose -f docker/docker-compose.yml up --build
 Once the stack is up:
 
 ```sh
-# publish a sample release from a developer workstation
+# publish a sample release from a developer workstation.
+# OTA_ADMIN_TOKEN must match the value the server was started with —
+# the docker-compose dev stack uses the built-in default "dev-token".
+# For production deployments, see docs/operations.org §Authentication.
 OTA_SERVER=http://127.0.0.1:8443 \
 OTA_ADMIN_TOKEN=dev-token \
   make publish DIR=./examples/hello \

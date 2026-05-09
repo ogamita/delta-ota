@@ -19,7 +19,20 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+- **Documentation: `OTA_ADMIN_TOKEN` is now described as the
+  shared secret it actually is.** New top-level "Authentication"
+  section in [docs/operations.org](docs/operations.org) covers
+  the resolution order on the server side (built-in `dev-token`
+  default → TOML file *not* mapped today, flagged as a known gap
+  → `OTA_ADMIN_TOKEN` env-var override), where to set the token
+  for each deployment style (`make run-server`, Docker, tarball
+  + systemd `EnvironmentFile`, Kubernetes Secret), where
+  `ota-admin` reads it from, and how to generate / rotate it.
+  The two install procedures' misleading `# set admin_token`
+  sudoedit comments are gone — replaced with the real env-var
+  setup. README.md gains a one-line note on the dev-stack
+  default.
 
 ## [1.0.3] - 2026-05-09
 
