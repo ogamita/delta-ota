@@ -21,6 +21,11 @@ BUILD_DIR        := build
 SERVER_BUILD_DIR := server/build
 ADMIN_BUILD_DIR  := admin/build
 CLIENT_BUILD_DIR := client/build
+DIST_DIR         := build/dist
+
+# Version stamp for distribution tarballs. Override on the command line
+# or in CI (GITLAB: CI_COMMIT_TAG; GITHUB: GITHUB_REF_NAME).
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 GOOS   ?= $(shell $(GO) env GOOS)
 GOARCH ?= $(shell $(GO) env GOARCH)
@@ -28,9 +33,11 @@ GOARCH ?= $(shell $(GO) env GOARCH)
 .PHONY: all help setup build test \
         vendor-verify vendor-build \
         build-server build-admin build-client build-libota \
-        lisp-check go-lint go-test \
+        lisp-check lisp-test lisp-test-admin go-lint go-test \
         test-unit e2e \
         run-server \
+        publish mint-tokens \
+        dist-server \
         clean
 
 all: build
@@ -41,13 +48,16 @@ help:
 	@echo "  make vendor-verify   re-hash vendored sources, fail on mismatch"
 	@echo "  make vendor-build    build vendored C helpers (bsdiff, xdelta3)"
 	@echo "  make build           build server, admin, libota, ota-agent"
-	@echo "  make build-server    build the SBCL server core"
-	@echo "  make build-admin     build the SBCL admin CLI"
+	@echo "  make build-server    build the ota-server executable"
+	@echo "  make build-admin     build the ota-admin executable"
 	@echo "  make build-client    build libota + ota-agent for GOOS/GOARCH"
 	@echo "  make test            unit tests (server + client)"
 	@echo "  make test-unit       same as test"
 	@echo "  make e2e             docker-compose end-to-end test"
 	@echo "  make run-server      start ota-server locally"
+	@echo "  make publish         publish a release via ota-admin (DIR=, SOFTWARE=, VERSION=, OS=, ARCH=)"
+	@echo "  make mint-tokens     mint install tokens via ota-admin (CSV=, CLASSIFICATIONS=, TTL=, OUTPUT=)"
+	@echo "  make dist-server     build delta-ota-server-VERSION.tar.gz (debug/test/eval install)"
 	@echo "  make clean           remove build artefacts"
 
 setup:
@@ -124,12 +134,23 @@ lisp-check:
 
 QUICKLISP_SETUP ?= $(shell test -f $(HOME)/quicklisp/setup.lisp && echo $(HOME)/quicklisp/setup.lisp || echo /opt/quicklisp/setup.lisp)
 
-lisp-test:
+lisp-test: build-server
 	$(SBCL) --non-interactive --no-userinit --no-sysinit \
 	    --load $(QUICKLISP_SETUP) \
 	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
 	    --eval '(ql:quickload "ota-server/tests" :silent t)' \
 	    --eval '(asdf:test-system "ota-server")'
+
+# Admin CLI tests are black-box checks against the built executable.
+# `build-admin` is a prerequisite so the smoke tests have a binary
+# to spawn; without it they are skipped.
+lisp-test-admin: build-admin
+	$(SBCL) --non-interactive --no-userinit --no-sysinit \
+	    --load $(QUICKLISP_SETUP) \
+	    --eval '(asdf:load-asd (truename "server/ota-server.asd"))' \
+	    --eval '(asdf:load-asd (truename "admin/ota-admin.asd"))' \
+	    --eval '(ql:quickload "ota-admin/tests" :silent t)' \
+	    --eval '(asdf:test-system "ota-admin")'
 
 go-lint:
 	cd client && $(GO) vet ./...
@@ -148,7 +169,7 @@ fuzz:
 	cd client && $(GO) test -run=- -fuzz=FuzzApply    -fuzztime=$(FUZZTIME) ./internal/patch/
 
 test: test-unit
-test-unit: lisp-check lisp-test go-test
+test-unit: lisp-check lisp-test lisp-test-admin go-test
 
 # ---------- documentation ----------
 # Generate PDFs from .org sources. Two backends:
@@ -178,6 +199,7 @@ docs: docs-pdf
 docs-pdf: $(PDF_FILES)
 docs-clean:
 	rm -rf $(PDF_OUT)
+	rm -f server/system-index.txt
 
 $(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
 	@mkdir -p $(PDF_OUT)
@@ -197,7 +219,7 @@ $(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
 	    exit 1; \
 	fi
 
-e2e: e2e-install e2e-auth e2e-ops e2e-recovery
+e2e: e2e-install e2e-auth e2e-ops e2e-recovery e2e-parallel
 e2e-install:
 	tests/e2e/run.sh
 e2e-auth:
@@ -206,12 +228,86 @@ e2e-ops:
 	tests/e2e/ops.sh
 e2e-recovery:
 	tests/e2e/recovery.sh
+e2e-parallel:
+	tests/e2e/parallel.sh
 
-run-server: build-server
-	$(SBCL) --core $(SERVER_BUILD_DIR)/ota-server.core \
-	    --eval '(ota-server:main :config "server/etc/ota.dev.toml")'
+run-server:
+	@test -x $(SERVER_BUILD_DIR)/ota-server || $(MAKE) build-server
+	$(SERVER_BUILD_DIR)/ota-server serve --config=server/etc/ota.dev.toml
+
+# ---------- ota-admin convenience targets ----------
+# Publish a new release. Required: DIR, SOFTWARE, VERSION, OS, ARCH.
+# Optional: OS_VERSIONS (comma-separated), CLASSIFICATIONS, SERVER (URL).
+# OTA_SERVER and OTA_ADMIN_TOKEN env vars are honoured by the binary.
+#
+# Example:
+#   OTA_ADMIN_TOKEN=dev-token \
+#     make publish DIR=./examples/hello SOFTWARE=hello \
+#                  VERSION=1.0.0 OS=darwin ARCH=arm64
+publish:
+	@test -x $(ADMIN_BUILD_DIR)/ota-admin || $(MAKE) build-admin
+	@test -n "$(DIR)"      || { echo "publish: DIR=... required"      >&2; exit 2; }
+	@test -n "$(SOFTWARE)" || { echo "publish: SOFTWARE=... required" >&2; exit 2; }
+	@test -n "$(VERSION)"  || { echo "publish: VERSION=... required"  >&2; exit 2; }
+	@test -n "$(OS)"       || { echo "publish: OS=... required"       >&2; exit 2; }
+	@test -n "$(ARCH)"     || { echo "publish: ARCH=... required"     >&2; exit 2; }
+	$(ADMIN_BUILD_DIR)/ota-admin publish "$(DIR)" \
+	    --software=$(SOFTWARE) \
+	    --version=$(VERSION) \
+	    --os=$(OS) --arch=$(ARCH) \
+	    $(if $(OS_VERSIONS),--os-versions=$(OS_VERSIONS),) \
+	    $(if $(CLASSIFICATIONS),--classifications=$(CLASSIFICATIONS),) \
+	    $(if $(SERVER),--server=$(SERVER),)
+
+# Mint install tokens in bulk from a CSV. Required: CSV.
+# Optional: CLASSIFICATIONS (comma-separated), TTL ("7d", "3h"…),
+# OUTPUT (default tokens.tsv), SERVER.
+#
+# Example:
+#   OTA_ADMIN_TOKEN=dev-token \
+#     make mint-tokens CSV=users.csv CLASSIFICATIONS=stable TTL=7d
+mint-tokens:
+	@test -x $(ADMIN_BUILD_DIR)/ota-admin || $(MAKE) build-admin
+	@test -n "$(CSV)" || { echo "mint-tokens: CSV=... required" >&2; exit 2; }
+	$(ADMIN_BUILD_DIR)/ota-admin mint-tokens \
+	    --csv="$(CSV)" \
+	    $(if $(CLASSIFICATIONS),--classifications=$(CLASSIFICATIONS),) \
+	    $(if $(TTL),--ttl=$(TTL),) \
+	    $(if $(OUTPUT),--output=$(OUTPUT),) \
+	    $(if $(SERVER),--server=$(SERVER),)
+
+# ---------- distribution tarball ----------
+# Bundle the standalone ota-server executable, the vendored
+# bsdiff/bspatch helpers, the sample config, and the systemd unit
+# into a single self-contained tarball:
+#   build/dist/delta-ota-server-$(VERSION).tar.gz
+#
+# Since v1.0.3, ota-server is a real standalone executable that
+# dispatches its own subcommands -- there is no entrypoint wrapper
+# to ship.  The systemd unit invokes /opt/ota/ota-server serve
+# directly.
+#
+# This artefact exists for evaluation, debugging, and air-gapped
+# single-host installs.  Production deployments use the published
+# container image (registry.gitlab.com/ogamita/delta-ota/server) --
+# the tarball is *not* attached to GitLab/GitHub Releases.
+DIST_STAGE := $(DIST_DIR)/delta-ota-server-$(VERSION)
+
+dist-server: build-server vendor-build
+	@rm -rf $(DIST_STAGE) $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz
+	@mkdir -p $(DIST_STAGE)/bin $(DIST_STAGE)/etc
+	cp $(SERVER_BUILD_DIR)/ota-server        $(DIST_STAGE)/
+	cp $(SERVER_BUILD_DIR)/bin/bsdiff        $(DIST_STAGE)/bin/
+	cp $(SERVER_BUILD_DIR)/bin/bspatch       $(DIST_STAGE)/bin/
+	cp server/etc/ota.toml.sample            $(DIST_STAGE)/etc/
+	cp server/etc/ota-server.service         $(DIST_STAGE)/etc/
+	cp LICENSE README.md CHANGELOG.md        $(DIST_STAGE)/
+	@echo $(VERSION) > $(DIST_STAGE)/VERSION
+	tar -C $(DIST_DIR) -czf $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz \
+	    delta-ota-server-$(VERSION)
+	@echo "dist-server: wrote $(DIST_DIR)/delta-ota-server-$(VERSION).tar.gz"
 
 # ---------- clean ----------
 clean:
-	rm -rf $(BUILD_DIR) $(SERVER_BUILD_DIR) $(ADMIN_BUILD_DIR) $(CLIENT_BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(SERVER_BUILD_DIR) $(ADMIN_BUILD_DIR) $(CLIENT_BUILD_DIR) $(DIST_DIR)
 	-find . -name '*.fasl' -delete

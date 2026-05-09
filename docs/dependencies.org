@@ -24,6 +24,7 @@ fully static.
 | uiop         | portability                              | MIT           |
 | ironclad     | SHA-256, Ed25519, AES                    | BSD-3-Clause  |
 | com.inuoe.jzon | JSON                                   | MIT           |
+| clop         | TOML 1.0 parser (server config)          | MIT           |
 | cl-dbi       | DB-independent SQL                       | LLGPL         |
 | sqlite       | SQLite driver (Quicklisp dist name)      | Public Domain |
 | cl-postgres  | PostgreSQL driver                        | zlib          |

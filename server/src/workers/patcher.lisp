@@ -56,25 +56,43 @@
                                        new-release-id new-blob-sha)
   "Build a patch from every previously published release of the same
    (software, os, arch) to the new release.  Returns a list of plists
-   describing the patches built."
-  (let ((built '()))
-    (dolist (rel (ota-server.catalogue:list-releases catalogue software))
-      (when (and (string= (getf rel :os) os)
-                 (string= (getf rel :arch) arch)
-                 (not (string= (getf rel :version) new-version)))
-        (handler-case
-            (multiple-value-bind (sha size)
-                (build-patch-from-blobs
-                 cas catalogue
-                 :from-release-id (getf rel :release-id)
-                 :to-release-id   new-release-id
-                 :from-blob-sha   (getf rel :blob-sha256)
-                 :to-blob-sha     new-blob-sha)
-              (push (list :from (getf rel :version)
-                          :sha256 sha :size size :patcher "bsdiff")
-                    built))
-          (error (e)
-            (format *error-output*
-                    "build-patches: skipping ~A->~A: ~A~%"
-                    (getf rel :release-id) new-release-id e)))))
+   describing the patches built.
+
+Logs per-patch progress (\"publish: bsdiff N/M from VERSION ...\")
+to *standard-output* so operators tailing the server log can see
+how far through the fan-in pass the publish is."
+  (let* ((all (ota-server.catalogue:list-releases catalogue software))
+         (priors (remove-if-not
+                  (lambda (rel)
+                    (and (string= (getf rel :os) os)
+                         (string= (getf rel :arch) arch)
+                         (not (string= (getf rel :version) new-version))))
+                  all))
+         (total (length priors))
+         (built '())
+         (i 0))
+    (when (plusp total)
+      (format t "publish: building ~D patch~:P for ~A/~A-~A/~A~%"
+              total software os arch new-version)
+      (force-output))
+    (dolist (rel priors)
+      (incf i)
+      (format t "publish: bsdiff ~D/~D from ~A (~A bytes) ...~%"
+              i total (getf rel :version) (getf rel :blob-size))
+      (force-output)
+      (handler-case
+          (multiple-value-bind (sha size)
+              (build-patch-from-blobs
+               cas catalogue
+               :from-release-id (getf rel :release-id)
+               :to-release-id   new-release-id
+               :from-blob-sha   (getf rel :blob-sha256)
+               :to-blob-sha     new-blob-sha)
+            (push (list :from (getf rel :version)
+                        :sha256 sha :size size :patcher "bsdiff")
+                  built))
+        (error (e)
+          (format *error-output*
+                  "build-patches: skipping ~A->~A: ~A~%"
+                  (getf rel :release-id) new-release-id e))))
     (nreverse built)))

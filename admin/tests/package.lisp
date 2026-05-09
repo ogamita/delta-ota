@@ -2,4 +2,5 @@
 ;;; Copyright (C) 2026 Ogamita Ltd.
 
 (defpackage #:ota-admin.tests
-  (:use #:cl #:fiveam))
+  (:use #:cl #:fiveam)
+  (:export #:run-all))

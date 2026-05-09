@@ -3,9 +3,180 @@
 
 (defpackage #:ota-admin
   (:use #:cl)
-  (:export #:main #:publish #:mint-tokens-from-csv))
+  (:export #:main #:publish #:mint-tokens-from-csv #:version-string))
 
 (in-package #:ota-admin)
+
+;; ---------------------------------------------------------------------------
+;; HTTP error friendlification
+;; ---------------------------------------------------------------------------
+;;
+;; Dexador / cl+ssl error messages are precise but unfriendly: an
+;; OpenSSL "wrong version number" surfaces as a stack-trace-shaped
+;; blob that stumps anyone who hasn't seen it before.  We intercept
+;; the most common HTTP/TLS misconfiguration patterns and rewrite
+;; them into one sentence the operator can act on.  Unknown errors
+;; pass through unchanged.
+
+(defun %http-scheme-of (url)
+  "Return :HTTP, :HTTPS, or NIL."
+  (cond ((alexandria:starts-with-subseq "https://" url) :https)
+        ((alexandria:starts-with-subseq "http://"  url) :http)))
+
+(defun %swap-scheme (url to)
+  "Return URL with its scheme replaced by TO (e.g. \"http\")."
+  (let ((colon (position #\: url)))
+    (if colon
+        (concatenate 'string to (subseq url colon))
+        url)))
+
+(defun %base-url (url)
+  "Return URL truncated at the path component (i.e. just
+scheme://host[:port]).  Used so we can suggest a clean OTA_SERVER
+value without echoing the request path back at the user."
+  (let* ((scheme-end (search "://" url))
+         (search-from (if scheme-end (+ scheme-end 3) 0))
+         (slash (position #\/ url :start search-from)))
+    (if slash (subseq url 0 slash) url)))
+
+(defun %condition-typename (err)
+  "Return the package-qualified class name of ERR as a string,
+e.g. \"USOCKET:NS-HOST-NOT-FOUND-ERROR\".  Some libraries
+(notably USOCKET) signal conditions whose default print form is
+just \"Condition USOCKET:FOO-ERROR was signalled.\" — the
+diagnostic information lives in the class name, not the printed
+message, so we match on both.  Including the package prefix lets
+us distinguish a transport-level USOCKET error from any unrelated
+symbol that happens to share a short name."
+  (let* ((sym (class-name (class-of err)))
+         (pkg (symbol-package sym)))
+    (if pkg
+        (concatenate 'string (package-name pkg) ":" (symbol-name sym))
+        (symbol-name sym))))
+
+(defun %friendlier-message (err url)
+  "Given an error condition ERR raised while talking to URL, return
+a short user-facing string when the error matches a known pattern,
+or NIL when we have nothing better to say than the raw message."
+  (let ((msg (princ-to-string err))
+        (cls (%condition-typename err)))
+    (cond
+      ;; OpenSSL handshake against a plain-HTTP server: the first
+      ;; response bytes are 'HTTP/1.1 ...' (0x48), not a TLS record
+      ;; (0x16).  This is the single most common bring-up mistake.
+      ((and (eq (%http-scheme-of url) :https)
+            (or (search "wrong version number"        msg)
+                (search "tls_validate_record_header"  msg)))
+       (format nil
+               "TLS handshake failed against ~A — the server appears to be ~
+                serving plain HTTP, not HTTPS.~%~
+                Try OTA_SERVER=~A (no 's'), or configure TLS on the server ~
+                ([tls].cert / .key in ota.toml, or OTA_TLS_CERT / OTA_TLS_KEY)."
+               (%base-url url)
+               (%swap-scheme (%base-url url) "http")))
+      ;; cl+ssl complaining about a missing CA / self-signed cert.
+      ((and (eq (%http-scheme-of url) :https)
+            (or (search "certificate verify failed"   msg)
+                (search "self signed certificate"     msg)
+                (search "self-signed certificate"     msg)
+                (search "unable to get local issuer"  msg)))
+       (format nil
+               "TLS certificate verification failed against ~A — the ~
+                server's certificate is not trusted by this host. Use a ~
+                cert from a trusted CA, or install the server's CA into ~
+                the system trust store."
+               url))
+      ;; DNS failures.  Match on substrings AND on usocket class names.
+      ((or (search "Name or service not known"  msg)
+           (search "nodename nor servname"      msg)
+           (search "No such host is known"      msg)
+           (search "NS-HOST-NOT-FOUND"          cls)
+           (search "NS-NO-RECOVERY"             cls)
+           (search "NS-TRY-AGAIN"               cls))
+       (format nil
+               "could not resolve hostname in ~A. Check OTA_SERVER / ~
+                --server and your DNS."
+               url))
+      ;; Connection-level failures: explicit refusal first.
+      ((or (search "Connection refused"      msg)
+           (search "ECONNREFUSED"            msg)
+           (search "Couldn't connect"        msg)
+           (search "CONNECTION-REFUSED"      cls))
+       (format nil
+               "could not connect to ~A: connection refused. Is the server ~
+                running and listening on that host:port?"
+               url))
+      ;; Read deadline elapsed.  This is by far the most likely
+      ;; cause of a publish failure once the server is up: the
+      ;; bsdiff pass on the server side outlasted the client's
+      ;; read-timeout.  The server keeps working; the 201 just
+      ;; arrives at a half-closed socket.
+      ((or (search "I/O timeout"        msg)
+           (search "IO-TIMEOUT"         cls)
+           (search "DEADLINE-TIMEOUT"   cls))
+       (format nil
+               "I/O timeout while reading the response from ~A — the ~
+                server is probably still processing the request ~
+                (a publish triggers a bsdiff against every prior ~
+                release; multi-MiB blobs can take minutes).~%~
+                Bump OTA_ADMIN_READ_TIMEOUT (seconds; 0 = no ~
+                deadline) and re-run.  The server will idempotently ~
+                drop a duplicate publish if the previous one ~
+                already landed."
+               url))
+      ;; Any remaining usocket error is almost certainly some other
+      ;; transport-level problem (timeout, EINVAL on a privileged port,
+      ;; routing failure, …).  Don't try to guess the cause -- just say
+      ;; we couldn't reach the URL and pass the underlying class name
+      ;; through for debugging.  SEARCH (not STARTS-WITH-SUBSEQ) so we
+      ;; also catch test stubs whose package name contains USOCKET.
+      ((search "USOCKET" cls)
+       (format nil
+               "could not reach ~A (~A). Check OTA_SERVER / --server, the ~
+                host:port, and your network."
+               url cls))
+      (t nil))))
+
+;; Dexador's default read-timeout is 10 seconds.  An ota-admin publish
+;; against a server that has to bsdiff a multi-megabyte (or
+;; multi-gigabyte) blob will routinely take longer than that, so we
+;; bump the default to 10 minutes.  Operators can tune via
+;; OTA_ADMIN_READ_TIMEOUT (seconds, integer; or 0 for no timeout).
+(defparameter +default-read-timeout-seconds+    600)
+(defparameter +default-connect-timeout-seconds+  30)
+
+(defun %resolve-timeout (env-name fallback)
+  "Read an integer-second timeout from ENV-NAME; fall back to FALLBACK
+when the var is unset or empty.  A value of 0 means \"no deadline\"
+and is converted to NIL for dexador."
+  (let ((v (uiop:getenv env-name)))
+    (cond
+      ((or (null v) (zerop (length v))) fallback)
+      (t (let ((n (parse-integer v :junk-allowed t)))
+           (cond
+             ((null n) fallback)
+             ((zerop n) nil)
+             (t n)))))))
+
+(defun %post (url &rest args)
+  "Like DEXADOR:POST but rewrites known TLS / connection errors into
+clearer one-line messages, and bumps the read/connect timeouts to
+sane values for slow admin operations (publish triggers a bsdiff
+pass that can take minutes).  Other errors propagate unchanged."
+  (let ((rt (%resolve-timeout "OTA_ADMIN_READ_TIMEOUT"
+                              +default-read-timeout-seconds+))
+        (ct (%resolve-timeout "OTA_ADMIN_CONNECT_TIMEOUT"
+                              +default-connect-timeout-seconds+)))
+    (handler-case
+        (apply #'dexador:post url
+               :read-timeout    rt
+               :connect-timeout ct
+               args)
+      (error (c)
+        (let ((friendly (%friendlier-message c url)))
+          (if friendly
+              (error friendly)
+              (error c)))))))
 
 (defun publish (&key dir software version os arch
                      (server "http://127.0.0.1:8080")
@@ -28,16 +199,16 @@
                      (read-sequence buf in)
                      buf))))
       (multiple-value-bind (resp code)
-          (dexador:post (format nil "~A/v1/admin/software/~A/releases"
-                                server software)
-                        :headers (list (cons "Authorization"
-                                             (format nil "Bearer ~A" token))
-                                       (cons "X-Ota-Version" version)
-                                       (cons "X-Ota-Os" os)
-                                       (cons "X-Ota-Arch" arch)
-                                       (cons "X-Ota-Os-Versions" os-versions)
-                                       (cons "Content-Type" "application/octet-stream"))
-                        :content bytes)
+          (%post (format nil "~A/v1/admin/software/~A/releases"
+                         server software)
+                 :headers (list (cons "Authorization"
+                                      (format nil "Bearer ~A" token))
+                                (cons "X-Ota-Version" version)
+                                (cons "X-Ota-Os" os)
+                                (cons "X-Ota-Arch" arch)
+                                (cons "X-Ota-Os-Versions" os-versions)
+                                (cons "Content-Type" "application/octet-stream"))
+                 :content bytes)
         (delete-file tar-path)
         (format t "publish: code=~A body=~A~%" code resp)
         (force-output)
@@ -93,7 +264,7 @@
                (cls (or (and cls-from-csv (split-string cls-from-csv #\;))
                         classifications
                         '("public")))
-               (resp (dexador:post
+               (resp (%post
                       (format nil "~A/v1/admin/install-tokens" server)
                       :headers (list (cons "Authorization" (format nil "Bearer ~A" token))
                                      (cons "Content-Type" "application/json"))
@@ -122,6 +293,11 @@
         finally (push (subseq s start) acc)
                 (return (nreverse acc))))
 
+(defun version-string ()
+  "Return the version recorded in ota-admin.asd."
+  (or (asdf:component-version (asdf:find-system "ota-admin" nil))
+      "unknown"))
+
 (defun usage ()
   (format *error-output*
 "ota-admin — Ogamita Delta OTA admin CLI
@@ -133,6 +309,9 @@ Usage:
 
   ota-admin mint-tokens --csv=PATH --classifications=stable [--ttl=7d]
                         [--server=URL] [--output=tokens.tsv]
+
+  ota-admin version       print version and exit
+  ota-admin help          print this message and exit
 
 Environment:
   OTA_ADMIN_TOKEN   bearer token for admin auth (required)
@@ -155,7 +334,12 @@ Environment:
 
 (defun main (&rest argv)
   (let ((argv (or argv (uiop:command-line-arguments))))
-    (cond ((or (null argv) (string= (first argv) "help")) (usage))
+    (cond ((or (null argv)
+               (member (first argv) '("help" "-h" "--help") :test #'string=))
+           (usage))
+          ((member (first argv) '("version" "-v" "--version") :test #'string=)
+           (format t "ota-admin ~A~%" (version-string))
+           (uiop:quit 0))
           ((string= (first argv) "mint-tokens")
            (let ((rest (rest argv)))
              (mint-tokens-from-csv

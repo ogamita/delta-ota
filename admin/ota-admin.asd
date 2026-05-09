@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — administrator CLI."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "0.1.0"
+  :version "1.0.4"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :depends-on ("alexandria" "uiop" "dexador" "com.inuoe.jzon" "ota-server")
   :pathname "src/"
@@ -16,4 +16,8 @@
   :license "AGPL-3.0-or-later"
   :depends-on ("ota-admin" "fiveam")
   :pathname "tests/"
-  :components ((:file "package")))
+  :components ((:file "package")
+               (:file "cli-smoke" :depends-on ("package"))
+               (:file "error-friendlification-tests" :depends-on ("package")))
+  :perform (test-op (op c)
+             (uiop:symbol-call :ota-admin.tests :run-all)))

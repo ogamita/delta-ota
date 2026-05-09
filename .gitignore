@@ -67,6 +67,9 @@ Thumbs.db
 
 # Claude Code per-developer config
 /.claude/settings.local.json
+/.claude/scheduled_tasks.lock
 
 # Spec draft snapshot is kept beside the spec (referenced by Appendix A)
 # but is not auto-generated; it stays tracked.
+
+system-index.txt

@@ -55,7 +55,7 @@ RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp 
         --eval '(quit)' \
     && sbcl --non-interactive --no-userinit --no-sysinit \
         --load /opt/quicklisp/setup.lisp \
-        --eval '(ql:quickload (list "alexandria" "uiop" "fiveam" "ironclad" "com.inuoe.jzon" "sqlite" "clack" "woo" "dexador" "cl-ppcre"))' \
+        --eval '(ql:quickload (list "alexandria" "uiop" "fiveam" "ironclad" "com.inuoe.jzon" "clop" "sqlite" "clack" "woo" "dexador" "cl-ppcre"))' \
         --eval '(quit)' \
     && rm /tmp/quicklisp.lisp
 

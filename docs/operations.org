@@ -32,19 +32,103 @@ selected in =ota.toml= via the =[storage]= and =[catalogue]= sections.
 - For PostgreSQL topology: PG ≥ 14; the catalogue migrations are
   applied automatically on first boot.
 
-** Quick start — single host
+** Quick start — container image (canonical)
+
+The server is shipped as a multi-arch container image
+(=linux/amd64 + linux/arm64=).  This is the supported production
+deployment for both the single-host and Kubernetes topologies.
 
 #+begin_src sh
-# 1. unpack the release tarball
+# 1. pull the tagged image (replace X.Y.Z with the released version)
+docker pull registry.gitlab.com/ogamita/delta-ota/server:vX.Y.Z
+
+# 2. prepare the host
+sudo mkdir -p /var/lib/ota /etc/ota
+sudo install -m 0640 /dev/null /etc/ota/ota.toml
+sudoedit /etc/ota/ota.toml             # set hostname, [tls], etc.
+
+# 3. run.  Pass the admin token via -e (or via --env-file).
+#    See "Authentication" below -- the same value is what
+#    ota-admin must use.
+docker run -d --name ota-server                            \
+    -p 8443:8443                                           \
+    -v /var/lib/ota:/var/lib/ota                           \
+    -v /etc/ota:/etc/ota                                   \
+    -e OTA_ADMIN_TOKEN="$(openssl rand -hex 32)"           \
+    --restart unless-stopped                               \
+    registry.gitlab.com/ogamita/delta-ota/server:vX.Y.Z
+#+end_src
+
+For Kubernetes, point the container at PostgreSQL and S3 in
+=ota.toml= and let the orchestrator manage scheduling — the same
+image serves both topologies.
+
+** Quick start — single-host tarball (debug / test / evaluation)
+
+A self-contained tarball, =delta-ota-server-X.Y.Z.tar.gz=, installs
+to =/opt/ota= and runs under systemd.  This path exists for
+evaluation, debugging, and air-gapped hosts where running a
+container is inconvenient.  It is *not* attached to the
+GitLab/GitHub Release.
+
+There are two ways to obtain it:
+
+1. *From CI* — the =dist-server= job in =.gitlab-ci.yml= and the
+   matching workflow in =.github/workflows/ci.yml= build it on
+   =master= and on tags.  Pull it from the pipeline artefacts of
+   the tag (or commit) you want.
+
+2. *Locally*, from a checkout of this repository — useful for
+   reproducing the artefact a customer is running, or for cutting
+   a debug bundle off a feature branch:
+
+   #+begin_src sh
+   # Build the SBCL core, vendored helpers, and the tarball.
+   # VERSION defaults to `git describe --tags --always --dirty`.
+   make dist-server VERSION=1.0.1
+   # -> build/dist/delta-ota-server-1.0.1.tar.gz
+   # -> build/dist/delta-ota-server-1.0.1/   (unpacked staging dir)
+   #+end_src
+
+   This requires the same toolchain as =make build-server=: SBCL +
+   Quicklisp at =~/quicklisp= or =/opt/quicklisp=, Go ≥ 1.22, and
+   a C compiler for the vendored mendsley bsdiff/bspatch helpers.
+   Cross-compiling the tarball for a different host architecture
+   is not supported — build on a host of the target arch, or use
+   the published container image instead.
+
+The tarball ships a *standalone* =ota-server= executable that bundles
+the SBCL runtime; the install host only needs the dynamic-library
+runtime deps =libev4=, =libssl3=, and =libsqlite3-0= (Debian package
+names).  No system =sbcl= installation is required.
+
+#+begin_src sh
+# 1. unpack
 sudo mkdir -p /opt/ota /var/lib/ota /etc/ota
-sudo tar -C /opt/ota -xzf delta-ota-server-X.Y.Z.tar.gz
+sudo tar -C /opt/ota --strip-components=1 -xzf delta-ota-server-X.Y.Z.tar.gz
 
-# 2. drop in a config
-sudo install -m 0640 etc/ota.toml.sample /etc/ota/ota.toml
-sudoedit /etc/ota/ota.toml             # set admin_token, hostname
+# 2. user + permissions
+sudo groupadd --system ota || true
+sudo useradd  --system --gid ota --home-dir /var/lib/ota \
+              --shell /usr/sbin/nologin ota || true
+sudo chown -R ota:ota /var/lib/ota /etc/ota
 
-# 3. systemd
-sudo install -m 0644 etc/ota-server.service /etc/systemd/system/
+# 3. drop in a config
+sudo install -m 0640 -o ota -g ota \
+     /opt/ota/etc/ota.toml.sample /etc/ota/ota.toml
+sudoedit /etc/ota/ota.toml             # set hostname, [tls], etc.
+
+# 4. set the admin token (read by the systemd unit's
+#    EnvironmentFile=).  See "Authentication" below -- the same
+#    value is what ota-admin must use.
+sudo install -m 0640 -o root -g ota /dev/null /etc/ota/environment
+echo "OTA_ADMIN_TOKEN=$(openssl rand -hex 32)" \
+  | sudo tee -a /etc/ota/environment > /dev/null
+
+# 5. systemd
+sudo install -m 0644 /opt/ota/etc/ota-server.service \
+     /etc/systemd/system/ota-server.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now ota-server
 #+end_src
 
@@ -58,6 +142,7 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 | =[server]=         | =hostname=      | =localhost=            | used in URLs/manifests |
 | =[server]=         | =data_dir=      | =/var/lib/ota=         | OTA root |
 | =[server]=         | =log_level=     | =info=                 | trace/debug/info/warn |
+| =[server]=         | =worker_num=    | =4=                    | Woo HTTP worker threads (each runs its own libev loop) |
 | =[tls]=            | =cert=, =key=   | unset                  | optional; otherwise plain HTTP |
 | =[catalogue]=      | =db=            | =sqlite:db/ota.db=     | =postgres://...= for PG |
 | =[storage]=        | =backend=       | =fs=                   | =fs= (only one in v1) |
@@ -65,32 +150,230 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 | =[patcher]=        | =bsdiff_path=   | =/opt/ota/bin/bsdiff=  | absolute path; never =$PATH= |
 
 Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
-=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=.
+=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=, =OTA_WORKER_NUM=.
+Env-vars take precedence over the TOML file (see
+[[file:../server/src/config/loader.lisp][loader.lisp]]).
+
+On startup the server prints its version, the bound address, and
+the number of worker threads it actually engaged.  Sample:
+
+#+begin_example
+ota-server 1.0.4
+listening on 127.0.0.1:8443 (4 worker threads)
+data_dir=/var/lib/ota/
+manifest pubkey=…
+#+end_example
+
+If "(N worker threads)" reads "(1 worker thread)" you are on a
+single-threaded loop and a long publish will block every other
+request -- bump =[server].worker_num= or set =OTA_WORKER_NUM=.
+
+* Concurrency model
+
+The HTTP front-end is *multi-threaded* (since v1.0.4): Woo spawns
+=[server].worker_num= worker threads, each running its own libev
+event loop and sharing the listening socket via accept().  A slow
+handler -- typically the synchronous bsdiff patch build during
+=publish=, which can take minutes for a 2 GB blob -- occupies one
+worker thread for the duration but does *not* block the others.
+This is the property =ota-admin= relies on for a sequence of
+publishes (and =ota-agent= relies on for first-Monday-morning
+upgrade storms): one in-flight publish does not stall concurrent
+reads or admin requests.
+
+The catalogue (SQLite) is opened in *WAL mode* with a 10-second
+=busy_timeout=, so concurrent readers + one writer never block
+each other through the journal.  All catalogue access from the
+HTTP layer goes through a recursive lock so the C library is
+never re-entered concurrently from the Lisp side either.  The
+combination keeps every public endpoint responsive while a long
+publish is in flight.
+
+Sizing guidance:
+
+| Workload                            | =worker_num=                                     |
+|-------------------------------------+--------------------------------------------------|
+| Local development                   | 4 (the dev sample)                               |
+| Single-host production, mixed       | ≈ CPU cores; cap by =[patcher].worker_count= + 4 |
+| Read-heavy (10 000 clients on first Monday) | 8–16; the =sendfile(2)= fast path scales sub-linearly with worker count |
+| Behind a reverse proxy doing TLS    | ≈ proxy concurrency limit                        |
+
+The patcher worker count is *separate*: =[patcher].worker_count=
+governs how many concurrent =bsdiff(1)= subprocesses the publish
+handler is willing to spawn.  Today the patch build inside
+=publish= is still synchronous in the calling thread (one worker
+per in-flight publish); =worker_num= simply ensures other
+requests stay responsive while it runs.
+
+* Authentication — the admin token
+
+The =OTA_ADMIN_TOKEN= is a *shared secret*.  The server compares
+incoming =Authorization: Bearer <token>= headers against it on every
+admin endpoint; =ota-admin= sends exactly the same value to
+authenticate its requests.  *The two must match* — the token is
+not derived, exchanged, or discoverable; it is whatever the
+operator wrote into the server's environment at boot.
+
+** Where the server reads it from
+
+Resolution order, lowest precedence first
+([[file:../server/src/config/loader.lisp][server/src/config/loader.lisp]]):
+
+1. *Built-in default* =dev-token= (=*defaults*=).  Convenient for
+   local development; *never* acceptable in production.
+2. *TOML configuration file* — currently *not* mapped.  An
+   =admin_token= key in =ota.toml= is ignored today.  This is a
+   known gap (the loader only reads =[server]/[tls]/[storage]/
+   [catalogue]/[patcher]/[gc]/[install_token]= keys; admin token
+   has no TOML key in v1).
+3. *Environment variable* =OTA_ADMIN_TOKEN= — always wins when set.
+   This is the only supported way to set a non-default token in v1.
+
+In practice this means: *to set a real production token, set
+=OTA_ADMIN_TOKEN= in the environment of the server process.*
+
+| Deployment       | Where to set =OTA_ADMIN_TOKEN=                                                |
+|------------------+-------------------------------------------------------------------------------|
+| =make run-server=| Inline on the command line: =OTA_ADMIN_TOKEN=xxxxx make run-server=           |
+| Docker / compose | =-e OTA_ADMIN_TOKEN=xxxxx= or an =--env-file=                                 |
+| Tarball + systemd| =/etc/ota/environment= (read by the unit's =EnvironmentFile=-/etc/ota/environment=) |
+| Kubernetes       | A =Secret= mounted as =OTA_ADMIN_TOKEN= via =envFrom=/=env=                   |
+
+To verify what the running process actually has on a Linux host you
+can shell into:
+
+#+begin_src sh
+sudo tr '\0' '\n' < /proc/$(pgrep -f ota-server)/environ \
+  | grep ^OTA_ADMIN_TOKEN=
+#+end_src
+
+** Where =ota-admin= reads it from
+
+=ota-admin= takes the token from the =OTA_ADMIN_TOKEN= environment
+variable ([[file:../admin/src/main.lisp][admin/src/main.lisp]]); there is no flag for it (the token
+is a credential and command-line history is not the right place
+for it).  You typically pull it out of a password store and export
+it for the duration of a publish session:
+
+#+begin_src sh
+export OTA_SERVER=https://ota.example.com
+export OTA_ADMIN_TOKEN=$(pass show ota/admin)
+admin/build/ota-admin publish ./build/release/ \
+    --software=schms --version=3.4.1          \
+    --os=windows    --arch=x86_64
+#+end_src
+
+If unset, =ota-admin publish= and =ota-admin mint-tokens= refuse to
+proceed with =ota-admin: ota-admin publish: OTA_ADMIN_TOKEN env var
+or :token argument required=.
+
+** Timeouts (=OTA_ADMIN_READ_TIMEOUT=, =OTA_ADMIN_CONNECT_TIMEOUT=)
+
+A =publish= triggers a synchronous bsdiff pass on the server: one
+patch from every prior release of the same =(software, os, arch)=
+to the new one.  For a multi-megabyte blob each patch takes a few
+seconds; for a multi-gigabyte blob each can take minutes.  The
+=ota-admin= HTTP client must wait for the server to finish before
+the 201 response arrives.
+
+Default deadlines (seconds):
+
+| Variable                     | Default | =0= means       |
+|------------------------------+---------+-----------------|
+| =OTA_ADMIN_READ_TIMEOUT=     | 600     | no read deadline |
+| =OTA_ADMIN_CONNECT_TIMEOUT=  | 30      | no connect deadline |
+
+If a =publish= fails with =I/O timeout while reading the response
+from URL=, bump =OTA_ADMIN_READ_TIMEOUT= and re-run.  The server's
+publish handler is idempotent on the =(software, os, arch,
+version)= tuple — a duplicate publish whose first attempt actually
+landed on the server (which is what client-side timeouts mean) is
+dropped on retry.
+
+#+begin_src sh
+# 30-minute deadline for a 4 GiB blob with many priors.
+OTA_ADMIN_READ_TIMEOUT=1800 \
+  make publish DIR=./build/release SOFTWARE=schms VERSION=3.4.1 \
+               OS=windows ARCH=x86_64
+
+# No deadline at all (useful when piping through a slow VPN).
+OTA_ADMIN_READ_TIMEOUT=0 \
+  admin/build/ota-admin publish ...
+#+end_src
+
+** Generating and rotating the token
+
+Generate a fresh token (32 bytes, hex) on the server host:
+
+#+begin_src sh
+openssl rand -hex 32
+#+end_src
+
+Rotation is a *coordinated edit*: change the value in the server's
+environment AND in your password store at the same time, then
+restart the server.  Existing per-client install bearers
+(=state.json=) are *unaffected* — those are issued by
+=POST /v1/exchange-token= and are not derived from the admin
+token.  Only operator workflows (=publish=, =mint-tokens=,
+=verify=, =gc=, =audit=, =install-tokens/batch=) need the new
+admin token.
 
 * Day-to-day operations
 
 ** Publish a release
 
-From a developer workstation that has =ota-admin= installed:
+=ota-admin= is built from this repository as a standalone executable
+at =admin/build/ota-admin=:
+
+#+begin_src sh
+make build-admin   # produces admin/build/ota-admin
+#+end_src
+
+From a developer workstation.  =OTA_ADMIN_TOKEN= must match the value
+the server was started with — see [[*Authentication — the admin token][Authentication — the admin token]].
 
 #+begin_src sh
 export OTA_SERVER=https://ota.example.com
 export OTA_ADMIN_TOKEN=$(pass show ota/admin)
 
-ota-admin publish ./build/release/      \
-    --software=schms                    \
-    --version=3.4.1                     \
-    --os=windows --arch=x86_64          \
+# Either invoke the binary directly...
+admin/build/ota-admin publish ./build/release/  \
+    --software=schms                            \
+    --version=3.4.1                             \
+    --os=windows --arch=x86_64                  \
     --os-versions=10,11
+
+# ...or use the Makefile convenience wrapper:
+make publish DIR=./build/release SOFTWARE=schms VERSION=3.4.1 \
+             OS=windows ARCH=x86_64 OS_VERSIONS=10,11
 #+end_src
 
 The server hashes the payload, stores the blob, builds patches from
 every prior release of the same =(software, os, arch)= triple, and
-re-signs the manifest.
+re-signs the manifest.  Per-patch progress is logged to the
+server's stdout ("publish: bsdiff N/M from VERSION ..."), so an
+operator tailing the log can see how far through the fan-in pass
+the publish is.
+
+The publish handler is *idempotent* on the
+=(software, os, arch, version)= tuple:
+
+| Repeat call shape                                | Server response |
+|-------------------------------------------------+-----------------|
+| Same tuple, same blob hash                       | =200= with =idempotent: true= -- the prior 201 is what's on the server, the patches it built are still there |
+| Same tuple, *different* blob hash                | =409 Conflict= -- bump the version, or delete the existing release first |
+| New tuple (any of software/os/arch/version differs) | =201= as usual  |
+
+This is what makes a client-side I/O timeout (see Authentication
+=> Timeouts above) a safe retry: re-running the same publish after
+the first attempt landed costs you a re-upload but does not
+duplicate or corrupt anything.
 
 ** Mint an install token
 
-Required for first-time installs by an unmanaged client:
+Required for first-time installs by an unmanaged client.
+
+For a single token, =curl= is enough:
 
 #+begin_src sh
 curl -X POST                                        \
@@ -98,6 +381,21 @@ curl -X POST                                        \
      -H "Content-Type: application/json"            \
      -d '{"classifications":["public"],"ttl_seconds":900}'  \
      https://ota.example.com/v1/admin/install-tokens
+#+end_src
+
+For bulk minting from a CSV of users (one row per token, name +
+email + classification), use the admin CLI -- it emits a TSV ready
+for mail-merge:
+
+#+begin_src sh
+admin/build/ota-admin mint-tokens             \
+    --csv=users.csv                           \
+    --classifications=stable                  \
+    --ttl=7d                                  \
+    --output=tokens.tsv
+
+# Or via the Makefile wrapper:
+make mint-tokens CSV=users.csv CLASSIFICATIONS=stable TTL=7d
 #+end_src
 
 The token is one-shot and short-TTL.  The user pastes it into

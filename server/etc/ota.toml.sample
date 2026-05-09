@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Ogamita Ltd.
+#
+# Sample configuration for a single-host install of ota-server
+# unpacked from delta-ota-server-X.Y.Z.tar.gz.
+#
+# This layout assumes the standard install paths used by
+# etc/ota-server.service:
+#   /opt/ota/        — application bits (core image + helpers)
+#   /var/lib/ota/    — data directory (blobs, patches, db, keys)
+#   /etc/ota/        — configuration + TLS material
+#
+# This file is intended for evaluation / debugging hosts. Production
+# deployments should use the published container image — see
+# docs/operations.org.
+
+[server]
+# The recommended deployment terminates TLS at a reverse proxy
+# (nginx, HAProxy, …) and binds the server to localhost. To expose
+# the server directly on the public interface, configure [tls] below
+# and switch to "0.0.0.0:8443".
+listen     = "127.0.0.1:8443"
+hostname   = "ota.example.com"
+data_dir   = "/var/lib/ota"
+log_level  = "info"
+# Number of Woo worker threads.  Each runs its own libev loop and
+# shares the listening socket; one slow handler does not wedge the
+# others.  Set to roughly your CPU count for read-heavy traffic
+# (10k clients fetching manifests + sendfile blobs on first-Monday
+# upgrades).  Defaults to 4 when omitted.
+worker_num = 4
+
+[tls]
+# Uncomment when terminating TLS in the server itself (no proxy).
+# cert         = "/etc/ota/server.crt"
+# key          = "/etc/ota/server.key"
+# client_ca    = "/etc/ota/clients-ca.crt"
+require_mtls = false
+
+[storage]
+backend = "fs"
+
+[catalogue]
+db = "sqlite:/var/lib/ota/db/ota.db"
+
+[patcher]
+default      = "bsdiff"
+worker_count = 2
+bsdiff_path  = "/opt/ota/bin/bsdiff"
+bspatch_path = "/opt/ota/bin/bspatch"
+# xdelta3 is intentionally not configured: see docs/adr/0004-bsdiff-only-no-xdelta3.org
+
+[gc]
+default_threshold = 0
+schedule          = "0 3 * * *"
+
+[install_token]
+ttl_seconds = 900

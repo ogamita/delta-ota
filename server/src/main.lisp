@@ -1,40 +1,74 @@
 ;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;; Copyright (C) 2026 Ogamita Ltd.
+;;;
+;;; ota-server — top-level CLI dispatch.
+;;;
+;;; The build script saves an executable whose toplevel calls
+;;; (ota-server:main) with no arguments; we read argv ourselves
+;;; via UIOP:COMMAND-LINE-ARGUMENTS.  When called from the test
+;;; harness or the e2e shell scripts, MAIN can also be invoked
+;;; programmatically:
+;;;
+;;;   (ota-server:main "serve" "--config=server/etc/ota.dev.toml")
+;;;   (ota-server:main :config "server/etc/ota.dev.toml")  ; legacy
+;;;
+;;; — i.e. the &rest argv form (string args) and the legacy
+;;; &key form both work.  The legacy form is preserved so the
+;;; existing e2e harness and any out-of-tree callers do not break.
 
 (defpackage #:ota-server
   (:use #:cl)
   (:export #:main
+           #:serve
            #:migrate
            #:run-gc
-           #:*default-config*))
+           #:version-string))
 
 (in-package #:ota-server)
 
-(defparameter *default-config*
-  (list :host "127.0.0.1"
-        :port 8080
-        :data-dir "./build/dev/ota-data"
-        :admin-token "dev-token"))
+;; ---------------------------------------------------------------------------
+;; Version
+;; ---------------------------------------------------------------------------
 
-(defun env-or-default (env-name fallback)
-  (or (uiop:getenv env-name) fallback))
+(defun version-string ()
+  "Return the version recorded in ota-server.asd."
+  (or (asdf:component-version (asdf:find-system "ota-server" nil))
+      "unknown"))
 
-(defun env-port (env-name fallback)
-  (let ((s (uiop:getenv env-name)))
-    (if s (parse-integer s) fallback)))
+;; ---------------------------------------------------------------------------
+;; Tiny argv helpers (kept first-party — same flavour as ota-admin)
+;; ---------------------------------------------------------------------------
 
-(defun load-config-from-env ()
-  (list :host (env-or-default "OTA_HOST" "0.0.0.0")
-        :port (env-port "OTA_PORT" 8080)
-        :data-dir (env-or-default "OTA_ROOT" "./build/dev/ota-data")
-        :admin-token (env-or-default "OTA_ADMIN_TOKEN" "dev-token")
-        :tls-cert (uiop:getenv "OTA_TLS_CERT")
-        :tls-key  (uiop:getenv "OTA_TLS_KEY")))
+(defun %get-flag (argv name)
+  "Look up --NAME=value or --NAME value in ARGV.  Returns the value
+string or NIL when absent."
+  (let ((eq-prefix (concatenate 'string "--" name "="))
+        (bare      (concatenate 'string "--" name)))
+    (loop for tail on argv
+          for a = (first tail)
+          when (alexandria:starts-with-subseq eq-prefix a)
+            return (subseq a (length eq-prefix))
+          when (string= a bare)
+            return (second tail))))
 
-(defun main (&key config)
-  "Boot the server. CONFIG is a plist; otherwise environment vars are
-   consulted (OTA_HOST, OTA_PORT, OTA_ROOT, OTA_ADMIN_TOKEN)."
-  (let* ((cfg (or config (load-config-from-env)))
+(defun %positional (argv)
+  "Return the positional (non-flag) arguments from ARGV."
+  (loop for a in argv
+        unless (alexandria:starts-with-subseq "--" a)
+          collect a))
+
+;; ---------------------------------------------------------------------------
+;; Subcommands
+;; ---------------------------------------------------------------------------
+
+(defun %resolve (config)
+  (ota-server.config:resolve-config config))
+
+(defun serve (&key config)
+  "Boot the server.  CONFIG: NIL → defaults+env-vars; pathname/string
+→ TOML file (env-vars override); plist → already-resolved (test
+harness)."
+  (let* ((cfg (%resolve config))
          (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
          (cas (ota-server.storage:make-cas root))
          (db (ota-server.catalogue:open-catalogue
@@ -53,35 +87,123 @@
     (ota-server.catalogue:run-migrations db)
     (ensure-directories-exist
      (ota-server.http::app-state-manifests-dir state))
-    (format t "ota-server: listening on ~A:~A~%  data_dir=~A~%  manifest pubkey=~A~%"
-            (getf cfg :host) (getf cfg :port) root
+    (format t "ota-server ~A~%~
+               listening on ~A:~A (~A worker thread~:P)~%~
+               data_dir=~A~%~
+               manifest pubkey=~A~%"
+            (version-string)
+            (getf cfg :host) (getf cfg :port)
+            (or (getf cfg :worker-num) 1)
+            root
             (ota-server.manifest:keypair-public-hex kp))
     (force-output)
     (let ((handler
             (ota-server.http:start-server state
-                                          :host (getf cfg :host)
-                                          :port (getf cfg :port))))
+                                          :host       (getf cfg :host)
+                                          :port       (getf cfg :port)
+                                          :worker-num (getf cfg :worker-num))))
       (format t "ota-server: ready.~%")
       (force-output)
-      ;; Block forever: SBCL's clackup with woo runs in the same thread
-      ;; if :worker-num is unspecified; otherwise we wait on the
-      ;; handler.  For now, sleep until interrupted.
       (handler-case
           (loop (sleep 86400))
         (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
-      (ota-server.http:stop-server handler))))
+      (ota-server.http:stop-server handler))
+    0))
 
 (defun migrate (&key config)
-  (let* ((cfg (or config (load-config-from-env)))
+  "Apply catalogue migrations and exit."
+  (let* ((cfg (%resolve config))
          (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
          (db (ota-server.catalogue:open-catalogue
               (merge-pathnames "db/ota.db" root))))
     (ota-server.catalogue:run-migrations db)
     (ota-server.catalogue:close-catalogue db)
     (format t "ota-server: migrations applied at ~A~%" (merge-pathnames "db/ota.db" root))
-    (force-output)))
+    (force-output)
+    0))
 
 (defun run-gc (&key config)
+  "Run garbage collection and exit (currently a stub)."
   (declare (ignore config))
   (format t "ota-server gc: phase-1 stub.~%")
-  (force-output))
+  (force-output)
+  0)
+
+;; ---------------------------------------------------------------------------
+;; Usage
+;; ---------------------------------------------------------------------------
+
+(defun %usage (&optional (stream *error-output*))
+  (format stream
+"ota-server — Ogamita Delta OTA distribution server
+
+Usage:
+  ota-server serve   [--config=PATH]    boot the server (default subcommand)
+  ota-server migrate [--config=PATH]    apply catalogue migrations and exit
+  ota-server gc      [--config=PATH]    run garbage collection and exit
+  ota-server shell                      drop into an SBCL REPL (debug only)
+  ota-server version                    print version and exit
+  ota-server help                       print this message and exit
+
+Configuration:
+  --config=PATH      path to a TOML config file.  When omitted, the server
+                     starts from built-in defaults overlaid by environment
+                     variables.
+
+Environment variables (override file values):
+  OTA_HOST           bind address           (default 127.0.0.1)
+  OTA_PORT           TCP port               (default 8443)
+  OTA_ROOT           data directory         (default ./build/dev/ota-data)
+  OTA_ADMIN_TOKEN    admin bearer token     (required for admin endpoints)
+  OTA_TLS_CERT       path to PEM TLS cert   (optional; otherwise plain HTTP)
+  OTA_TLS_KEY        path to PEM TLS key    (optional)
+")
+  (force-output stream))
+
+;; ---------------------------------------------------------------------------
+;; Top-level dispatch
+;; ---------------------------------------------------------------------------
+
+(defun %dispatch-argv (argv)
+  "Process ARGV (a list of strings) and return an integer exit code."
+  (let* ((cmd (or (first argv) "serve"))
+         (rest (rest argv))
+         (config (%get-flag rest "config")))
+    (cond
+      ((member cmd '("help" "-h" "--help") :test #'string=)
+       (%usage)
+       2)
+      ((member cmd '("version" "-v" "--version") :test #'string=)
+       (format t "ota-server ~A~%" (version-string))
+       0)
+      ((string= cmd "serve")
+       (or (serve :config config) 0))
+      ((string= cmd "migrate")
+       (or (migrate :config config) 0))
+      ((string= cmd "gc")
+       (or (run-gc :config config) 0))
+      ((string= cmd "shell")
+       #+sbcl (sb-impl::toplevel-init)
+       0)
+      (t
+       (format *error-output* "ota-server: unknown subcommand: ~A~%~%" cmd)
+       (%usage)
+       2))))
+
+(defun main (&rest argv)
+  "Top-level entry point.  Two calling conventions:
+
+  - String args: (main \"serve\" \"--config=...\") or no args (read
+    UIOP:COMMAND-LINE-ARGUMENTS).  Returns an integer exit code.
+
+  - Legacy keyword form: (main :config <plist-or-pathname-or-nil>)
+    -- preserved so the e2e harness and out-of-tree callers do not
+    break.  Calls SERVE directly."
+  (cond
+    ;; Legacy keyword call: (main :config X).
+    ((and argv (keywordp (first argv)))
+     (apply #'serve argv))
+    ;; CLI call: pass strings, or nothing (read argv).
+    (t
+     (let ((argv (or argv (uiop:command-line-arguments))))
+       (%dispatch-argv argv)))))
