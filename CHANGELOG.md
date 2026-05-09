@@ -20,6 +20,42 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Fixed
+- **`publish` is now idempotent on `(software, os, arch, version)`
+  — duplicate publishes no longer crash the server with `500
+  UNIQUE constraint failed: releases.…`.** The handler now looks
+  up the tuple before inserting and decides:
+  - same blob hash → `200 {"idempotent": true, …}` with the
+    existing release-id and the count of patches already on disk;
+  - different blob hash → `409 Conflict` with a clear message
+    naming both blob hashes and telling the operator to bump the
+    version or delete the existing release first;
+  - new tuple → `201` as before.
+
+  This is what makes a client-side I/O timeout a safe retry: the
+  re-run will either succeed-as-200 (if the first attempt actually
+  landed) or proceed normally.
+
+### Added
+- **Server prints its version + worker count on startup.** The
+  banner now reads `ota-server X.Y.Z\nlistening on H:P (N worker
+  thread{s})\n…` — operators can immediately verify which build
+  is running and that multi-thread mode is engaged. If you see
+  "(1 worker thread)" your `[server].worker_num` is mis-set.
+- **`OTA_WORKER_NUM` env-var override** for symmetry with the
+  other `OTA_*` vars (overrides `[server].worker_num` from the
+  TOML file).
+- **Per-patch progress logging during publish.** The patch worker
+  now logs `publish: building N patches for SW/OS-ARCH/VER` plus
+  `publish: bsdiff i/N from VERSION (BYTES bytes) ...` for each
+  prior release. An operator tailing the server log can see how
+  far through the fan-in pass a publish is. (Real-time progress
+  in the HTTP response would require a chunked-transfer
+  rewrite — deferred to a later phase.)
+- **New `ota-server.catalogue:get-release-by-tuple`** plus 3
+  unit tests + a worker-num-env-override test (server suite is
+  now 116 checks, was 109).
+
+### Fixed
 - **`ota-admin publish` no longer times out client-side while the
   server is still processing.** Dexador's default
   `*default-read-timeout*` is **10 seconds** — far too short for a

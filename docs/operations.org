@@ -150,8 +150,23 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 | =[patcher]=        | =bsdiff_path=   | =/opt/ota/bin/bsdiff=  | absolute path; never =$PATH= |
 
 Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
-=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=.  Env-vars take
-precedence over the TOML file (see [[file:../server/src/config/loader.lisp][loader.lisp]]).
+=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=, =OTA_WORKER_NUM=.
+Env-vars take precedence over the TOML file (see
+[[file:../server/src/config/loader.lisp][loader.lisp]]).
+
+On startup the server prints its version, the bound address, and
+the number of worker threads it actually engaged.  Sample:
+
+#+begin_example
+ota-server 1.0.4
+listening on 127.0.0.1:8443 (4 worker threads)
+data_dir=/var/lib/ota/
+manifest pubkey=…
+#+end_example
+
+If "(N worker threads)" reads "(1 worker thread)" you are on a
+single-threaded loop and a long publish will block every other
+request -- bump =[server].worker_num= or set =OTA_WORKER_NUM=.
 
 * Concurrency model
 
@@ -335,7 +350,24 @@ make publish DIR=./build/release SOFTWARE=schms VERSION=3.4.1 \
 
 The server hashes the payload, stores the blob, builds patches from
 every prior release of the same =(software, os, arch)= triple, and
-re-signs the manifest.
+re-signs the manifest.  Per-patch progress is logged to the
+server's stdout ("publish: bsdiff N/M from VERSION ..."), so an
+operator tailing the log can see how far through the fan-in pass
+the publish is.
+
+The publish handler is *idempotent* on the
+=(software, os, arch, version)= tuple:
+
+| Repeat call shape                                | Server response |
+|-------------------------------------------------+-----------------|
+| Same tuple, same blob hash                       | =200= with =idempotent: true= -- the prior 201 is what's on the server, the patches it built are still there |
+| Same tuple, *different* blob hash                | =409 Conflict= -- bump the version, or delete the existing release first |
+| New tuple (any of software/os/arch/version differs) | =201= as usual  |
+
+This is what makes a client-side I/O timeout (see Authentication
+=> Timeouts above) a safe retry: re-running the same publish after
+the first attempt landed costs you a re-upload but does not
+duplicate or corrupt anything.
 
 ** Mint an install token
 

@@ -481,44 +481,84 @@ incrementally — typically a small fraction of the full payload.</small></p>
              (ota-server.storage:put-blob-from-file (app-state-cas app) tmp-path)
            (let* ((release-id (format nil "~A/~A-~A/~A" software os arch version))
                   (osversions (parse-csv osvers))
-                  (manifest-plist
-                    (ota-server.manifest:build-manifest-plist
-                     :software software :os os :arch arch
-                     :os-versions osversions :version version
-                     :blob-sha256 sha :blob-size size
-                     :blob-url (format nil "/v1/blobs/~A" sha)
-                     :notes notes))
-                  (manifest-bytes (ota-server.manifest:manifest-to-json-bytes manifest-plist))
-                  (manifest-sha (ota-server.storage:sha256-hex-of-bytes manifest-bytes))
-                  (sig (ota-server.manifest:sign-bytes
-                        manifest-bytes
-                        (ota-server.manifest:keypair-private (app-state-keypair app))
-                        (ota-server.manifest:keypair-public  (app-state-keypair app))))
-                  (mdir (app-state-manifests-dir app)))
-             (ensure-directories-exist
-              (merge-pathnames (format nil "~A/" software) mdir))
-             (write-bytes (merge-pathnames
-                           (format nil "~A/~A.json" software version) mdir)
-                          manifest-bytes)
-             (write-bytes (merge-pathnames
-                           (format nil "~A/~A.sig" software version) mdir)
-                          sig)
-             (ota-server.catalogue:insert-release
-              (app-state-catalogue app)
-              :release-id release-id
-              :software software :os os :arch arch
-              :os-versions osversions
-              :version version
-              :blob-sha256 sha :blob-size size
-              :manifest-sha256 manifest-sha
-              :classifications (parse-csv (or (header-of headers "x-ota-classifications") ""))
-              :channels        (parse-csv (or (header-of headers "x-ota-channels") ""))
-              :notes notes)
-             (ota-server.catalogue:append-audit
-              (app-state-catalogue app)
-              :identity "admin" :action "publish-release"
-              :target release-id
-              :detail (format nil "blob=~A size=~A" sha size))
+                  (existing (ota-server.catalogue:get-release-by-tuple
+                             (app-state-catalogue app) software os arch version)))
+             ;; Idempotent re-publish: same (software, os, arch,
+             ;; version) tuple as a prior release.  v1.0.4: instead
+             ;; of letting the UNIQUE constraint blow up with a
+             ;; cl-sqlite 500, decide based on whether the blob
+             ;; matches.
+             (when existing
+               (cond
+                 ((string= (getf existing :blob-sha256) sha)
+                  ;; Exact same content -- treat as idempotent
+                  ;; success.  Re-fetch the current patch fan-in so
+                  ;; the response's patches_built reflects what is
+                  ;; actually on disk, not 0 (the bsdiff already
+                  ;; ran the first time).
+                  (let ((patches-in (ota-server.catalogue:list-patches-to
+                                     (app-state-catalogue app)
+                                     (getf existing :release-id))))
+                    (return-from handle-admin-publish-release
+                      (json-response 200
+                                     (obj "release_id"      (getf existing :release-id)
+                                          "blob_sha256"     (getf existing :blob-sha256)
+                                          "blob_size"       (getf existing :blob-size)
+                                          "manifest_sha256" (getf existing :manifest-sha256)
+                                          "patches_built"   (length patches-in)
+                                          "idempotent"      t)))))
+                 (t
+                  ;; Different content under the same version --
+                  ;; operator error (or a leftover from a botched
+                  ;; previous run).  409 Conflict tells the client
+                  ;; to either bump the version or explicitly
+                  ;; delete the prior release first.
+                  (return-from handle-admin-publish-release
+                    (error-response 409
+                                    "release already exists with different content"
+                                    (format nil
+                                            "version ~A of ~A/~A-~A is published with blob ~A; ~
+                                             the upload's blob is ~A. Bump the version, or delete the existing release first."
+                                            version software os arch
+                                            (getf existing :blob-sha256) sha))))))
+             (let* ((manifest-plist
+                      (ota-server.manifest:build-manifest-plist
+                       :software software :os os :arch arch
+                       :os-versions osversions :version version
+                       :blob-sha256 sha :blob-size size
+                       :blob-url (format nil "/v1/blobs/~A" sha)
+                       :notes notes))
+                    (manifest-bytes (ota-server.manifest:manifest-to-json-bytes manifest-plist))
+                    (manifest-sha (ota-server.storage:sha256-hex-of-bytes manifest-bytes))
+                    (sig (ota-server.manifest:sign-bytes
+                          manifest-bytes
+                          (ota-server.manifest:keypair-private (app-state-keypair app))
+                          (ota-server.manifest:keypair-public  (app-state-keypair app))))
+                    (mdir (app-state-manifests-dir app)))
+               (ensure-directories-exist
+                (merge-pathnames (format nil "~A/" software) mdir))
+               (write-bytes (merge-pathnames
+                             (format nil "~A/~A.json" software version) mdir)
+                            manifest-bytes)
+               (write-bytes (merge-pathnames
+                             (format nil "~A/~A.sig" software version) mdir)
+                            sig)
+               (ota-server.catalogue:insert-release
+                (app-state-catalogue app)
+                :release-id release-id
+                :software software :os os :arch arch
+                :os-versions osversions
+                :version version
+                :blob-sha256 sha :blob-size size
+                :manifest-sha256 manifest-sha
+                :classifications (parse-csv (or (header-of headers "x-ota-classifications") ""))
+                :channels        (parse-csv (or (header-of headers "x-ota-channels") ""))
+                :notes notes)
+               (ota-server.catalogue:append-audit
+                (app-state-catalogue app)
+                :identity "admin" :action "publish-release"
+                :target release-id
+                :detail (format nil "blob=~A size=~A" sha size))
              ;; Build patches from every prior release of the same
              ;; (software, os, arch) to this new release, then
              ;; re-render the manifest with patches_in populated and
@@ -562,7 +602,7 @@ incrementally — typically a small fraction of the full payload.</small></p>
                                    "blob_sha256" sha
                                    "blob_size" size
                                    "manifest_sha256" manifest-sha
-                                   "patches_built" (length patches-in)))))))))))
+                                   "patches_built" (length patches-in))))))))))))
 
 (defun write-body-to-tmp (env cas)
   "Stream the request body into a temp file under the CAS."

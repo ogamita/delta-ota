@@ -87,8 +87,14 @@ harness)."
     (ota-server.catalogue:run-migrations db)
     (ensure-directories-exist
      (ota-server.http::app-state-manifests-dir state))
-    (format t "ota-server: listening on ~A:~A~%  data_dir=~A~%  manifest pubkey=~A~%"
-            (getf cfg :host) (getf cfg :port) root
+    (format t "ota-server ~A~%~
+               listening on ~A:~A (~A worker thread~:P)~%~
+               data_dir=~A~%~
+               manifest pubkey=~A~%"
+            (version-string)
+            (getf cfg :host) (getf cfg :port)
+            (or (getf cfg :worker-num) 1)
+            root
             (ota-server.manifest:keypair-public-hex kp))
     (force-output)
     (let ((handler

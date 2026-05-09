@@ -184,3 +184,76 @@ worker_num = 16
                 (ota-server.config:load-config-from-file tmp)
                 :getenv (lambda (n) (declare (ignore n)) nil))))
       (is (= 16 (getf cfg :worker-num))))))
+
+(test worker-num-env-overrides-toml
+  "OTA_WORKER_NUM env-var beats both defaults and the TOML file."
+  (let ((cfg (ota-server.config:apply-env-overrides
+              (list :worker-num 4)
+              :getenv (lambda (n)
+                        (when (string= n "OTA_WORKER_NUM") "32")))))
+    (is (= 32 (getf cfg :worker-num)))))
+
+;; ---------------------------------------------------------------------------
+;; Idempotent publish: the catalogue lookup that feeds it.
+;; ---------------------------------------------------------------------------
+
+(test get-release-by-tuple-roundtrips
+  "INSERT-RELEASE then GET-RELEASE-BY-TUPLE returns the same row."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "idem")
+           (ota-server.catalogue:insert-release
+            cat
+            :release-id "idem/linux-amd64/1.0.0"
+            :software "idem"
+            :os "linux" :arch "amd64" :os-versions #("12")
+            :version "1.0.0"
+            :blob-sha256 "deadbeef" :blob-size 42
+            :manifest-sha256 "feedface"
+            :published-by "test")
+           (let ((r (ota-server.catalogue:get-release-by-tuple
+                     cat "idem" "linux" "amd64" "1.0.0")))
+             (is (not (null r)))
+             (is (string= "deadbeef" (getf r :blob-sha256)))
+             (is (= 42 (getf r :blob-size)))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test get-release-by-tuple-discriminates-arch
+  "Two releases with the same software/version but different arch are
+distinct rows; the lookup returns the right one for each."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "multiarch")
+           (dolist (arch '("amd64" "arm64"))
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "multiarch/linux-~A/1.0.0" arch)
+              :software "multiarch"
+              :os "linux" :arch arch :os-versions #()
+              :version "1.0.0"
+              :blob-sha256 (concatenate 'string "blob-" arch)
+              :blob-size 1
+              :manifest-sha256 "x"
+              :published-by "test"))
+           (is (string= "blob-amd64"
+                        (getf (ota-server.catalogue:get-release-by-tuple
+                               cat "multiarch" "linux" "amd64" "1.0.0")
+                              :blob-sha256)))
+           (is (string= "blob-arm64"
+                        (getf (ota-server.catalogue:get-release-by-tuple
+                               cat "multiarch" "linux" "arm64" "1.0.0")
+                              :blob-sha256))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test get-release-by-tuple-misses-cleanly
+  "An unknown tuple returns NIL (not an error)."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (is (null (ota-server.catalogue:get-release-by-tuple
+                    cat "no-such" "no" "no" "0.0.0")))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))

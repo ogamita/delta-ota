@@ -158,6 +158,8 @@ canned values without mutating the real environment."
       (setf (getf cfg :tls-cert) v))
     (alexandria:when-let ((v (%nonempty (funcall getenv "OTA_TLS_KEY"))))
       (setf (getf cfg :tls-key) v))
+    (alexandria:when-let ((v (%nonempty (funcall getenv "OTA_WORKER_NUM"))))
+      (setf (getf cfg :worker-num) (parse-integer v)))
     cfg))
 
 (defun load-config-from-env (&key (getenv #'uiop:getenv))

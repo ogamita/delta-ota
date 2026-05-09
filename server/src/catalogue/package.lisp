@@ -12,6 +12,7 @@
            #:insert-release
            #:list-releases
            #:get-release
+           #:get-release-by-tuple
            #:get-latest-release
            #:record-install-event
            #:insert-patch

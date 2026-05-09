@@ -176,6 +176,18 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
                  software-name version)))
       (when rows (row-to-release (first rows))))))
 
+(defun get-release-by-tuple (catalogue software-name os arch version)
+  "Look up a release by the full UNIQUE tuple (software_name, os,
+arch, version).  Returns the release plist or NIL.  Used by the
+publish handler for idempotent re-publish detection."
+  (with-catalogue (db catalogue)
+    (let ((rows (sqlite:execute-to-list
+                 db
+                 (format nil "SELECT ~A FROM releases WHERE software_name = ? AND os = ? AND arch = ? AND version = ?"
+                         *release-columns*)
+                 software-name os arch version)))
+      (when rows (row-to-release (first rows))))))
+
 (defun get-latest-release (catalogue software-name)
   (with-catalogue (db catalogue)
     (let ((rows (sqlite:execute-to-list
