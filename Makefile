@@ -185,6 +185,7 @@ docs: docs-pdf
 docs-pdf: $(PDF_FILES)
 docs-clean:
 	rm -rf $(PDF_OUT)
+	rm -f server/system-index.txt
 
 $(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
 	@mkdir -p $(PDF_OUT)
