@@ -425,21 +425,48 @@ do not require =OTA_ADMIN_TOKEN=.
 For unattended dashboards / orchestration, every command exits
 non-zero on failure and writes its data to stdout.
 
-*Footgun:* the server's "latest release" endpoint
-(=GET /v1/software/<sw>/releases/latest=, used by
-=list --remote --latest= and by =ota-agent install/upgrade= when
-no explicit =--version= is given) sorts by =published_at DESC=,
-*not* by version-number ordering.  If you publish a hotfix to an
-older version after a newer one is already out, that hotfix
-becomes "latest" until you publish anything newer.  Workarounds:
+The "latest release" semantics changed in v1.1.0 — see
+[[*Latest-release semantics][Latest-release semantics]] below.
 
-  - Use zero-padded version strings (=01.02.03=) so lexical and
-    semver order coincide; or
-  - Mark the wanted release as the active one explicitly
-    (=ota-agent install <sw> --version=X=); or
-  - Avoid out-of-order publishes for monotonic series.
+** Latest-release semantics
 
-A semver-aware "latest" sort is a v1.2 backlog item.
+The server endpoint =GET /v1/software/<sw>/releases/latest= drives
+=ota-agent install/upgrade/watch= when no explicit =--version= is
+given, and =ota-agent list --remote --latest=.  Its definition of
+"latest" changed between v1.0.x and v1.1.0:
+
+| Server | "latest" =                                                                                |
+|--------+--------------------------------------------------------------------------------------------|
+| v1.0.x | most recently *published* release (=ORDER BY published_at DESC=)                          |
+| v1.1.0 | highest *semver* version, with most-recently-published as fallback when no version parses |
+
+Why the change: under v1.0.x, an operator who re-published a
+hotfix to an older version after a newer one was already out
+would silently see =watch= *downgrade* every installed client to
+the hotfix.  v1.1.0 makes "latest" mean what an operator expects:
+the highest version number.
+
+Semver rules (subset, see
+[[file:../server/src/catalogue/db.lisp][catalogue/db.lisp]]):
+
+  - =MAJOR.MINOR.PATCH= comparison is per-component numeric
+    (so =1.0.10= > =1.0.9=, not the other way round).
+  - =MAJOR.MINOR.PATCH-PRERELEASE= sorts *less than* the same
+    triple without a prerelease tag (so =1.0.0-rc1= < =1.0.0=).
+  - Versions whose components are not all integers (e.g.
+    =alpha=, =1.x.0=) do not parse as semver and are ignored
+    when selecting "latest" -- as long as there is at least one
+    parseable version.  When *no* version parses, the v1.0.x
+    fallback applies.
+
+Date-based version strings like =2026.05.10= parse as semver
+(all components are integers) and order correctly.
+
+If you want the v1.0.x semantics back -- e.g. you have a
+deliberate hotfix-to-older-version workflow -- run a custom
+patch level or sort-by =published_at= using
+=GET /v1/software/<sw>/releases= directly (which still returns
+all rows in =published_at DESC= order).
 
 ** Garbage-collect old releases
 

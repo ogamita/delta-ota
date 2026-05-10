@@ -621,17 +621,13 @@ that are not wired up; today they print
 
 ** Catalogue semantics
 
-- [ ] *Semver-aware "latest" sort.*  The server's
-  =GET /v1/software/<sw>/releases/latest= sorts by
-  =published_at DESC=, so a hotfix published to an older version
-  after a newer one is already out becomes "latest" until you
-  publish something newer.  This trips operators who don't
-  publish strictly monotonically (see operations.org § End-user
-  inspection commands).  Fix is a small Lisp semver comparator
-  in =ota-server.catalogue= + a =get-highest-version-release=
-  helper, plus a route choice (probably keep =latest= meaning
-  "most recent" and add =highest= as an alternative).  Ship
-  target: v1.2.
+- [X] *Semver-aware "latest" sort* — landed in v1.1.0.
+  =GET /v1/software/<sw>/releases/latest= now returns the highest
+  *semver* version (with most-recently-published as fallback when
+  no version string parses).  Real-world bug surfaced when
+  =ota-agent watch= silently downgraded an install whose server
+  had a hotfix re-published after a newer release.  See
+  operations.org § Latest-release semantics for the full rules.
 
 ** ota-server — incomplete subcommands and gaps
 

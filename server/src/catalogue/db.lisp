@@ -189,13 +189,103 @@ publish handler for idempotent re-publish detection."
       (when rows (row-to-release (first rows))))))
 
 (defun get-latest-release (catalogue software-name)
-  (with-catalogue (db catalogue)
-    (let ((rows (sqlite:execute-to-list
-                 db
-                 (format nil "SELECT ~A FROM releases WHERE software_name = ? ORDER BY published_at DESC LIMIT 1"
-                         *release-columns*)
-                 software-name)))
-      (when rows (row-to-release (first rows))))))
+  "Return the release of SOFTWARE-NAME that should be served as
+\"latest\".  v1.1.0 semantics: the highest *semver* version when at
+least one release has a parseable semver string; otherwise the
+most-recently-published release (the v1.0.x semantics).
+
+Why the change: under the prior `published_at DESC` rule, a hotfix
+re-published to an older version after a newer one was already out
+would silently become \"latest\" -- and `ota-agent watch` would
+then downgrade every installed client.  Real-world bug; see the
+v1.1.0 CHANGELOG entry."
+  (let ((all (list-releases catalogue software-name)))
+    (cond ((null all) nil)
+          (t (or (highest-semver-release all)
+                 ;; LIST-RELEASES returns published_at DESC; the
+                 ;; first row is the v1.0.x \"latest\".  Used when no
+                 ;; version parses as semver.
+                 (first all))))))
+
+(defun highest-semver-release (releases)
+  "Return the entry of RELEASES (a list of release plists) with the
+highest parseable semver in its :VERSION; NIL when none parse."
+  (let ((parseable
+          (remove-if-not (lambda (r) (parse-semver (getf r :version)))
+                         releases)))
+    (when parseable
+      (first
+       (sort (copy-list parseable)
+             (lambda (a b)
+               (semver< (parse-semver (getf b :version))
+                        (parse-semver (getf a :version)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Semver parsing (subset).  Handles MAJOR.MINOR.PATCH and the
+;; MAJOR.MINOR.PATCH-PRERELEASE form.  No build-metadata support
+;; (`+build`) -- it is not used in our catalogue today.
+;; ---------------------------------------------------------------------------
+
+(defun parse-semver (version-string)
+  "Parse \"1.2.3\" or \"1.2.3-rc1\" into the structured form
+((1 2 3) . PRERELEASE-OR-NIL).  Returns NIL when VERSION-STRING is
+not parseable as semver (e.g. \"alpha\", or has a non-integer
+component)."
+  (when (and version-string (plusp (length version-string)))
+    (let* ((dash (position #\- version-string))
+           (numeric (if dash (subseq version-string 0 dash) version-string))
+           (prerelease (and dash (subseq version-string (1+ dash))))
+           (parts (split-on-dot numeric)))
+      (when (and (consp parts)
+                 (every (lambda (p)
+                          (and (plusp (length p))
+                               (every #'digit-char-p p)))
+                        parts))
+        (cons (mapcar #'parse-integer parts) prerelease)))))
+
+(defun split-on-dot (s)
+  (let ((acc '()) (start 0))
+    (dotimes (i (length s))
+      (when (char= (char s i) #\.)
+        (push (subseq s start i) acc)
+        (setf start (1+ i))))
+    (push (subseq s start) acc)
+    (nreverse acc)))
+
+(defun semver< (a b)
+  "Return T when parsed semver A is strictly less than B.  Both A
+and B must be the (NUMS . PRERELEASE) shape returned by
+PARSE-SEMVER.
+
+Per the semver spec: number lists are compared lexicographically;
+when they tie, a release with a prerelease tag is *less than* one
+without (1.0.0-rc1 < 1.0.0); when both have prerelease tags, they
+are string-compared (a coarse approximation -- spec'd ordering
+rules are subtler but not needed for our publish-monotonic
+catalogue use case)."
+  (let ((nums-a (car a))
+        (nums-b (car b))
+        (pre-a  (cdr a))
+        (pre-b  (cdr b)))
+    (cond
+      ((nums< nums-a nums-b) t)
+      ((nums< nums-b nums-a) nil)
+      ;; numeric components tied
+      ((and pre-a (null pre-b)) t)         ; 1.0.0-rc < 1.0.0
+      ((and (null pre-a) pre-b) nil)
+      ((and pre-a pre-b)        (string< pre-a pre-b))
+      (t nil))))                            ; equal
+
+(defun nums< (a b)
+  "Lex compare of two integer lists, with the missing-tail
+treated as zero (so (1 0) and (1 0 0) are equal)."
+  (cond
+    ((and (null a) (null b)) nil)
+    ((null a) (some #'plusp b))
+    ((null b) nil)
+    ((< (first a) (first b)) t)
+    ((> (first a) (first b)) nil)
+    (t (nums< (rest a) (rest b)))))
 
 (defun insert-patch (catalogue &key sha256 from-release-id to-release-id patcher size)
   (with-catalogue (db catalogue)

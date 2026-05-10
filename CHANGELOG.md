@@ -19,6 +19,32 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Fixed
+- **Server: `/releases/latest` now returns the highest *semver*
+  version, not the most-recently-*published* one.** Surfaced
+  during v1.1.0 testing: an operator re-published 1.0.1 today
+  after 1.0.4 was already in the catalogue. The v1.0.x semantics
+  (`ORDER BY published_at DESC`) returned 1.0.1 as "latest" — and
+  `ota-agent watch`, which calls `Upgrade(..., "latest")` on a
+  fixed interval, dutifully *downgraded* every installed client
+  from 1.0.2 to 1.0.1. Real-world data-loss potential.
+
+  v1.1.0 changes the server's `get-latest-release` to:
+  - Parse each release's `version` as semver
+    (`MAJOR.MINOR.PATCH[-PRERELEASE]`).
+  - Return the entry with the highest semver triple
+    (`-PRERELEASE` sorts *less than* the same triple without
+    one, per the semver spec).
+  - Fall back to v1.0.x's `published_at DESC` only when *no*
+    version in the catalogue parses as semver.
+  - Ignore non-semver versions (e.g. `wip`, `alpha-build`) when
+    at least one parseable version exists.
+
+  Date-based version strings like `2026.05.10` parse as semver
+  (all components integers) and order correctly. The `latest`
+  semantics change is server-side only — no wire-format or
+  schema_version impact.
+
 ### Changed
 - **`ota-agent list --remote` now shows every release**, not just
   the per-software latest. This is the "I can't see my four
