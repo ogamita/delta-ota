@@ -19,6 +19,10 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.1.0] - 2026-05-10
+
 ### Fixed
 - **Server: `published_at` is now strictly monotonic per software.**
   v1.0.x stamped publish timestamps via SQL's

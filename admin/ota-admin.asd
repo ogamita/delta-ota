@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — administrator CLI."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "1.1.0"
+  :version "1.1.1"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :depends-on ("alexandria" "uiop" "dexador" "com.inuoe.jzon" "ota-server")
   :pathname "src/"
