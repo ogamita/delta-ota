@@ -6,7 +6,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ogamita Delta OTA — efficient over-the-air software distribution</title>
-<meta name="description" content="Ship multi-GB software updates that transfer ~1% of the full payload. Self-contained client, atomic switch-over, dual licence (AGPL + commercial).">
+<meta name="description" content="Ship multi-GB software updates that transfer ~1% of the full payload. Resumable downloads, atomic switch-over, self-contained client, dual licence (AGPL + commercial).">
 <style>
   :root {
     --accent: #0a64a4;
@@ -122,6 +122,15 @@
          bandwidth bill, faster updates, happier users.</p>
     </div>
     <div class="card">
+      <h3>Resumable on disconnect</h3>
+      <p>Lose connectivity at 1.9 GB into a 2 GB initial install?
+         The agent keeps the partial file, hashes the prefix, and
+         asks the server for <em>just the rest</em> with HTTP
+         <code>Range</code>. Even on flaky LTE the install
+         eventually completes — no manual re-tries, no lost
+         bandwidth.</p>
+    </div>
+    <div class="card">
       <h3>Never breaks the install</h3>
       <p>Atomic switch-over: the agent flips to the new release
          only after the bytes have been downloaded, hashed, patched,
@@ -138,6 +147,13 @@
       <p>Every release manifest is Ed25519-signed and pinned to the
          publisher's public key. Tampered bytes are refused before
          a single file is written.</p>
+    </div>
+    <div class="card">
+      <h3>Semver-aware "latest"</h3>
+      <p>An emergency hot-fix re-published to an older version
+         can't accidentally become "latest" and downgrade every
+         client overnight. The server compares actual semver, not
+         publish timestamps.</p>
     </div>
   </div>
 </section>
@@ -185,7 +201,8 @@
       <h3>2. Distribute</h3>
       <p>The agent fetches the signed manifest, picks the smallest
          viable patch, downloads it with streaming SHA-256
-         verification, and reconstructs the new release locally.</p>
+         verification (<em>resumable</em> on connection drops), and
+         reconstructs the new release locally.</p>
     </div>
     <div class="card">
       <h3>3. Switch over</h3>
@@ -205,26 +222,79 @@ installed schms 3.4.1</pre>
 </section>
 
 <section>
+  <h2>Built for operators</h2>
+  <p class="lede">
+    Releasing software is high-stakes. The features below are the
+    ones operators ask about after the second incident.
+  </p>
+  <div class="grid">
+    <div class="card">
+      <h3>Async patch-build pool</h3>
+      <p>Long bsdiff runs no longer pin an HTTP worker — patches
+         are queued in the catalogue and consumed by a fixed-size
+         pool. HTTP and patch-CPU scale independently. A server
+         restart mid-fan-in resumes orphaned jobs automatically;
+         <code>bsdiff</code> is deterministic and the catalogue
+         deduplicates, so retries are idempotent.</p>
+    </div>
+    <div class="card">
+      <h3>Real-time publish progress</h3>
+      <p>Watch each patch land as it builds. <code>ota-admin
+         publish</code> streams an NDJSON event per completed
+         <code>from→to</code> pair, so a multi-minute fan-in shows
+         a real progress bar instead of an opaque "still working".</p>
+    </div>
+    <div class="card">
+      <h3>Atomic, idempotent publish</h3>
+      <p>Re-publishing the same release with the same blob is a
+         200 OK no-op. Re-publishing the same version with a
+         different blob is a 409 Conflict, never a corrupted
+         catalogue. Two operator processes against the same data
+         directory see exactly one winner, deterministically.</p>
+    </div>
+    <div class="card">
+      <h3>End-user inspection</h3>
+      <p><code>ota-agent list</code>, <code>show</code>,
+         <code>verify</code>, <code>prune</code>, and
+         <code>doctor --recover</code> let operators (and curious
+         end users) inspect what's installed locally, what's
+         available remotely, and roll back to any "anchor"
+         release on demand — without a fresh download.</p>
+    </div>
+  </div>
+</section>
+
+<section>
   <h2>What you get</h2>
   <table>
     <tr><th>Server</th>
         <td>Linux x86_64 / arm64. Multi-arch container image.
-            HTTP/JSON API. <code>sendfile(2)</code> for blob downloads.
-            SQLite catalogue (PostgreSQL sub-phase). FS or S3 storage.</td></tr>
+            HTTP/JSON API with HTTP <code>Range</code> support
+            (resumable client downloads). <code>sendfile(2)</code>
+            on full responses. Async patch-build worker pool with
+            persistent job queue. SQLite catalogue (PostgreSQL
+            sub-phase). FS or S3 storage. WAL-mode writes plus
+            cross-process atomicity via <code>BEGIN IMMEDIATE</code>.</td></tr>
     <tr><th>Client library</th>
         <td>Embeddable C-ABI shared library + static archive.
             Pure-Go internals, no <code>cgo</code>, no OpenSSL.
+            Resumable downloads with crash-safe <code>.part</code>
+            files (trailing-zero scan recovers from torn writes
+            without per-chunk <code>fsync</code>).
             <code>libota.h</code> header for Python, .NET, AutoLISP.</td></tr>
     <tr><th>Client CLI</th>
         <td>Single-file <code>ota-agent</code> per OS, ~10 MB.
             <code>install</code>, <code>upgrade</code>, <code>revert</code>,
-            <code>doctor --recover</code>, <code>watch</code>.</td></tr>
+            <code>list</code>, <code>show</code>, <code>verify</code>,
+            <code>prune</code>, <code>doctor --recover</code>,
+            <code>watch</code>.</td></tr>
     <tr><th>Operations</th>
         <td>Garbage collection, content-integrity verification,
             backup/restore scripts, audit log, install-token bulk
             issuance, recovery rollback to anchor releases.</td></tr>
     <tr><th>Documentation</th>
-        <td>Datasheet, user manual, operator runbook, performance
+        <td>Datasheet, user manual, operator runbook, QA plan,
+            architecture decision records (ADRs), performance
             notes, threat-model walkthrough — all PDF-ready.</td></tr>
   </table>
 </section>
