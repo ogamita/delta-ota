@@ -44,6 +44,31 @@ worker_num = 4
 # client_ca    = "/etc/ota/clients-ca.crt"
 require_mtls = false
 
+# --- v1.4: admin cert-subject identity (ADR-0009) ----------------------
+# The standard deployment terminates TLS + mTLS at a reverse proxy
+# (nginx, HAProxy, …) and forwards the verified client certificate's
+# Subject DN as an HTTP header.  Turn this knob on so the server
+# trusts that header; leave it off in deployments where the upstream
+# is untrusted (any direct-public ota-server, any proxy not under
+# your control).
+# trust_proxy_subject_header = false
+# proxy_subject_header_name  = "x-ota-client-cert-subject"  # nginx-emitted alternatives: "x-client-dn", "ssl-client-s-dn"
+
+# Strict allowlist of Subject DN strings allowed to use admin
+# endpoints.  When non-empty, a bearer token alone is no longer
+# sufficient -- the request must also carry one of these subjects
+# in the proxy header.  Defense in depth: a leaked admin token by
+# itself cannot publish or rotate keys.
+# admin_subjects = [
+#   "CN=alice@example.com,O=Example",
+#   "CN=bob@example.com,O=Example",
+# ]
+
+# When require_mtls = true, admin endpoints reject every request
+# that does NOT carry a recognised cert subject -- even with a
+# valid bearer token.  Combine with admin_subjects for the
+# strictest deployment.
+
 [storage]
 backend = "fs"
 
@@ -63,3 +88,20 @@ schedule          = "0 3 * * *"
 
 [install_token]
 ttl_seconds = 900
+
+# --- v1.4: per-endpoint rate limits (ADR-0009 §4) -----------------------
+# Each row caps one route's token bucket -- format "CAPACITY/REFILL"
+# where REFILL is tokens/sec (fractional OK; "1/60" = one per minute).
+# Routes not listed inherit the built-in admin defaults or, for
+# non-admin routes, the v1.3 generic budget (600 tokens, 10/sec).
+# These caps stack on top of the per-identity rule: each (identity,
+# route) pair gets its own bucket, so one operator's burst does not
+# starve another.
+# [rate_limits]
+# admin-publish-release            = "10/0.166"   # 10 publishes/min
+# admin-mint-install-token         = "60/1"       # 1/sec
+# admin-mint-install-tokens-batch  = "5/0.0166"   # 5 batches/hr
+# admin-build-reverse-patch        = "10/0.166"
+# admin-mark-uncollectable         = "30/0.5"
+# admin-gc                         = "6/0.0166"
+# admin-verify                     = "6/0.0166"

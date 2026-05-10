@@ -219,7 +219,7 @@ $(PDF_OUT)/%.pdf: $(DOCS_DIR)/%.org
 	    exit 1; \
 	fi
 
-e2e: e2e-install e2e-auth e2e-ops e2e-recovery e2e-parallel e2e-two-process e2e-resume
+e2e: e2e-install e2e-auth e2e-ops e2e-recovery e2e-parallel e2e-two-process e2e-resume e2e-admin-identity
 e2e-install:
 	tests/e2e/run.sh
 e2e-auth:
@@ -234,6 +234,8 @@ e2e-two-process:
 	tests/e2e/two-process-publish.sh
 e2e-resume:
 	tests/e2e/resume-download.sh
+e2e-admin-identity:
+	tests/e2e/admin-identity.sh
 
 run-server:
 	@test -x $(SERVER_BUILD_DIR)/ota-server || $(MAKE) build-server

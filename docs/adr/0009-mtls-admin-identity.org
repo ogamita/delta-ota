@@ -1,0 +1,311 @@
+#+TITLE: ADR-0009 — mTLS admin identity + per-endpoint rate limits
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.4.0.
+
+* Context
+
+Through v1.3 the admin endpoints (every route under =/v1/admin/=)
+had two security properties:
+
+1. *A single shared bearer token* — =OTA_ADMIN_TOKEN= — checked by
+   =authorised-admin-p= on each handler.  Anyone who has the token
+   has the keys to the kingdom: they can publish releases, rotate
+   GC policy, mint install tokens, mark uncollectable, force
+   reverse-patch builds.
+2. *Generic rate limiting* — the v1.0.4 token-bucket limiter
+   (capacity 600, refill 10/sec) keyed only on the calling
+   identity.  Admin and read paths shared the same generous
+   budget; a leaked admin token could publish hundreds of
+   releases in a burst before the bucket ran out, since it has
+   no idea which endpoint the burst is hitting.
+
+Two gaps that the implementation plan has carried since phase 4:
+
+#+begin_quote
+- /Mandatory mTLS for admin endpoints (cert-subject identity)/ —
+  Today TLS is opt-in (=[tls].cert= / =.key=) and any mTLS is
+  implicit at the proxy layer; the server doesn't verify a client
+  cert subject against an authorised admin list.
+- /Per-endpoint rate limits/ — admin endpoints rely on the
+  bearer-token alone with no QPS cap.
+#+end_quote
+
+The deployment shape we actually have to design for: most
+production instances terminate TLS at a reverse proxy (nginx,
+HAProxy, AWS ALB) for the same reasons every other modern
+service does — kTLS, easy cert rotation, traffic logging,
+multi-tenant fan-out.  Patching Woo to do *direct* mTLS at the
+SBCL layer would be heroic; the proxy already has working mTLS
+support.  We just need to *trust* what the proxy verified and use
+it.
+
+** What "cert-subject identity" buys us
+
+Three things, in defense-in-depth order:
+
+1. *Audit log fidelity.*  Today every admin row says =identity =
+   "admin"=.  When two operators share a deployment, we lose the
+   trace of who actually pushed the release.  A cert subject like
+   =CN=alice@example.com,O=Example= is what a human reads in the
+   audit log six months later.
+2. *Allowlist gating.*  Even with a leaked =OTA_ADMIN_TOKEN=, the
+   attacker still needs a client certificate signed by a
+   recognised CA *and* a Subject DN on the allowlist.  Two
+   secrets to steal, not one.
+3. *Mandatory mode.*  With =require_mtls = true=, bearer-only
+   admin requests are rejected outright — even if they have the
+   right token.  This is the strictest deployment, intended for
+   "regulated customer" tenancies.
+
+** What "per-endpoint rate limits" buys us
+
+A leaked admin token under v1.3 could:
+
+- Mint 600 install tokens in a single second (each one ~32 ms of
+  DB write + audit row).
+- Trigger 600 =gc= calls before the bucket ran out — and each gc
+  walks the catalogue + manifests dir.
+- Issue 600 =publish-release= requests, queuing up gigabytes of
+  blob storage and patches before any alerting could catch up.
+
+The v1.0.4 limiter was sized for *the read path* (clients
+fetching manifests + blobs).  Admin routes need their own
+bucketing: tighter caps, separate per-(identity, route)
+counters, and an operator override so the cap can be tuned per
+deployment.
+
+* Decision
+
+** Cert-subject identity
+
+The server reads the verified client certificate's Subject DN
+from an HTTP header injected by a trusted upstream proxy, then
+applies an allowlist + mandatory-mode gate.  Four new config
+keys, all under =[tls]=:
+
+| Key                            | Type             | Default                          | Purpose                                          |
+|--------------------------------+------------------+----------------------------------+--------------------------------------------------|
+| =trust_proxy_subject_header=   | bool             | =false=                          | Master switch — when off, the header is ignored. |
+| =proxy_subject_header_name=    | string           | =x-ota-client-cert-subject=      | Configurable — nginx commonly emits =x-client-dn=. |
+| =admin_subjects=               | list of strings  | =[]= (no allowlist)              | Strict allowlist of Subject DN strings.          |
+| =require_mtls=                 | bool             | =false=                          | When =true=, admin endpoints reject any request without a recognised subject. |
+
+The matrix decided by =ADMIN-IDENTITY= ([[file:../../server/src/http/server.lisp][http/server.lisp]]):
+
+| Bearer | Cert subject     | =require_mtls= | =admin_subjects= match | Result                          |
+|--------+------------------+----------------+------------------------+---------------------------------|
+| absent | any              | any            | any                    | 401                             |
+| wrong  | any              | any            | any                    | 401                             |
+| ok     | absent           | =false=        | -                      | OK, identity = ="admin"=        |
+| ok     | absent           | =true=         | -                      | 403 ="client cert required"=    |
+| ok     | present          | any            | yes                    | OK, identity = subject          |
+| ok     | present          | any            | no (non-empty list)    | 403 ="subject not authorised"=  |
+| ok     | present          | any            | yes (empty list = pass) | OK, identity = subject          |
+
+The macro =WITH-ADMIN-IDENTITY= wraps every admin handler so the
+identity-resolution gate is impossible to forget: each handler
+binds the resolved identity (cert subject or "admin") and threads
+it through the =APPEND-AUDIT= call.
+
+** Per-endpoint rate limits
+
+Two changes to the limiter:
+
+1. *Bucket key becomes =(identity . route-keyword)=* — so an
+   admin endpoint's cap is independent from the read-path cap,
+   and from another operator's identical bucket.
+2. *Built-in admin cap table* — =*admin-rate-limits*=
+   ([[file:../../server/src/http/server.lisp][server.lisp]]) declares
+   stricter =(CAPACITY . REFILL/sec)= pairs for each admin
+   route.  Defaults:
+
+| Route                              | Cap | Refill    | Steady rate    |
+|------------------------------------+-----+-----------+----------------|
+| =:admin-publish-release=           | 10  | 1/6 /sec  | ~10/min        |
+| =:admin-mint-install-token=        | 60  | 1   /sec  | 1/sec          |
+| =:admin-mint-install-tokens-batch= | 5   | 1/60/sec  | 5/hr           |
+| =:admin-build-reverse-patch=       | 10  | 1/6 /sec  | ~10/min        |
+| =:admin-mark-uncollectable=        | 30  | 1/2 /sec  | ~30/min        |
+| =:admin-gc=                        | 6   | 1/60/sec  | 6/hr           |
+| =:admin-verify=                    | 6   | 1/60/sec  | 6/hr           |
+
+3. *Operator override* — =[rate_limits]= section in TOML:
+
+#+begin_src toml
+[rate_limits]
+admin-publish-release          = "20/0.333"   # 20 publishes/min
+admin-gc                       = "2/0.00139"  # 2/day
+#+end_src
+
+Format is =CAPACITY/REFILL-PER-SEC=.  Fractional refill is OK
+(=0.0166= ≈ 1/min, =0.00139= ≈ 1/day).  Routes not listed
+inherit the built-in admin defaults; non-admin routes inherit
+the v1.3 generic budget (600 tokens, 10/sec).
+
+** Woo 429 workaround
+
+Woo's bundled =status-code-to-text= predates RFC 6585 and has no
+entry for 429 ("Too Many Requests").  At load time Woo also
+*pre-bakes* a =*status-line*= hash of status-line byte vectors
+for every recognised code — so monkey-patching just
+=status-code-to-text= isn't enough.  We back-fill the cache for
+the missing codes (425, 428, 429, 431) at server-load time;
+=RESPONSE-HEADERS-BYTES= then writes the correct status line
+instead of crashing on a NIL lookup.
+
+Idempotent re-population: if Woo ships a fix one day, our patch
+becomes a redundant re-set.
+
+* Consequences
+
+** Positive
+
+- *Audit log fidelity.*  =GET /v1/admin/audit= now shows the
+  cert subject (when one was presented) as the =identity= field
+  on every action row.  A leaked bearer is detectable in the
+  log even before the allowlist gate is turned on, because the
+  attacker's requests will have =identity = "admin"= while the
+  legitimate operators' rows will have their DN.
+- *Defense in depth.*  With =admin_subjects= non-empty, a leaked
+  =OTA_ADMIN_TOKEN= is no longer sufficient to use admin
+  endpoints — the attacker also needs a client certificate
+  signed by the proxy's CA.
+- *Per-route burst protection.*  A hostile admin token can no
+  longer queue thousands of publishes or gc runs; the cap is
+  hit in seconds.  Honest CI workflows (a few releases per day
+  per software line) stay well under.
+- *Backwards-compatible by default.*  All four TLS knobs default
+  to the v1.3 behaviour (no trust, no allowlist, no mandatory
+  mode), and the per-endpoint caps only apply when a route is
+  in =*admin-rate-limits*= or an explicit override.  Existing
+  deployments upgrade with no changes.
+
+** Negative
+
+- *Header-trust window.*  An attacker who can inject HTTP
+  headers between the proxy and ota-server (e.g., a sidecar
+  container that bypasses the proxy entirely, or a misconfigured
+  network policy that exposes the ota-server port directly) can
+  forge a Subject DN.  Mitigation: standard "bind to loopback,
+  trust only the proxy" deployment; the trust knob is off by
+  default so a misconfigured server stays safe.  A future
+  iteration can add an explicit allowlist of trusted source
+  CIDRs.
+- *No direct mTLS.*  Direct termination by Woo (without a proxy)
+  doesn't get cert verification.  Going there means patching
+  Woo + cl+ssl with =SSL_VERIFY_PEER= + =SSL_CTX_load_verify_locations=
+  + a way to expose the parsed Subject DN to the handler — three
+  pieces of vendor surgery.  Deferred until a customer asks.
+
+** Neutral
+
+- The new config keys are all opt-in.  Operators who don't care
+  see exactly the v1.3 behaviour.
+- The per-endpoint table is exposed for override.  A deployment
+  that needs to publish 100 releases in 5 minutes for a launch
+  event can flip the cap temporarily without recompiling.
+
+* Alternatives considered
+
+** A. Direct mTLS in Woo
+
+Rejected.  Woo's API doesn't expose the OpenSSL context;
+patching it would require either vendoring (against
+[[file:0003-vendoring-policy.org][ADR-0003]]'s "no upstream
+patches in vendor/") or maintaining a fork.  All known customer
+deployments use a proxy anyway.
+
+** B. Embed an OAuth2 / OIDC client
+
+Rejected for v1.4.  Bigger scope, requires an identity provider,
+and the audit-log-by-subject use case is satisfied by the simpler
+header-trust path.  Re-walk if a customer asks for federated
+identity.
+
+** C. Per-token rate limits (one token, one bucket)
+
+Rejected.  =OTA_ADMIN_TOKEN= is a single shared secret today; per-
+token bucketing would require minting per-operator admin tokens,
+which is a wholly different model.  The (identity, route) bucket
+is the same shape but doesn't require new identity infrastructure.
+
+** D. Multi-range / multi-bucket admin limits
+
+E.g. "100 publishes per hour AND 5 per minute".  Rejected for now
+— the single-bucket = (capacity, refill) shape covers both
+"steady-state throughput" and "burst limit" because capacity *is*
+the burst limit.  Add a layered limiter only if a customer hits
+a use case the single bucket can't model.
+
+* Operational notes
+
+** nginx config snippet
+
+#+begin_src nginx
+location /v1/admin/ {
+    # Require + verify client cert against the CA bundle.
+    ssl_verify_client      on;
+    ssl_client_certificate /etc/nginx/clients-ca.crt;
+    ssl_verify_depth       3;
+
+    # Forward the verified DN to ota-server.
+    proxy_set_header X-Ota-Client-Cert-Subject $ssl_client_s_dn;
+    proxy_pass http://127.0.0.1:8443;
+}
+
+# Public read paths -- no client cert needed.
+location /v1/ {
+    proxy_pass http://127.0.0.1:8443;
+}
+#+end_src
+
+And in =ota.toml=:
+
+#+begin_src toml
+[tls]
+trust_proxy_subject_header = true
+admin_subjects = ["CN=alice@example.com,O=Example",
+                  "CN=bob@example.com,O=Example"]
+# require_mtls = true   # uncomment for strictest mode
+#+end_src
+
+** Audit-log inspection
+
+#+begin_example
+$ curl -sS -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+       http://localhost:8443/v1/admin/audit \
+  | jq '.[] | {at, identity, action, target}'
+{
+  "at": "2026-05-10T18:30:01Z",
+  "identity": "CN=alice@example.com,O=Example",
+  "action": "publish-release",
+  "target": "myapp/linux-x86_64/2.4.1"
+}
+{
+  "at": "2026-05-10T18:32:14Z",
+  "identity": "CN=bob@example.com,O=Example",
+  "action": "mint-install-token",
+  "target": null
+}
+#+end_example
+
+** Rate-limit verification
+
+#+begin_example
+$ for i in {1..15}; do
+    curl -sS -o /dev/null -w '%{http_code}\n' \
+         -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+         -X POST http://localhost:8443/v1/admin/install-tokens \
+         -d '{"classifications": ["public"]}'
+  done
+201
+201
+...
+201
+429    # bucket exhausted, Retry-After: 1
+429
+#+end_example

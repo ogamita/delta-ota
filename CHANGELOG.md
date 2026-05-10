@@ -20,6 +20,32 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Added
+- **Cert-subject identity for admin endpoints + mandatory-mTLS mode.**
+  Operators terminating TLS at a reverse proxy (the recommended
+  deployment, per [docs/operations.org](docs/operations.org)) can
+  now pass the verified client certificate's Subject DN through to
+  `ota-server` via a configurable header. The server checks the
+  subject against an allowlist (`[tls].admin_subjects = [...]`)
+  and records it as the audit-log identity in place of the
+  generic `"admin"`. With `[tls].require_mtls = true`, admin
+  endpoints reject requests that don't carry a recognised cert
+  subject — even with a valid bearer token. Defense in depth: a
+  leaked `OTA_ADMIN_TOKEN` is no longer enough on its own. See
+  [docs/adr/0009-mtls-admin-identity.org](docs/adr/0009-mtls-admin-identity.org).
+- **Per-endpoint rate limits.** The v1.0.4 token-bucket limiter
+  was a single global bucket per identity (capacity 600, refill
+  10/sec) — fine for clients hitting `/v1/blobs`, but admin
+  endpoints inherited the same generous cap. A leaked admin
+  token could publish hundreds of releases in a burst. Buckets
+  are now keyed on `(identity, endpoint)` with admin routes
+  declaring stricter `(capacity, refill)` defaults (e.g.
+  `:admin-publish-release` capped at 10/min). Non-admin routes
+  keep the v1.0.4 behaviour unchanged. The cap table is exposed
+  for operator override via `[rate_limits].<endpoint> = "C/R"`.
+
+## [1.3.0] - 2026-05-10
+
+### Added
 - **Resumable blob downloads (HTTP Range).** The server now honours
   `Range: bytes=N-[M]` on `/v1/blobs/<sha>` and `/v1/patches/<sha>`,
   responding `206 Partial Content` with the requested slice. Full

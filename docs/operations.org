@@ -336,6 +336,110 @@ token.  Only operator workflows (=publish=, =mint-tokens=,
 =verify=, =gc=, =audit=, =install-tokens/batch=) need the new
 admin token.
 
+* Admin cert-subject identity (since v1.4)
+
+The bearer token gives one shared secret all-or-nothing access.
+v1.4 adds a second factor for admin endpoints — the verified
+client certificate from a reverse proxy — and a strict allowlist
+of Subject DNs allowed to use them.  See
+[[file:adr/0009-mtls-admin-identity.org][ADR-0009]] for the design.
+
+** What changes for the operator
+
+- Every admin action row in =GET /v1/admin/audit= now carries a
+  per-operator =identity= (the cert subject) instead of the
+  generic ="admin"=.  Two operators sharing a deployment leave
+  distinct traces.
+- A leaked =OTA_ADMIN_TOKEN= is no longer sufficient to use
+  admin endpoints — the attacker also needs a client
+  certificate signed by the proxy's CA and a Subject DN on the
+  allowlist.
+- With =require_mtls = true=, bearer-only admin requests are
+  rejected outright.  This is the strictest deployment, intended
+  for "regulated customer" tenancies.
+
+** Configuration
+
+#+begin_src toml
+[tls]
+# Master switch: ota-server reads the proxy header only when
+# this is on.  Off by default to refuse forged subjects on a
+# misconfigured deployment.
+trust_proxy_subject_header = true
+
+# Which header carries the verified Subject DN.  Defaults to
+# x-ota-client-cert-subject; nginx commonly emits x-client-dn
+# or ssl-client-s-dn (configure the proxy to set the canonical
+# name, or point this knob at whatever the proxy emits).
+proxy_subject_header_name  = "x-ota-client-cert-subject"
+
+# Allowlist.  Empty = no enforcement (subject is still recorded
+# in the audit log).  Non-empty = strict — only these DNs may
+# use admin endpoints.
+admin_subjects = [
+  "CN=alice@example.com,O=Example",
+  "CN=bob@example.com,O=Example",
+]
+
+# Strictest mode: bearer alone is not enough.  An admin request
+# without a recognised subject is 403.
+# require_mtls = true
+#+end_src
+
+** Reverse-proxy snippet (nginx)
+
+#+begin_src nginx
+location /v1/admin/ {
+    ssl_verify_client      on;
+    ssl_client_certificate /etc/nginx/clients-ca.crt;
+    ssl_verify_depth       3;
+    proxy_set_header X-Ota-Client-Cert-Subject $ssl_client_s_dn;
+    proxy_pass http://127.0.0.1:8443;
+}
+
+location /v1/ {
+    # Public read paths -- no client cert needed.
+    proxy_pass http://127.0.0.1:8443;
+}
+#+end_src
+
+* Per-endpoint rate limits (since v1.4)
+
+The v1.0.4 token-bucket limiter (capacity 600, refill 10/sec)
+covered every endpoint with one bucket per identity.  v1.4 keys
+the bucket on =(identity, endpoint)= and applies stricter
+defaults to admin routes.  Non-admin routes keep the v1.3
+behaviour byte-for-byte.
+
+Built-in admin caps (in tokens; refill in tokens/sec):
+
+| Route                              | Cap | Refill    | Steady rate |
+|------------------------------------+-----+-----------+-------------|
+| =admin-publish-release=            | 10  | 0.166/sec | ~10/min     |
+| =admin-mint-install-token=         | 60  | 1   /sec  | 1/sec       |
+| =admin-mint-install-tokens-batch=  | 5   | 0.0166/sec | 5/hour    |
+| =admin-build-reverse-patch=        | 10  | 0.166/sec | ~10/min     |
+| =admin-mark-uncollectable=         | 30  | 0.5 /sec  | ~30/min     |
+| =admin-gc=                         | 6   | 0.0166/sec | 6/hour    |
+| =admin-verify=                     | 6   | 0.0166/sec | 6/hour    |
+
+Honest CI publishing 3-4 releases per day per software line is
+two orders of magnitude under the publish cap.  A hostile admin
+token hits 429 in seconds.
+
+** Operator override
+
+#+begin_src toml
+[rate_limits]
+# Format: "CAPACITY/REFILL-PER-SEC".  Fractional refill OK.
+admin-publish-release          = "30/0.5"     # 30/min for a launch day
+admin-gc                       = "2/0.0000231"  # 2/day
+#+end_src
+
+A rate-limited admin request gets =429 Too Many Requests=
+with =Retry-After: 1=.  =ota-admin= will surface that as
+a friendly retry message.
+
 * Day-to-day operations
 
 ** Publish a release
@@ -695,3 +799,6 @@ Operational implications:
 | =sendfile= path silently breaks under TLS       | TLS encryption happens in userspace              | Move TLS termination to a reverse proxy with kTLS |
 | Big initial install never completes over flaky link | Reverse proxy stripping =Range:= headers      | Test directly against the server: =curl -I -H 'Range: bytes=0-99' .../v1/blobs/<sha>=; expect 206 |
 | =.part= file accumulating disk space             | Aborted install never resumed                   | Delete =<OTA_HOME>/<sw>/blobs/<sha>.part= or run =ota-agent install <sw>= to complete it |
+| Admin call returns 403 "subject not authorised"  | Operator's cert DN not in =[tls].admin_subjects= | Add the DN to the allowlist (or remove =admin_subjects= entirely to disable enforcement) |
+| Admin call returns 403 "client cert required"    | =[tls].require_mtls = true= but no cert reached the server | Verify the reverse proxy is requesting + verifying client certs AND injecting the configured header |
+| Admin operations hit 429 unexpectedly             | Per-endpoint cap is tighter than the workload   | Set =[rate_limits].<endpoint> = "C/R"= to raise the cap; see ADR-0009 |

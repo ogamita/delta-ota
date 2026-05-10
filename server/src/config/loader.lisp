@@ -28,6 +28,24 @@
         :tls-key                    nil
         :tls-client-ca              nil
         :tls-require-mtls           nil
+        ;; v1.4: admin cert-subject identity (ADR-0009).
+        ;;   admin-subjects:
+        ;;     list of Subject DN strings allowed to use admin
+        ;;     endpoints when a cert is presented.  NIL = no
+        ;;     allowlist enforcement (subject is still recorded
+        ;;     in the audit log when supplied).
+        ;;   trust-proxy-subject-header:
+        ;;     T = trust the proxy-injected header carrying the
+        ;;     verified client cert's Subject DN.  Off by default
+        ;;     so a misconfigured deployment doesn't accept
+        ;;     forged subjects from arbitrary clients.
+        ;;   proxy-subject-header-name:
+        ;;     header to read (case-insensitive).  Defaults to
+        ;;     X-Ota-Client-Cert-Subject; nginx commonly emits
+        ;;     X-Client-Verify + X-Client-DN.
+        :tls-admin-subjects               nil
+        :tls-trust-proxy-subject-header   nil
+        :tls-proxy-subject-header-name    "x-ota-client-cert-subject"
         :storage-backend            "fs"
         :catalogue-db               nil
         :patcher-default            "bsdiff"
@@ -36,7 +54,12 @@
         :patcher-bspatch-path       nil
         :gc-default-threshold       0
         :gc-schedule                nil
-        :install-token-ttl-seconds  900))
+        :install-token-ttl-seconds  900
+        ;; v1.4: per-endpoint rate-limit overrides (ADR-0009 §
+        ;; rate limits).  Plist mapping route-keyword to a
+        ;; (CAPACITY . REFILL-PER-SEC) cons.  NIL means "use the
+        ;; built-in admin defaults from *admin-rate-limits*".
+        :rate-limits-override       nil))
 
 ;; ---------------------------------------------------------------------------
 ;; TOML parsing
@@ -75,6 +98,40 @@ Either component may fall back to the supplied default."
       (error 'config-error
              :format-control "TOML parse error: ~A"
              :format-arguments (list c)))))
+
+(defun %parse-rate-limits-section (alist)
+  "Translate a TOML [rate_limits] section into a plist mapping
+route-keyword to a (CAPACITY . REFILL-PER-SEC) cons.  The TOML
+side uses string keys like \"admin-publish-release\" and string
+values shaped \"C/R\" (e.g. \"10/1\" = capacity 10 tokens, refill
+1 token per second).  NIL when the section is empty/missing."
+  (when alist
+    (let ((acc '()))
+      (dolist (cell alist)
+        (let ((key (intern (string-upcase (car cell)) :keyword))
+              (spec (cdr cell)))
+          (unless (stringp spec)
+            (error 'config-error
+                   :format-control "[rate_limits].~A must be a string \"C/R\", got ~S"
+                   :format-arguments (list (car cell) spec)))
+          (let ((slash (position #\/ spec)))
+            (unless slash
+              (error 'config-error
+                     :format-control "[rate_limits].~A: expected \"CAPACITY/REFILL_PER_SEC\", got ~S"
+                     :format-arguments (list (car cell) spec)))
+            (let ((cap (parse-integer spec :end slash))
+                  (refill (read-from-string (subseq spec (1+ slash)))))
+              (unless (and (integerp cap) (plusp cap))
+                (error 'config-error
+                       :format-control "[rate_limits].~A: capacity must be a positive integer, got ~S"
+                       :format-arguments (list (car cell) cap)))
+              (unless (and (realp refill) (plusp refill))
+                (error 'config-error
+                       :format-control "[rate_limits].~A: refill must be a positive number, got ~S"
+                       :format-arguments (list (car cell) refill)))
+              (push (cons cap refill) acc)
+              (push key acc)))))
+      acc)))
 
 (defun load-config-from-file (path)
   "Read TOML at PATH and return a plist matching the documented schema.
@@ -117,6 +174,20 @@ applied here — call APPLY-ENV-OVERRIDES on the result."
          :tls-client-ca             (%toml-get tls     "client_ca")
          :tls-require-mtls          (%toml-get tls     "require_mtls"
                                                (getf defaults :tls-require-mtls))
+         :tls-admin-subjects        (let ((v (%toml-get tls "admin_subjects")))
+                                      (cond ((null v) nil)
+                                            ((listp v) v)
+                                            (t (error 'config-error
+                                                      :format-control "[tls].admin_subjects must be a list of strings, got ~S"
+                                                      :format-arguments (list v)))))
+         :tls-trust-proxy-subject-header
+                                    (%toml-get tls     "trust_proxy_subject_header"
+                                               (getf defaults :tls-trust-proxy-subject-header))
+         :tls-proxy-subject-header-name
+                                    (%toml-get tls     "proxy_subject_header_name"
+                                               (getf defaults :tls-proxy-subject-header-name))
+         :rate-limits-override      (%parse-rate-limits-section
+                                     (%toml-section toml "rate_limits"))
          :storage-backend           (%toml-get storage "backend"
                                                (getf defaults :storage-backend))
          :catalogue-db              (%toml-get cat     "db")
