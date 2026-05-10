@@ -26,6 +26,13 @@
            #:shortest-patch-path
            #:compute-reachability-plan
            #:reachability-plan-feasible-p
-           #:execute-reachability-builds))
+           #:execute-reachability-builds
+           ;; v1.7: notification worker pool
+           #:notification-pool
+           #:make-notification-pool
+           #:start-notification-pool
+           #:stop-notification-pool
+           #:notify-notification-pool
+           #:enqueue-publish-notifications))
 
 (in-package #:ota-server.workers)

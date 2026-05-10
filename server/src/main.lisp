@@ -112,6 +112,18 @@ harness)."
     (let ((pool (ota-server.workers:start-patch-pool
                  cas db :size patch-worker-count)))
       (setf (ota-server.http::app-state-pool state) pool))
+    ;; v1.7: notification worker pool.  Skipped silently when no
+    ;; webhook URL is configured -- the deployment doesn't care
+    ;; about upgrade notifications.
+    (ota-server.catalogue:reset-stale-running-notifications db)
+    (let ((npool (ota-server.workers:start-notification-pool
+                  db
+                  :webhook-url (getf cfg :notifications-webhook-url)
+                  :webhook-timeout (or (getf cfg :notifications-webhook-timeout) 10)
+                  :webhook-secret (getf cfg :notifications-webhook-secret)
+                  :max-attempts (or (getf cfg :notifications-max-attempts) 5)
+                  :size (or (getf cfg :notifications-worker-count) 2))))
+      (setf (ota-server.http::app-state-notification-pool state) npool))
     (format t "ota-server ~A~%~
                listening on ~A:~A (~A http worker thread~:P, ~A patch worker~:P)~%~
                data_dir=~A~%~
@@ -136,6 +148,8 @@ harness)."
              (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
         (ota-server.workers:stop-patch-pool
          (ota-server.http::app-state-pool state))
+        (ota-server.workers:stop-notification-pool
+         (ota-server.http::app-state-notification-pool state))
         (ota-server.http:stop-server handler)))
     0))
 

@@ -51,6 +51,18 @@
            ;; v1.5 — client-software state snapshot
            #:record-client-software-state
            #:get-client-software-state
-           #:list-client-software-states))
+           #:list-client-software-states
+           ;; v1.7 — opt-in client emails
+           #:record-client-email
+           #:list-client-emails
+           #:delete-client-email
+           ;; v1.7 — notifications outbox
+           #:enqueue-notification
+           #:claim-next-notification
+           #:mark-notification-sent
+           #:mark-notification-failed
+           #:reset-stale-running-notifications
+           #:count-notifications
+           #:list-clients-on-software))
 
 (in-package #:ota-server.catalogue)

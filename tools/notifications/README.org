@@ -1,0 +1,69 @@
+#+TITLE: ota-server notification webhook receivers (samples)
+
+* What's here
+
+=ota-server= v1.7+ sends one HTTP POST per upgrade-notification
+event to a configurable webhook URL.  *We deliberately do not
+ship SMTP.*  Operators run a tiny webhook receiver that
+translates the JSON payload to whatever notification mechanism
+the organisation already uses.
+
+ADR-0012 explains the rationale (vendoring policy +
+SMTP-attack-surface arguments).  This directory contains
+reference receivers for the common backends.
+
+* Payload
+
+A single =POST= per outbox row.  Body is JSON with
+=schema_version=1=:
+
+#+begin_src json
+{
+  "schema_version":  1,
+  "notification_id": 1234,
+  "reason":          "publish",            // publish|announce|security
+  "client_id":       "c-deadbeef",
+  "emails":          ["alice@example.com"],
+  "software":        "myapp",
+  "release": {
+    "release_id":     "myapp/linux-x86_64/2.0.0",
+    "version":        "2.0.0",
+    "published_at":   "2026-05-10T19:42:00Z",
+    "blob_size":      4194304
+  }
+}
+#+end_src
+
+When =[notifications].webhook_secret= is set in =ota.toml=, every
+POST carries an =X-Ota-Webhook-Signature= header containing the
+HMAC-SHA256 of the body (lowercase hex).  Receivers SHOULD
+verify it before acting.
+
+The receiver MUST:
+
+- Return =2xx= on successful delivery.  =ota-server= marks the
+  outbox row =sent= and never retries.
+- Return =4xx= on a *permanent* failure (bad address, recipient
+  blocked, …).  =ota-server= marks the row =failed= and gives up.
+- Return =5xx= (or hang up) on a transient failure.
+  =ota-server= leaves the row =pending=, increments =attempts=,
+  and re-tries on the next pool tick (up to =max_attempts=,
+  default 5).
+
+* Receivers in this directory
+
+| File                    | Backend          | Stack          |
+|-------------------------+------------------+----------------|
+| =smtp-relay.py=         | SMTP (any MTA)   | Python stdlib  |
+| =slack-webhook.sh=      | Slack            | shell + curl   |
+
+Each receiver has a short header comment explaining how to run
+it (a one-liner, a systemd unit, a docker run, an AWS Lambda) and
+which environment variables it reads.
+
+* Adding more
+
+The payload shape is documented in =docs/adr/0012-notification-webhook.org=
+and stable for the lifetime of =schema_version=1=.  Fork any of
+the samples; the JSON is small enough that a 30-line script
+covers most backends.

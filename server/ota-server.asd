@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — distribution server."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "1.6.0"
+  :version "1.7.0"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
@@ -18,7 +18,9 @@
                "sqlite"
                "clack"
                "woo"
-               "cl-ppcre")
+               "cl-ppcre"
+               ;; v1.7: outbound HTTP for the notification webhook.
+               "dexador")
   :pathname "src/"
   :components ((:module "config"
                 :components ((:file "package")
@@ -35,11 +37,12 @@
                              (:file "db" :depends-on ("package"))))
                (:module "workers"
                 :components ((:file "package")
-                             (:file "patcher"      :depends-on ("package"))
-                             (:file "pool"         :depends-on ("package" "patcher"))
-                             (:file "reachability" :depends-on ("package" "patcher"))
-                             (:file "operations"   :depends-on ("package" "reachability"))
-                             (:file "stats"        :depends-on ("package")))
+                             (:file "patcher"       :depends-on ("package"))
+                             (:file "pool"          :depends-on ("package" "patcher"))
+                             (:file "reachability"  :depends-on ("package" "patcher"))
+                             (:file "operations"    :depends-on ("package" "reachability"))
+                             (:file "stats"         :depends-on ("package"))
+                             (:file "notifications" :depends-on ("package")))
                 :depends-on ("storage" "catalogue" "manifest"))
                (:module "http"
                 :components ((:file "package")
@@ -64,6 +67,7 @@
                (:file "range-tests"       :depends-on ("smoke"))
                (:file "admin-identity-tests" :depends-on ("smoke"))
                (:file "client-state-tests"   :depends-on ("smoke"))
-               (:file "reachability-tests"   :depends-on ("smoke")))
+               (:file "reachability-tests"   :depends-on ("smoke"))
+               (:file "notifications-tests"  :depends-on ("smoke")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))

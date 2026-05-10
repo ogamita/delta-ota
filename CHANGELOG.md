@@ -20,6 +20,29 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Added
+- **Opt-in client-person link + upgrade notifications via webhook.**
+  Two new tables: `client_emails` (multiple addresses per client,
+  opt-in by design) and `notifications_outbox` (mirrors
+  `patch_jobs` structurally for atomicity + restart-safety +
+  retry). Agent gains `ota-agent set-email <addr>` /
+  `unset-email` / `show-email`. Admin gains
+  `POST /v1/admin/software/<sw>/announce`. Publish handler
+  automatically enqueues "new release" notifications for clients
+  on older versions of the same software within matching
+  channels. A new notification worker pool drains the outbox and
+  POSTs JSON to a configurable webhook URL — operators run a
+  small HTTP receiver that translates to whatever their org
+  uses (SMTP, SES, Slack, Teams, internal ticket system); we
+  ship sample receivers in `tools/notifications/`. No built-in
+  SMTP — vendoring policy (ADR-0003) prohibits LGPL libraries
+  and hand-rolling SMTP would add attack surface. GDPR-friendly:
+  opt-in only, deletion via one HTTP call, configurable
+  `OTA_DISABLE_REPORTING=1` short-circuit. See
+  [docs/adr/0012-notification-webhook.org](docs/adr/0012-notification-webhook.org).
+
+## [1.6.0] - 2026-05-10
+
+### Added
 - **Reachability-aware GC.** The GC now consults the v1.5
   client-software snapshot before dropping any release: for
   every active client position, Dijkstra over the patches

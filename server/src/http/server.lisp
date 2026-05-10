@@ -44,7 +44,11 @@
   ;; v1.2: async patch-build worker pool (workers/pool.lisp).  NIL when
   ;; the legacy synchronous fan-in is wanted (some tests, the e2e
   ;; harness if not yet updated).
-  pool)
+  pool
+  ;; v1.7: notification worker pool (workers/notifications.lisp).
+  ;; NIL when [notifications].webhook_url isn't configured -- the
+  ;; publish handler then skips the fan-out silently.
+  notification-pool)
 
 (defparameter *app* nil)
 
@@ -255,6 +259,18 @@ closed automatically when EVENT-BUILDER returns or signals."
           (equal (first segments) "v1") (equal (second segments) "software")
           (equal (fourth segments) "upgrade"))
      (values :get-upgrade-patch (list :software (third segments))))
+    ;; v1.7 — opt-in client emails.  Per-client bearer auth.
+    ((and (eq method :put) (equal segments '("v1" "clients" "me" "email")))
+     :client-put-email)
+    ((and (eq method :get) (equal segments '("v1" "clients" "me" "email")))
+     :client-list-emails)
+    ((and (eq method :delete) (equal segments '("v1" "clients" "me" "email")))
+     :client-delete-email)
+    ;; v1.7 — admin manual announce.
+    ((and (eq method :post) (= 5 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "software") (equal (fifth segments) "announce"))
+     (values :admin-announce (list :software (fourth segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -971,6 +987,23 @@ EMIT is a one-arg function called with a plist per event."
           (funcall emit (list :event :manifest-resigned
                               :manifest-sha256 final-manifest-sha
                               :patches-built (length patches-in)))))
+      ;; v1.7: fan out upgrade notifications to clients on older
+      ;; versions of this software.  Best-effort: a failure here
+      ;; logs but doesn't fail the publish itself.
+      (handler-case
+          (let ((enqueued (ota-server.workers:enqueue-publish-notifications
+                           (app-state-catalogue app)
+                           :software software :release-id release-id
+                           :reason "publish")))
+            (when (plusp enqueued)
+              (when (app-state-notification-pool app)
+                (ota-server.workers:notify-notification-pool
+                 (app-state-notification-pool app)))
+              (funcall emit (list :event :notifications-enqueued
+                                  :count enqueued))))
+        (error (e)
+          (format *error-output*
+                  "publish: notification enqueue failed: ~A~%" e)))
       (funcall emit (list :event :done
                           :release-id release-id
                           :blob-sha256 sha :blob-size size
@@ -1725,6 +1758,128 @@ distinguish the two failure modes."
             (t
              (error-response 400 (princ-to-string c)))))))))
 
+;; ---------------------------------------------------------------------------
+;; v1.7: client emails + admin announce.
+;; ---------------------------------------------------------------------------
+
+(defun handle-client-put-email (app env)
+  "Register an email for the calling client.  Body: { email: ... }.
+Idempotent on (client_id, email).  Strictly opt-in: the agent
+calls this only when the user has run `ota-agent set-email`."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((body (read-request-body-bytes env))
+              (json (and body (ignore-errors
+                                (com.inuoe.jzon:parse
+                                 (sb-ext:octets-to-string body :external-format :utf-8)))))
+              (email (and (hash-table-p json) (gethash "email" json))))
+         (cond
+           ((or (null email) (zerop (length email)))
+            (error-response 400 "missing email"))
+           (t
+            (ota-server.catalogue:record-client-email
+             (app-state-catalogue app)
+             :client-id (getf client :client-id)
+             :email email)
+            (json-response 200
+                           (obj "client_id" (getf client :client-id)
+                                "email"     email
+                                "verified"  nil)))))))))
+
+(defun handle-client-list-emails (app env)
+  "List the calling client's registered addresses.  Used by the
+agent's `show-email` subcommand and by the GDPR subject-access
+path."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let ((rows (ota-server.catalogue:list-client-emails
+                    (app-state-catalogue app) (getf client :client-id))))
+         (json-response 200
+                        (coerce
+                         (mapcar (lambda (r)
+                                   (obj "email"        (getf r :email)
+                                        "verified_at"  (or (getf r :verified-at) "")
+                                        "opted_in_at"  (getf r :opted-in-at)))
+                                 rows)
+                         'vector)))))))
+
+(defun handle-client-delete-email (app env)
+  "Remove one (or all) registered addresses for the calling client.
+?address=foo@bar removes one; absent ?address removes all (the
+GDPR right-to-deletion path)."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((qs (env-get env :query-string))
+              (qparams (parse-query-string qs))
+              (addr (getf qparams :address))
+              (deleted (ota-server.catalogue:delete-client-email
+                        (app-state-catalogue app)
+                        :client-id (getf client :client-id)
+                        :email addr)))
+         (json-response 200
+                        (obj "client_id" (getf client :client-id)
+                             "deleted"   deleted)))))))
+
+(defun handle-admin-announce (app env params)
+  "Admin-triggered notification fan-out.  Iterates clients on
+SOFTWARE older than the announced release (or all clients when
+release_id isn't pinned) and enqueues outbox rows.
+
+Body:
+  { release_id: \"...\",            -- required
+    reason:     \"announce\",       -- default
+    dry_run:    false }
+
+Authenticated via with-admin-identity (cert-subject if
+configured, audit-logged)."
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (sw       (getf params :software))
+           (rid      (and (hash-table-p json) (gethash "release_id" json)))
+           (reason   (or (and (hash-table-p json) (gethash "reason" json))
+                         "announce"))
+           (dry-run  (and (hash-table-p json) (gethash "dry_run" json))))
+      (cond
+        ((or (null rid) (zerop (length rid)))
+         (error-response 400 "missing release_id"))
+        (t
+         (let* ((enqueued
+                 (cond
+                   (dry-run
+                    (length (ota-server.catalogue:list-clients-on-software
+                             (app-state-catalogue app) sw)))
+                   (t
+                    (ota-server.workers:enqueue-publish-notifications
+                     (app-state-catalogue app)
+                     :software sw :release-id rid :reason reason)))))
+           (when (and (not dry-run) (app-state-notification-pool app))
+             (ota-server.workers:notify-notification-pool
+              (app-state-notification-pool app)))
+           (ota-server.catalogue:append-audit
+            (app-state-catalogue app)
+            :identity identity :action "announce"
+            :target (format nil "~A/~A" sw rid)
+            :detail (format nil "reason=~A enqueued=~D dry_run=~A"
+                            reason enqueued (if dry-run "true" "false")))
+           (json-response 200
+                          (obj "software"  sw
+                               "release_id" rid
+                               "reason"     reason
+                               "enqueued"   enqueued
+                               "dry_run"    (if dry-run t nil)))))))))
+
 (defun handle-get-upgrade-patch (app env params)
   "v1.6: lazy upgrade-time patch build.
 
@@ -1936,7 +2091,12 @@ this path)."
                  (:admin-stats-index            (handle-admin-stats-index state env))
                  (:admin-stats-run              (handle-admin-stats-run state env params))
                  ;; v1.6 — lazy upgrade-time patch build.
-                 (:get-upgrade-patch            (handle-get-upgrade-patch state env params)))
+                 (:get-upgrade-patch            (handle-get-upgrade-patch state env params))
+                 ;; v1.7 — client emails + admin announce.
+                 (:client-put-email             (handle-client-put-email state env))
+                 (:client-list-emails           (handle-client-list-emails state env))
+                 (:client-delete-email          (handle-client-delete-email state env))
+                 (:admin-announce               (handle-admin-announce state env params)))
              (error (e)
                (format *error-output* "handler error on ~A: ~A~%" path e)
                (error-response 500 "internal error" (princ-to-string e))))))))))

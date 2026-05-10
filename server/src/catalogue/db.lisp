@@ -71,7 +71,9 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
                    "src/catalogue/migrations/0002_patches.sql"
                    "src/catalogue/migrations/0003_auth.sql"
                    "src/catalogue/migrations/0004_patch_jobs.sql"
-                   "src/catalogue/migrations/0005_client_software_state.sql"))
+                   "src/catalogue/migrations/0005_client_software_state.sql"
+                   "src/catalogue/migrations/0006_client_emails.sql"
+                   "src/catalogue/migrations/0007_notifications_outbox.sql"))
       (dolist (stmt (split-statements (read-migration-file mig)))
         (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) stmt)))
           (when (plusp (length trimmed))
@@ -916,6 +918,182 @@ idempotent.  Returns the number of rows reset."
        db
        "UPDATE patch_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
       before)))
+
+;; ---------------- v1.7: client emails ----------------
+;;
+;; Opt-in only.  Agent calls PUT /v1/clients/me/email to register
+;; an address; DELETE to revoke.  Multiple addresses per client are
+;; allowed (admin + personal); the notification worker pool fans
+;; one webhook POST per registered address.
+
+(defun record-client-email (catalogue &key client-id email)
+  "Register an email for a client.  Idempotent: a re-PUT of the
+same (client_id, email) pair is a no-op (the existing
+opted_in_at / created_at are preserved)."
+  (with-catalogue (db catalogue)
+    (let ((now (universal-to-iso8601 (get-universal-time))))
+      (sqlite:execute-non-query
+       db
+       "INSERT OR IGNORE INTO client_emails (client_id, email, opted_in_at, created_at) VALUES (?, ?, ?, ?)"
+       client-id email now now))))
+
+(defun list-client-emails (catalogue client-id)
+  "Return all registered addresses for CLIENT-ID as plists."
+  (with-catalogue (db catalogue)
+    (mapcar (lambda (row)
+              (destructuring-bind (email verified opted-in created) row
+                (list :email email
+                      :verified-at verified
+                      :opted-in-at opted-in
+                      :created-at created)))
+            (sqlite:execute-to-list
+             db
+             "SELECT email, verified_at, opted_in_at, created_at FROM client_emails WHERE client_id = ? ORDER BY opted_in_at ASC"
+             client-id))))
+
+(defun delete-client-email (catalogue &key client-id email)
+  "Remove one address for a client.  When EMAIL is NIL, removes
+all addresses for the client (the GDPR right-to-deletion path).
+Returns the number of rows deleted."
+  (with-catalogue (db catalogue)
+    (cond
+      (email
+       (sqlite:execute-non-query
+        db
+        "DELETE FROM client_emails WHERE client_id = ? AND email = ?"
+        client-id email))
+      (t
+       (sqlite:execute-non-query
+        db
+        "DELETE FROM client_emails WHERE client_id = ?"
+        client-id)))
+    (or (caar (sqlite:execute-to-list db "SELECT changes()")) 0)))
+
+;; ---------------- v1.7: notifications outbox ----------------
+
+(defparameter *notification-columns*
+  "id, client_id, software_name, release_id, reason, status, attempts, last_error, enqueued_at, started_at, sent_at")
+
+(defun row-to-notification (row)
+  (destructuring-bind (id cid sw rid reason status attempts err
+                       enqueued started sent) row
+    (list :id id :client-id cid :software sw :release-id rid
+          :reason reason :status status :attempts attempts
+          :last-error err
+          :enqueued-at enqueued :started-at started :sent-at sent)))
+
+(defun enqueue-notification (catalogue &key client-id software release-id
+                                            (reason "publish"))
+  "Insert one outbox row.  Idempotent on (client, software,
+release, reason) -- a duplicate enqueue silently no-ops.  Returns
+(values :enqueued JOB-ID) or (values :existing JOB-ID).
+
+The UNIQUE constraint ensures a re-published release or a
+retried admin announce can't fan out twice to the same client."
+  (with-catalogue (db catalogue)
+    (let ((now (universal-to-iso8601 (get-universal-time))))
+      (sqlite:execute-non-query
+       db
+       "INSERT OR IGNORE INTO notifications_outbox (client_id, software_name, release_id, reason, status, enqueued_at) VALUES (?, ?, ?, ?, 'pending', ?)"
+       client-id software release-id reason now)
+      (let* ((changed (or (caar (sqlite:execute-to-list db "SELECT changes()")) 0))
+             (id (caar (sqlite:execute-to-list
+                        db
+                        "SELECT id FROM notifications_outbox WHERE client_id = ? AND software_name = ? AND release_id = ? AND reason = ?"
+                        client-id software release-id reason))))
+        (values (if (plusp changed) :enqueued :existing) id)))))
+
+(defun claim-next-notification (catalogue)
+  "Atomically claim the oldest pending row.  Returns the plist or
+NIL when none.  BEGIN IMMEDIATE wraps the SELECT+UPDATE so two
+workers don't claim the same row."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query db "BEGIN IMMEDIATE")
+    (handler-case
+        (let* ((rows (sqlite:execute-to-list
+                      db
+                      (format nil "SELECT ~A FROM notifications_outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+                              *notification-columns*)))
+               (job (and rows (row-to-notification (first rows)))))
+          (cond
+            ((null job)
+             (sqlite:execute-non-query db "COMMIT")
+             nil)
+            (t
+             (sqlite:execute-non-query
+              db
+              "UPDATE notifications_outbox SET status = 'running', started_at = ?, attempts = attempts + 1 WHERE id = ?"
+              (universal-to-iso8601 (get-universal-time)) (getf job :id))
+             (sqlite:execute-non-query db "COMMIT")
+             (setf (getf job :status) "running")
+             (incf (getf job :attempts))
+             job)))
+      (error (c)
+        (handler-case (sqlite:execute-non-query db "ROLLBACK")
+          (error () nil))
+        (error c)))))
+
+(defun mark-notification-sent (catalogue id)
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "UPDATE notifications_outbox SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?"
+     (universal-to-iso8601 (get-universal-time)) id)))
+
+(defun mark-notification-failed (catalogue id error-msg
+                                 &key (give-up nil))
+  "Record a failure.  When GIVE-UP is T (operator-defined max
+attempts reached, or a 4xx response from the webhook), the row
+is moved to status='failed'; otherwise it stays 'pending' for the
+next pool tick."
+  (with-catalogue (db catalogue)
+    (cond
+      (give-up
+       (sqlite:execute-non-query
+        db
+        "UPDATE notifications_outbox SET status = 'failed', sent_at = ?, last_error = ? WHERE id = ?"
+        (universal-to-iso8601 (get-universal-time))
+        (or error-msg "") id))
+      (t
+       (sqlite:execute-non-query
+        db
+        "UPDATE notifications_outbox SET status = 'pending', last_error = ? WHERE id = ?"
+        (or error-msg "") id)))))
+
+(defun reset-stale-running-notifications (catalogue)
+  "Boot-time recovery: any row left in 'running' is reset to
+'pending'.  Same pattern as reset-stale-running-jobs."
+  (with-catalogue (db catalogue)
+    (let ((before (or (caar (sqlite:execute-to-list
+                             db "SELECT COUNT(*) FROM notifications_outbox WHERE status = 'running'"))
+                      0)))
+      (sqlite:execute-non-query
+       db
+       "UPDATE notifications_outbox SET status = 'pending', started_at = NULL WHERE status = 'running'")
+      before)))
+
+(defun count-notifications (catalogue &key status)
+  (with-catalogue (db catalogue)
+    (or (caar (cond
+                (status
+                 (sqlite:execute-to-list
+                  db "SELECT COUNT(*) FROM notifications_outbox WHERE status = ?"
+                  status))
+                (t
+                 (sqlite:execute-to-list
+                  db "SELECT COUNT(*) FROM notifications_outbox"))))
+        0)))
+
+(defun list-clients-on-software (catalogue software-name)
+  "Distinct client_ids currently tracking SOFTWARE-NAME (snapshot
+has a current_release_id != NULL).  Used by the publish handler
+to fan out notifications to clients on older versions."
+  (with-catalogue (db catalogue)
+    (mapcar #'car
+            (sqlite:execute-to-list
+             db
+             "SELECT DISTINCT client_id FROM client_software_state WHERE software_name = ? AND current_release_id IS NOT NULL"
+             software-name))))
 
 (defun list-audit (catalogue &optional (limit 100))
   (with-catalogue (db catalogue)

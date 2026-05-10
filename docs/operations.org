@@ -758,6 +758,83 @@ v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
 straightforward to add.  Ship target: a sub-phase, driven by the
 first customer who needs it.
 
+* Upgrade notifications (since v1.7)
+
+=ota-server= can notify users by email (or any other channel)
+when a release lands.  *No SMTP runs in =ota-server=.*  Mail
+leaves the process via an HTTP webhook to an operator-managed
+receiver, which translates our JSON to whatever the
+organisation actually uses.
+
+ADR-0012 has the full design; this section is the operator
+quick-reference.
+
+** Configuration
+
+#+begin_src toml
+[notifications]
+webhook_url     = "http://127.0.0.1:9090/notify"   # required; pool refuses to start when unset
+webhook_timeout = 10                                # seconds (default 10)
+webhook_secret  = "...random hex..."                # optional HMAC-SHA256 over body
+worker_count    = 2                                 # default 2
+max_attempts    = 5                                 # default 5
+#+end_src
+
+** Trigger points
+
+- *Automatic at publish time*: every successful publish enqueues
+  one outbox row per client whose snapshot points at a different
+  release.
+- *Manual announce*: =POST /v1/admin/software/<sw>/announce=
+  with body =({release_id, reason="announce", dry_run})=
+  forces a fan-out outside of publish.
+
+** Sample receivers
+
+=tools/notifications/= ships ready-to-run reference receivers:
+
+- =smtp-relay.py= — Python stdlib, ~120 lines.  Use it when
+  you have your own MTA / Postfix / Exim relay.
+- =slack-webhook.sh= — shell + curl + socat, ~70 lines.  Use
+  it when notifications go to a Slack channel.
+
+Forking either to add SES / SendGrid / Mailgun / Teams /
+Discord support is short work; the payload shape is documented
+in =tools/notifications/README.org=.
+
+** Agent opt-in
+
+Strictly opt-in.  Users / operators register an address via:
+
+#+begin_src
+$ ota-agent set-email   <software> <address>
+$ ota-agent show-email  <software>
+$ ota-agent unset-email <software> [<address>]
+#+end_src
+
+The agent does NOT prompt automatically.
+
+** Outbox inspection
+
+The =notifications_outbox= table records every dispatch
+attempt.
+
+#+begin_src bash
+sqlite3 /var/lib/ota/db/ota.db \
+    'SELECT status, COUNT(*) FROM notifications_outbox GROUP BY status'
+#+end_src
+
+A future v1.8 admin stats query (=notification-status=) will
+expose this through the v1.5 catalogue.  For v1.7, operators
+query directly.
+
+** Disabling
+
+Leave =[notifications].webhook_url= unset.  The pool is not
+started; the publish handler skips the fan-out silently.
+Existing =client_emails= rows are kept; operators can still
+read them via SQL if needed.
+
 * Reachability-aware GC (since v1.6)
 
 =POST /v1/admin/software/<sw>/gc= now consults the v1.5

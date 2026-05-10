@@ -59,7 +59,17 @@
         ;; rate limits).  Plist mapping route-keyword to a
         ;; (CAPACITY . REFILL-PER-SEC) cons.  NIL means "use the
         ;; built-in admin defaults from *admin-rate-limits*".
-        :rate-limits-override       nil))
+        :rate-limits-override       nil
+        ;; v1.7: notification webhook (ADR-0012).  When
+        ;; NOTIFICATIONS-WEBHOOK-URL is unset, the notification
+        ;; worker pool refuses to start and publish-time fan-out
+        ;; is silently skipped -- a deployment that doesn't care
+        ;; about upgrade notifications just leaves these alone.
+        :notifications-webhook-url     nil
+        :notifications-webhook-timeout 10        ; seconds
+        :notifications-webhook-secret  nil       ; HMAC-SHA256 over body
+        :notifications-worker-count    2
+        :notifications-max-attempts    5))
 
 ;; ---------------------------------------------------------------------------
 ;; TOML parsing
@@ -188,6 +198,21 @@ applied here — call APPLY-ENV-OVERRIDES on the result."
                                                (getf defaults :tls-proxy-subject-header-name))
          :rate-limits-override      (%parse-rate-limits-section
                                      (%toml-section toml "rate_limits"))
+         :notifications-webhook-url
+                                    (%toml-get (%toml-section toml "notifications") "webhook_url"
+                                               (getf defaults :notifications-webhook-url))
+         :notifications-webhook-timeout
+                                    (%toml-get (%toml-section toml "notifications") "webhook_timeout"
+                                               (getf defaults :notifications-webhook-timeout))
+         :notifications-webhook-secret
+                                    (%toml-get (%toml-section toml "notifications") "webhook_secret"
+                                               (getf defaults :notifications-webhook-secret))
+         :notifications-worker-count
+                                    (%toml-get (%toml-section toml "notifications") "worker_count"
+                                               (getf defaults :notifications-worker-count))
+         :notifications-max-attempts
+                                    (%toml-get (%toml-section toml "notifications") "max_attempts"
+                                               (getf defaults :notifications-max-attempts))
          :storage-backend           (%toml-get storage "backend"
                                                (getf defaults :storage-backend))
          :catalogue-db              (%toml-get cat     "db")

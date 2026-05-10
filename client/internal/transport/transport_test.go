@@ -490,6 +490,116 @@ func TestReportClientState_NetworkFailureSurfaced(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// v1.7: client emails
+// ---------------------------------------------------------------------------
+
+func TestSetClientEmail_PutsBodyWithAuth(t *testing.T) {
+	var seenMethod, seenAuth, seenPath string
+	var seenBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		seenAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&seenBody)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"client_id":"c-1","email":"alice@x.com","verified":false}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER"
+	res, err := c.SetClientEmail(context.Background(), "alice@x.com")
+	if err != nil {
+		t.Fatalf("SetClientEmail: %v", err)
+	}
+	if seenMethod != "PUT" {
+		t.Errorf("method=%q want PUT", seenMethod)
+	}
+	if seenPath != "/v1/clients/me/email" {
+		t.Errorf("path=%q want /v1/clients/me/email", seenPath)
+	}
+	if seenAuth != "Bearer BEARER" {
+		t.Errorf("authorization=%q want Bearer BEARER", seenAuth)
+	}
+	if seenBody["email"] != "alice@x.com" {
+		t.Errorf("body.email=%v want alice@x.com", seenBody["email"])
+	}
+	if res.Email != "alice@x.com" {
+		t.Errorf("response.Email=%q want alice@x.com", res.Email)
+	}
+}
+
+func TestListClientEmails_DecodesArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`[
+		  {"email":"a@x.com","verified_at":"","opted_in_at":"2026-05-10T...Z"},
+		  {"email":"b@x.com","verified_at":"","opted_in_at":"2026-05-11T...Z"}
+		]`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER"
+	rows, err := c.ListClientEmails(context.Background())
+	if err != nil {
+		t.Fatalf("ListClientEmails: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].Email != "a@x.com" || rows[1].Email != "b@x.com" {
+		t.Errorf("emails out of order: %v", rows)
+	}
+}
+
+func TestDeleteClientEmail_OneAddress(t *testing.T) {
+	var seenQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"client_id":"c-1","deleted":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER"
+	n, err := c.DeleteClientEmail(context.Background(), "alice@x.com")
+	if err != nil {
+		t.Fatalf("DeleteClientEmail: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deleted=%d want 1", n)
+	}
+	if seenQuery != "address=alice@x.com" {
+		t.Errorf("query=%q want address=alice@x.com", seenQuery)
+	}
+}
+
+func TestDeleteClientEmail_AllAddresses(t *testing.T) {
+	var seenQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"client_id":"c-1","deleted":3}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER"
+	n, err := c.DeleteClientEmail(context.Background(), "")
+	if err != nil {
+		t.Fatalf("DeleteClientEmail: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("deleted=%d want 3", n)
+	}
+	if seenQuery != "" {
+		t.Errorf("query=%q want empty (delete all)", seenQuery)
+	}
+}
+
 func TestReportClientState_4xxReportedAsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)

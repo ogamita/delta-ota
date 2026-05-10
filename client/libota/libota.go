@@ -398,3 +398,58 @@ func Revert(cfg Config, software string) error {
 // Drain is a tiny utility to copy a stream to /dev/null counting
 // bytes (used by tests).
 func Drain(r io.Reader) (int64, error) { return io.Copy(io.Discard, r) }
+
+// ---------------------------------------------------------------------------
+// v1.7: email subcommands
+// ---------------------------------------------------------------------------
+
+// EmailClient bundles a transport.Client authenticated by the
+// per-client bearer recorded in state.json.  The agent's
+// set-email / unset-email / show-email subcommands all share
+// this boilerplate -- loading state, attaching auth, hitting the
+// per-software server URL persisted from the original install.
+type EmailClient struct {
+	tr      *transport.Client
+	state   *state.State
+	server  string
+}
+
+// NewEmailClient loads the per-software state.json for SOFTWARE
+// under OTAHOME and wires up a transport.Client with the
+// persisted ServerURL + BearerToken.  Returns an error when no
+// state exists (the user hasn't installed SOFTWARE yet) or when
+// the state is missing the bearer (the agent was never linked
+// to a server -- nothing to talk to).
+func NewEmailClient(otaHome, software string) (*EmailClient, error) {
+	layout := state.New(otaHome, software)
+	st, err := layout.Load()
+	if err != nil {
+		return nil, err
+	}
+	if st.BearerToken == "" {
+		return nil, errors.New("email: no bearer token; install the software first")
+	}
+	if st.ServerURL == "" {
+		return nil, errors.New("email: no server URL in state.json")
+	}
+	tr := transport.New(st.ServerURL)
+	tr.Auth = transport.BearerAuth(st.BearerToken)
+	return &EmailClient{tr: tr, state: st, server: st.ServerURL}, nil
+}
+
+// Set registers an address with the server.
+func (c *EmailClient) Set(ctx context.Context, address string) error {
+	_, err := c.tr.SetClientEmail(ctx, address)
+	return err
+}
+
+// Unset removes one (or all, when ADDRESS is empty) addresses.
+// Returns the count deleted.
+func (c *EmailClient) Unset(ctx context.Context, address string) (int, error) {
+	return c.tr.DeleteClientEmail(ctx, address)
+}
+
+// Show lists registered addresses.
+func (c *EmailClient) Show(ctx context.Context) ([]transport.ClientEmail, error) {
+	return c.tr.ListClientEmails(ctx)
+}
