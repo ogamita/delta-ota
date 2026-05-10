@@ -1,0 +1,244 @@
+#+TITLE: ADR-0008 — Resumable blob downloads (HTTP Range + .part survival)
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.3.0.
+
+* Context
+
+A first-time install pulls the *full release blob* — the
+content-addressed tar that the agent unpacks into the install
+tree.  Empirically these blobs are a few hundred MB to *2 GB or
+more* (the customer profile that drove this work ships a 1.8 GB
+asset bundle for a desktop application).  Patches, by contrast,
+are typically <100 KB; restart-from-zero on a patch is invisible.
+
+Through v1.2 the download path was non-resumable:
+
+  - The server's =handle-get-blob= returned the CAS pathname; Woo
+    handed it to the kernel via =sendfile(2)=.  No =Range:= parsing.
+  - The client streamed the response into =<dst>.part=, hashed it
+    on the way through, and renamed to the final name on success.
+  - On *any* failure (network drop, read error, hash mismatch), the
+    client called =os.Remove(tmp)= — the partial file was deleted.
+  - On a process crash, the =.part= file was left orphaned and the
+    next attempt created a new one from byte 0; the orphan was
+    never reused.
+
+So a 2 GB initial install that dropped at 1.9 GB threw away the
+work, and the next attempt restarted from 0.  Over a flaky link
+this is the difference between "eventually succeeds" and "never
+succeeds".
+
+** Constraints
+
+- Self-containment ([[file:../../CLAUDE.md][CLAUDE.md]]): the client must work without any
+  external resume tool.  Curl --continue-at is not a substitute.
+- The integrity guarantee on the *blob* is the SHA-256 in the
+  signed manifest.  Whatever resume does, the final SHA-256 of the
+  bytes on disk MUST still match — corrupt resume must be caught,
+  not silently accepted.
+- =sendfile(2)= is the steady-state fast path on the server (kernel
+  ships bytes from the disk to the socket without traversing
+  SBCL).  A redesign should not lose that for full-content
+  responses.
+- We don't want to call =fsync(2)= every chunk: that would halve
+  throughput on a 2 GB transfer for an edge case that almost
+  never materialises in practice.
+
+** The torn-write problem
+
+If the client doesn't =fsync= every chunk, a process crash mid-write
+can leave the file's metadata size larger than the data the kernel
+actually committed:
+
+  - On most journalled filesystems (ext4 in =data=ordered=, the
+    default) data is journalled before the metadata size update,
+    so the on-disk size is bounded by what's been committed.  The
+    common case is fine.
+  - On other filesystems / settings (=data=writeback=, some
+    network filesystems, some odd configurations on macOS APFS
+    under aggressive memory pressure) the size may grow ahead of
+    the data, and the gap reads back as zeros after recovery.
+
+We can't reliably tell legitimate trailing zeros in the blob from
+post-crash zero-fill, so on resume we must *conservatively
+re-fetch* any trailing-zero tail of the =.part= file.  Worst case:
+a blob whose last byte happens to be zero costs us re-downloading a
+few hundred KB.  Acceptable.
+
+* Decision
+
+Two coordinated changes:
+
+** Server: HTTP Range support on /v1/blobs/<sha> and /v1/patches/<sha>
+
+[[file:../../server/src/http/server.lisp][http/server.lisp]] now exposes:
+
+- =serve-file-with-optional-range= : routing logic that honours
+  =Range:= when present, falls back to the v1.0–v1.2 sendfile
+  path when absent, and adds =Accept-Ranges: bytes= to *full*
+  responses so clients know the option exists.
+- =parse-range-header= : parser for the three single-range
+  shapes we actually need: =bytes=N-= (the resume case),
+  =bytes=N-M= (bounded), =bytes=-K= (suffix).  Multi-range
+  (=bytes=0-9,20-29=) is rejected — supporting it would mean
+  emitting =multipart/byteranges= responses, which adds a lot
+  of complexity for a use case that never arises in practice
+  (clients ask for one open-ended range to resume).
+- =serve-file-range= : streams the requested slice via Clack's
+  lambda-responder.  This means partial responses use chunked
+  transfer encoding rather than =sendfile= — acceptable, since
+  partial requests are by definition the failure-recovery path
+  and not the steady-state.
+
+The 416 path emits =Content-Range: bytes */SIZE= per RFC 7233 §4.4
+so misconfigured clients can detect "the blob really is only
+N bytes" and recover.
+
+The Patches endpoint gets the same treatment for symmetry — a
+client implementation that doesn't need patch-resume can just
+ignore it.
+
+** Client: resumable downloads in transport.go
+
+[[file:../../client/internal/transport/transport.go][transport.go]]
+replaces =downloadHashed='s implementation:
+
+1. *Probe the existing .part.*  =openResumeState= stats it; if
+   present and non-empty, =safeResumeSize= scans the trailing-zero
+   tail and returns the offset of the last non-zero byte + 1.
+   The =.part= is truncated down to that safe size.
+2. *Rebuild the prefix hash.*  =hashPrefix= reads bytes [0, N) of
+   the truncated =.part= into a fresh =sha256.New()=.  This is
+   one sequential disk read; on a 2 GB blob this is ~2 s on
+   commodity NVMe — vastly cheaper than re-downloading.
+3. *Send the request with =Range: bytes=N-=.*  N is the safe
+   resume offset.  When N is 0 the header is omitted.
+4. *Branch on response.*
+   - =206 Partial Content=: the server honoured the Range.
+     Open the =.part= for append, continue the SHA into the
+     existing hasher.
+   - =200 OK= when we *did* send a Range: the server (or a
+     proxy) ignored it and is shipping the full body.  Truncate
+     the =.part= to 0, start a fresh SHA, write from byte 0.
+   - =200 OK= when we *did not* send a Range: ordinary fresh
+     download.
+   - Anything else: error.
+5. *Final integrity check.*  Compare the SHA-256 of the
+   accumulated bytes (prefix + body) against the manifest's
+   expected SHA.  Mismatch ⇒ =os.Remove(.part)= and propagate
+   the error; only a hash mismatch deletes the =.part=.
+6. *On any other error (mid-transfer drop, disk full, …)
+   KEEP the =.part=.*  This is the key behaviour change vs
+   v1.2: the next attempt will resume.
+
+The trailing-zero scan window is bounded at 16 MiB
+(=safeScanWindowBytes=) — large enough to handle pretty much any
+realistic torn-write region, small enough that the scan itself is
+imperceptible.  If those 16 MiB are *all* zero we discard the
+whole window and let the resume loop trim further on the next
+iteration.
+
+* Consequences
+
+** Positive
+
+- *Initial install over flaky links is feasible.*  A 2 GB pull
+  that drops at 1.9 GB resumes from ~1.9 GB on the next attempt
+  rather than from 0.
+- *Idempotent across crashes and restarts.*  The =.part= file is
+  the persistent state; the resume loop handles arbitrary numbers
+  of retries.  The trailing-zero scan handles the no-fsync /
+  torn-write hazard without paying the throughput cost of
+  per-chunk fsync.
+- *Server backwards-compatible.*  Clients that don't send Range
+  see exactly the v1.0–v1.2 behaviour — including the kernel
+  =sendfile= fast path.  Older agents talking to a v1.3+ server
+  work unchanged.
+- *Server forward-compatible.*  Newer agents talking to a v1.0–
+  v1.2 server detect "no Range honoured" via the 200-with-Range-
+  request branch and gracefully restart from byte 0.  No
+  capability negotiation needed.
+- *Integrity unchanged.*  The final SHA-256 check is identical;
+  if a partial transfer was somehow corrupted, the comparison
+  catches it and the =.part= is dropped.
+
+** Negative
+
+- *Partial responses lose the sendfile fast path.*  We read +
+  write in user space.  In practice partial requests are rare
+  (only after a failed transfer) and the bottleneck is the
+  network anyway.
+- *Trailing-zero scan can re-fetch a few bytes unnecessarily.*
+  A blob whose last byte is legitimately zero will trigger the
+  scan into trimming a tiny tail on the next resume.  Bounded
+  to ~16 MiB; always benign.
+- *Disk space.*  =.part= files persist between attempts.  An
+  abandoned install leaves the partial blob until the next
+  attempt completes (which will rename it) or the operator
+  cleans up.  Documenting this in operations.org.
+
+** Neutral
+
+- We could have used a sidecar =.part.sha-state= holding the
+  marshalled hasher state to skip step 2 (the prefix re-hash).
+  Go's =crypto/sha256.digest= doesn't expose marshalling, so this
+  would need a third-party SHA implementation — not worth the
+  vendoring for a 2-second savings on a 2 GB transfer.
+- The 200-with-Range fallback also covers the future case of an
+  intermediate proxy stripping or rewriting the Range header.
+
+* Alternatives considered
+
+** A. Keep it non-resumable; tell users to use stable links
+
+Rejected.  The customer already pointed at the 2 GB-on-flaky-LTE
+case; "use stable links" isn't an answer.  Self-contained client
+means we can't punt to wget --continue.
+
+** B. fsync after every write
+
+Rejected.  Halves throughput on a 2 GB transfer.  The whole point
+of streaming is to keep the kernel happy; per-chunk fsync defeats
+it.  And it would still leave torn-write windows on filesystems
+whose metadata sync isn't strict (NFS, some FUSE mounts, …).
+
+** C. Sidecar .part.sha-state
+
+Rejected for now.  Would skip the ~2 s prefix re-hash but requires
+either a third-party hash library that exposes marshal/unmarshal,
+or a vendored copy of Go's =crypto/sha256= internals.  A 2 s
+savings on a 2 GB transfer that already took an hour is not worth
+the vendoring overhead.  Reconsider if profiling ever flags the
+prefix re-hash as a real cost.
+
+** D. Patch Woo for sendfile-with-offset on partial requests
+
+Rejected for now.  The Linux =sendfile(2)= syscall accepts an
+offset, so in principle the partial response could keep the
+fast path.  Woo's API doesn't expose it, and patching vendored
+upstreams is restricted by ADR-0003.  The userspace read+write
+is bandwidth-bounded; the kernel-bypass benefit is small once the
+network is the bottleneck.  Re-walk if a deployment ever hits a
+profile where partial responses are CPU-bound.
+
+** E. Multi-range responses (multipart/byteranges)
+
+Rejected.  The client only ever asks for a single open-ended
+range to resume.  multipart/byteranges adds a parser, MIME
+boundary handling, and tests for ~no win.  YAGNI.
+
+* Operational notes
+
+- =.part= files live next to the final destination
+  (=<OTA_HOME>/<software>/blobs/<sha>.part=).  They are safe to
+  delete manually if a deployment is abandoning a partial
+  download.
+- Server: no new config knobs.  Range support is always on.
+- Client: no new config knobs.  Resume is always on; the trailing-
+  zero scan is unconditional but bounded to 16 MiB.
+- The 16 MiB scan window is exposed as =safeScanWindowBytes=
+  (Go) for tests; it is not a configuration value.

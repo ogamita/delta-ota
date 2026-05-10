@@ -20,6 +20,25 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Added
+- **Resumable blob downloads (HTTP Range).** The server now honours
+  `Range: bytes=N-[M]` on `/v1/blobs/<sha>` and `/v1/patches/<sha>`,
+  responding `206 Partial Content` with the requested slice. Full
+  responses include `Accept-Ranges: bytes` so clients can opportu-
+  nistically resume. The Go client (`libota` + `ota-agent`) keeps
+  its `<dst>.part` file across restarts: on the next attempt it
+  scans the trailing zero-tail of `.part` (a torn write may have
+  enlarged the file's apparent size beyond what was committed to
+  disk), truncates to the last non-zero byte, recomputes the
+  prefix SHA, and asks the server for `bytes=N-`. If the server
+  doesn't honour the Range (replies `200`), the client falls back
+  to a clean restart from byte 0. Patches are typically <100 KB
+  so resume mostly matters for the initial 2 GB blob — but the
+  same code path applies to both. See
+  [docs/adr/0008-resumable-blob-downloads.org](docs/adr/0008-resumable-blob-downloads.org).
+
+## [1.2.0] - 2026-05-10
+
+### Added
 - **Async patch-build worker pool.** The bsdiff fan-in that runs
   after every publish no longer executes synchronously inside
   the publish handler thread. Patches are persisted as `patch_jobs`
