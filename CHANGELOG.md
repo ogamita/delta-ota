@@ -19,6 +19,26 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Changed
+- **CI: dev-image cache backend switched from `inline` to a
+  registry cache ref.** Buildx's inline cache exporter is
+  silently a no-op on multi-platform manifests
+  (`linux/amd64,linux/arm64`); the prior `--cache-to type=inline`
+  was therefore writing nothing, and every pipeline was
+  rebuilding the apt-get + go-tarball + Quicklisp prebake
+  stages from scratch. Now uses
+  `--cache-to type=registry,ref=$CI_REGISTRY_IMAGE/dev:cache,mode=max`
+  with a matching `--cache-from`. Every intermediate layer is
+  pushed to a sibling `dev:cache` tag so the next build can
+  actually reuse them.
+- **CI: `build-server-image` is gated on tags only** (was: master
+  AND tags). The rolling `:latest` and the versioned
+  `:vX.Y.Z` tags are now both built only on tag pushes,
+  halving the QEMU-emulated arm64 buildx burn (~10 min per
+  pipeline) on master. The `release` publish job (already
+  tag-gated) still fires correctly because its `needs:` on
+  `build-server-image` is satisfied on tag pushes.
+
 ### Added
 - **`tests/e2e/two-process-publish.sh`** — boots two independent
   `ota-server` processes against the same data dir on different
