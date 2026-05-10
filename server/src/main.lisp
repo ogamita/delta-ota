@@ -204,6 +204,65 @@ any uncaught error."
 ;; Usage
 ;; ---------------------------------------------------------------------------
 
+(defun run-stats (&key config query-name params)
+  "Run one named stats query from the catalogue and print the
+result as an ASCII table.  Mirrors the HTTP
+`GET /v1/admin/stats/<query-name>` so cron / systemd timers
+can collect stats without going through the API.
+
+Required: :query-name (a keyword).  Optional: :params, a plist
+of :keyword/string-or-integer values matching the catalogue
+entry's :params list.  Exit code 0 on success, 2 on missing
+:query-name, 3 on unknown query / missing required param."
+  (unless query-name
+    (format *error-output* "ota-server stats: <query-name> required~%")
+    (return-from run-stats 2))
+  (let* ((cfg (%resolve config))
+         (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
+         (db  (ota-server.catalogue:open-catalogue
+               (merge-pathnames "db/ota.db" root))))
+    (unwind-protect
+         (handler-case
+             (multiple-value-bind (cols rows)
+                 (ota-server.workers:run-stat-query db query-name :params params)
+               (%print-stats-table cols rows)
+               (force-output)
+               0)
+           (ota-server.workers:stats-error (c)
+             (format *error-output* "ota-server stats: ~A~%" c)
+             3))
+      (ota-server.catalogue:close-catalogue db))))
+
+(defun %print-stats-table (cols rows)
+  "Render (COLS ROWS) as a left-aligned ASCII table on
+*standard-output*.  Computes per-column widths from the data so
+the output is friendly to grep / awk pipelines without being
+ugly when read by a human."
+  (let* ((widths (mapcar (lambda (col)
+                           (max (length (symbol-name col))
+                                (reduce
+                                 #'max
+                                 (mapcar (lambda (row)
+                                           (length (princ-to-string
+                                                    (or (nth (position col cols) row) ""))))
+                                         rows)
+                                 :initial-value 0)))
+                         cols)))
+    ;; Header.
+    (loop for col in cols for w in widths
+          do (format t "~vA  " w (symbol-name col)))
+    (terpri)
+    (loop for w in widths
+          do (format t "~v,,,'-A  " w ""))
+    (terpri)
+    ;; Body.
+    (dolist (row rows)
+      (loop for col in cols for w in widths
+            for v in row
+            do (format t "~vA  " w (or v "")))
+      (terpri))
+    (format t "~%~D row~:P~%" (length rows))))
+
 (defun %usage (&optional (stream *error-output*))
   (format stream
 "ota-server — Ogamita Delta OTA distribution server
@@ -214,6 +273,9 @@ Usage:
   ota-server gc      [--config=PATH] --software=NAME [--min-user-count=N]
                      [--min-age-days=N] [--dry-run]
                                         run garbage collection on SOFTWARE and exit
+  ota-server stats   [--config=PATH] <query-name> [--<param>=<value> ...]
+                                        run an admin stats query; --help-stats
+                                        lists available queries
   ota-server shell                      drop into an SBCL REPL (debug only)
   ota-server version                    print version and exit
   ota-server help                       print this message and exit
@@ -269,6 +331,23 @@ Environment variables (override file values):
                      :min-age-days min-age-days
                      :dry-run (and dry-run t))
              0)))
+      ((string= cmd "stats")
+       (cond
+         ((member "--help-stats" rest :test #'string=)
+          (%list-stats *standard-output*)
+          0)
+         (t
+          (let* ((positional (%positional rest))
+                 (qname-str (second positional))
+                 (qname (and qname-str
+                             (intern (string-upcase
+                                      (substitute #\- #\_ qname-str))
+                                     :keyword)))
+                 (params (%stats-params-from-flags rest)))
+            (or (run-stats :config config
+                           :query-name qname
+                           :params params)
+                0)))))
       ((string= cmd "shell")
        #+sbcl (sb-impl::toplevel-init)
        0)
@@ -276,6 +355,41 @@ Environment variables (override file values):
        (format *error-output* "ota-server: unknown subcommand: ~A~%~%" cmd)
        (%usage)
        2))))
+
+(defun %stats-params-from-flags (argv)
+  "Walk ARGV and collect every --KEY=VALUE flag (except --config
+and the like) into a plist of :KEY/value.  Used by the stats
+subcommand: any flag the user passes that isn't a known
+infrastructure flag is treated as a stats query parameter."
+  (let ((reserved '("config" "help" "help-stats"))
+        (acc '()))
+    (dolist (a argv)
+      (when (and (>= (length a) 3)
+                 (string= "--" a :end2 2))
+        (let* ((eq (position #\= a))
+               (k  (if eq (subseq a 2 eq) (subseq a 2)))
+               (v  (if eq (subseq a (1+ eq)) "")))
+          (unless (member k reserved :test #'string=)
+            (push v acc)
+            (push (intern (string-upcase k) :keyword) acc)))))
+    acc))
+
+(defun %list-stats (stream)
+  "Print the catalogue of available stats queries to STREAM."
+  (let ((rows (ota-server.workers:list-stat-queries)))
+    (format stream "Available stats queries:~%~%")
+    (dolist (r rows)
+      (format stream "  ~A~%" (string-downcase
+                               (symbol-name (getf r :name))))
+      (format stream "    ~A~%" (getf r :description))
+      (let ((ps (getf r :params)))
+        (when ps
+          (format stream "    params: ~{--~A~^ ~}~%"
+                  (mapcar (lambda (p)
+                            (substitute #\- #\_
+                                        (string-downcase (symbol-name p))))
+                          ps))))
+      (terpri stream))))
 
 (defun main (&rest argv)
   "Top-level entry point.  Two calling conventions:

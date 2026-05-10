@@ -232,6 +232,22 @@ closed automatically when EVENT-BUILDER returns or signals."
           (equal (nth 5 segments) "reverse"))
      (values :admin-build-reverse-patch
              (list :software (fourth segments))))
+    ;; v1.5 — client-software state snapshot (PUT/GET/DELETE).
+    ;; Per-client bearer auth (the existing exchange-token flow);
+    ;; client_id is resolved from the bearer.
+    ((and (eq method :put) (= 5 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "clients")
+          (equal (third segments) "me") (equal (fourth segments) "software"))
+     (values :client-put-state (list :software (fifth segments))))
+    ((and (eq method :get) (equal segments '("v1" "clients" "me" "software")))
+     :client-list-state)
+    ;; v1.5 — admin stats catalogue.
+    ((and (eq method :get) (equal segments '("v1" "admin" "stats")))
+     :admin-stats-index)
+    ((and (eq method :get) (= 4 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "stats"))
+     (values :admin-stats-run (list :query-name (fourth segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -1473,6 +1489,178 @@ overwrite an existing manifest with one for a different blob."
                                              (getf r :bad))
                                      'vector))))))
 
+(defun %resolve-client-from-bearer (app env)
+  "Return the catalogue's client plist for the request's bearer
+token, or NIL when no such client is known.  Used by the v1.5
+client-state endpoints; the bearer is the per-client one minted
+at install-token exchange (phase 4), NOT the admin token."
+  (let ((tok (bearer-of env)))
+    (when (and tok
+               ;; The admin token reaches every endpoint, but admin
+               ;; doesn't have a row in the clients table -- so we
+               ;; explicitly fall through to the catalogue lookup
+               ;; without the admin-token shortcut.
+               (not (string= tok (app-state-admin-token app))))
+      (ota-server.catalogue:get-client-by-token
+       (app-state-catalogue app) tok))))
+
+(defun handle-client-put-state (app env params)
+  "Idempotent set of the calling client's snapshot row for one
+software.  Body keys (all optional except either current or
+kind=uninstall):
+
+  current_release_id   string|null
+  previous_release_id  string|null
+  kind                 install|upgrade|revert|recover|uninstall
+  at                   ISO-8601; server uses now() when absent
+
+Authenticated by the per-client bearer.  401 when the bearer
+doesn't resolve to a known client (e.g. expired or never
+exchanged)."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((body (read-request-body-bytes env))
+              (json (and body (ignore-errors
+                                (com.inuoe.jzon:parse
+                                 (sb-ext:octets-to-string body :external-format :utf-8)))))
+              (sw       (getf params :software))
+              (current  (and (hash-table-p json) (gethash "current_release_id" json)))
+              (previous (and (hash-table-p json) (gethash "previous_release_id" json)))
+              (kind     (or (and (hash-table-p json) (gethash "kind" json))
+                            "upgrade"))
+              (at       (and (hash-table-p json) (gethash "at" json))))
+         (cond
+           ((or (null kind) (zerop (length kind)))
+            (error-response 400 "missing kind"))
+           ((and (null current) (not (string= kind "uninstall")))
+            (error-response 400 "current_release_id required unless kind=uninstall"))
+           (t
+            (ota-server.catalogue:record-client-software-state
+             (app-state-catalogue app)
+             :client-id (getf client :client-id)
+             :software sw
+             :current-release-id current
+             :previous-release-id previous
+             :kind kind
+             :at at)
+            (json-response 200
+                           (obj "client_id"          (getf client :client-id)
+                                "software"           sw
+                                "current_release_id" (or current "")
+                                "kind"               kind)))))))))
+
+(defun handle-client-list-state (app env)
+  "Return the calling client's snapshot rows across all software
+they have ever reported on.  Useful for the agent's
+`show-state` subcommand and for GDPR subject-access."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((rows (ota-server.catalogue:list-client-software-states
+                     (app-state-catalogue app)
+                     :client-id (getf client :client-id))))
+         (json-response 200
+                        (coerce
+                         (mapcar (lambda (r)
+                                   (obj "software"
+                                        (getf r :software)
+                                        "current_release_id"
+                                        (or (getf r :current-release-id) "")
+                                        "previous_release_id"
+                                        (or (getf r :previous-release-id) "")
+                                        "last_kind"
+                                        (getf r :last-kind)
+                                        "last_updated_at"
+                                        (getf r :last-updated-at)))
+                                 rows)
+                         'vector)))))))
+
+(defun handle-admin-stats-index (app env)
+  "Return the catalogue of available stats queries.  Useful for
+operators discovering what they can ask, and for the CLI
+subcommand's --help."
+  (with-admin-identity (_identity env app)
+    (declare (ignore _identity))
+    (let ((rows (ota-server.workers:list-stat-queries)))
+      (json-response 200
+                     (coerce
+                      (mapcar (lambda (r)
+                                (obj "name"
+                                     (string-downcase
+                                      (string (getf r :name)))
+                                     "description"
+                                     (getf r :description)
+                                     "params"
+                                     (coerce
+                                      (mapcar (lambda (p)
+                                                (substitute #\_ #\-
+                                                            (string-downcase
+                                                             (symbol-name p))))
+                                              (getf r :params))
+                                      'vector)
+                                     "columns"
+                                     (coerce
+                                      (mapcar #'string-downcase
+                                              (mapcar #'symbol-name
+                                                      (getf r :columns)))
+                                      'vector)))
+                              rows)
+                      'vector)))))
+
+(defun handle-admin-stats-run (app env params)
+  "Run one named stats query.  Query name comes from the URL
+(:query-name path param); query parameters come from the query
+string (?software=...&since-days=30).
+
+Returns 200 with a JSON object: {\"columns\":[\"...\"], \"rows\":[[...]]}.
+A 404 names-an-unknown-query and a 400 missing-required-param
+distinguish the two failure modes."
+  (with-admin-identity (identity env app)
+    (let* ((raw-name (getf params :query-name))
+           (qname    (and raw-name
+                          (intern (string-upcase
+                                   (substitute #\- #\_ raw-name))
+                                  :keyword)))
+           (qs       (env-get env :query-string))
+           (qparams  (parse-query-string qs)))
+      (handler-case
+          (multiple-value-bind (cols rows)
+              (ota-server.workers:run-stat-query
+               (app-state-catalogue app) qname
+               :params qparams)
+            (ota-server.catalogue:append-audit
+             (app-state-catalogue app)
+             :identity identity :action "stats-run"
+             :target raw-name :detail (or qs ""))
+            (json-response
+             200
+             (obj "query"   raw-name
+                  "columns" (coerce (mapcar (lambda (c)
+                                              (string-downcase (symbol-name c)))
+                                            cols)
+                                    'vector)
+                  "rows"    (coerce
+                             (mapcar (lambda (row)
+                                       (coerce
+                                        (mapcar (lambda (v)
+                                                  ;; SQLite NULL surfaces as NIL.
+                                                  (or v ""))
+                                                row)
+                                        'vector))
+                                     rows)
+                             'vector))))
+        (ota-server.workers:stats-error (c)
+          (cond
+            ((search "unknown stats query" (princ-to-string c))
+             (error-response 404 (princ-to-string c)))
+            (t
+             (error-response 400 (princ-to-string c)))))))))
+
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
   (let* ((body (read-request-body-bytes env))
@@ -1498,6 +1686,44 @@ overwrite an existing manifest with one for a different blob."
   (cond ((listp env) (getf env key))
         ((hash-table-p env) (gethash key env))
         (t nil)))
+
+(defun parse-query-string (qs)
+  "Parse a simple application/x-www-form-urlencoded query string
+into a plist of :keyword/value pairs.  Used by the v1.5 stats
+endpoint, which takes optional parameters via the URL rather
+than via a JSON body (GET semantics).
+
+Naive: assumes one ? and one round of URL-decoding suffices.
+For our use case (stats params: integers, ASCII identifiers,
+ISO-8601 dates) that's correct."
+  (let ((acc '()))
+    (when (and qs (plusp (length qs)))
+      (dolist (pair (uiop:split-string qs :separator "&"))
+        (let* ((eq (position #\= pair))
+               (k  (if eq (subseq pair 0 eq) pair))
+               (v  (if eq (subseq pair (1+ eq)) "")))
+          (when (plusp (length k))
+            (push (%url-decode v) acc)
+            (push (intern (string-upcase (substitute #\- #\_ k)) :keyword)
+                  acc)))))
+    acc))
+
+(defun %url-decode (s)
+  "Decode %XX hex escapes; pass-through everything else.  Plus is
+NOT mapped to space here (we don't accept HTML-form bodies via
+this path)."
+  (with-output-to-string (out)
+    (loop with n = (length s) with i = 0
+          while (< i n)
+          for c = (char s i)
+          do (cond
+               ((and (char= c #\%) (< (+ i 2) n))
+                (let ((hex (subseq s (1+ i) (+ i 3))))
+                  (handler-case
+                      (write-char (code-char (parse-integer hex :radix 16)) out)
+                    (error () (write-char c out)))
+                  (incf i 3)))
+               (t (write-char c out) (incf i))))))
 
 (defun method-keyword (env)
   (let ((m (env-get env :request-method)))
@@ -1543,7 +1769,13 @@ overwrite an existing manifest with one for a different blob."
                  (:admin-mark-uncollectable     (handle-admin-mark-uncollectable state env params))
                  (:admin-build-reverse-patch    (handle-admin-build-reverse-patch state env params))
                  (:exchange-token               (handle-exchange-token state env))
-                 (:events-install               (handle-events-install state env)))
+                 (:events-install               (handle-events-install state env))
+                 ;; v1.5 — client-software state snapshot.
+                 (:client-put-state             (handle-client-put-state state env params))
+                 (:client-list-state            (handle-client-list-state state env))
+                 ;; v1.5 — admin stats catalogue.
+                 (:admin-stats-index            (handle-admin-stats-index state env))
+                 (:admin-stats-run              (handle-admin-stats-run state env params)))
              (error (e)
                (format *error-output* "handler error on ~A: ~A~%" path e)
                (error-response 500 "internal error" (princ-to-string e))))))))))

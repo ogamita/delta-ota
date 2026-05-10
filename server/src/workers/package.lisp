@@ -16,6 +16,11 @@
            #:start-patch-pool
            #:stop-patch-pool
            #:notify-patch-pool
-           #:enqueue-patches-for-release))
+           #:enqueue-patches-for-release
+           ;; v1.5: admin stats catalogue
+           #:list-stat-queries
+           #:run-stat-query
+           #:stats-error
+           #:*stats-catalogue*))
 
 (in-package #:ota-server.workers)

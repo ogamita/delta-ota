@@ -300,6 +300,9 @@ func doctorCmd(args []string) {
 			OTAHome:        ota_home,
 			TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
 			Timeout:        2 * time.Minute,
+			// v1.5: doctor --recover is a distinct transition kind in
+			// the audit log and the snapshot table.
+			Kind: "recover",
 		}
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel2()

@@ -37,7 +37,8 @@
                 :components ((:file "package")
                              (:file "patcher"    :depends-on ("package"))
                              (:file "pool"       :depends-on ("package" "patcher"))
-                             (:file "operations" :depends-on ("package")))
+                             (:file "operations" :depends-on ("package"))
+                             (:file "stats"      :depends-on ("package")))
                 :depends-on ("storage" "catalogue" "manifest"))
                (:module "http"
                 :components ((:file "package")
@@ -60,6 +61,7 @@
                (:file "concurrency-tests" :depends-on ("smoke"))
                (:file "patch-pool-tests"  :depends-on ("smoke"))
                (:file "range-tests"       :depends-on ("smoke"))
-               (:file "admin-identity-tests" :depends-on ("smoke")))
+               (:file "admin-identity-tests" :depends-on ("smoke"))
+               (:file "client-state-tests"   :depends-on ("smoke")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-server.tests :run-all)))

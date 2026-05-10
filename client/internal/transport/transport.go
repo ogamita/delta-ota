@@ -236,6 +236,63 @@ func (c *Client) ListSoftware(ctx context.Context) ([]Software, error) {
 	return out, nil
 }
 
+// ReportClientState PUTs the agent's current snapshot for one
+// software to /v1/clients/me/software/<sw> (v1.5).  The server
+// updates client_software_state, used by the GC's exact
+// count-users-at-release and by the admin stats catalogue.
+//
+// Authenticated by the per-client bearer.  Should be called
+// after every successful install / upgrade / revert / recover /
+// uninstall.  Idempotent on the server side: re-PUT the same
+// state is a no-op at the value level.
+//
+// Best-effort: callers SHOULD log the error and continue.  The
+// local install state is already committed before this is
+// called; a reporting failure does not roll the install back.
+//
+// Honours OTA_DISABLE_REPORTING=1 by short-circuiting to nil
+// without making any network call.  Deployments that don't want
+// the server to know their snapshot can flip this.
+func (c *Client) ReportClientState(ctx context.Context,
+	software, currentReleaseID, previousReleaseID, kind string) error {
+	if os.Getenv("OTA_DISABLE_REPORTING") == "1" {
+		return nil
+	}
+	body := map[string]any{
+		"kind": kind,
+	}
+	if currentReleaseID != "" {
+		body["current_release_id"] = currentReleaseID
+	} else {
+		body["current_release_id"] = nil
+	}
+	if previousReleaseID != "" {
+		body["previous_release_id"] = previousReleaseID
+	}
+	enc, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("report-state: encode: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/clients/me/software/%s", c.BaseURL, software)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(enc))
+	if err != nil {
+		return err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("report-state: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("report-state: %s", resp.Status)
+	}
+	return nil
+}
+
 // DownloadPatch is like DownloadBlob but for /v1/patches/<sha>.
 func (c *Client) DownloadPatch(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
 	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/patches/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)

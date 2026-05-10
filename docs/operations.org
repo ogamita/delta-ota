@@ -758,6 +758,87 @@ v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
 straightforward to add.  Ship target: a sub-phase, driven by the
 first customer who needs it.
 
+* Fleet statistics (since v1.5)
+
+The =client_software_state= snapshot table tells the server who
+is on what release right now (per (client, software)).  =ota-
+agent= reports the snapshot after every successful install /
+upgrade / revert / recover / uninstall, so the GC's "is anyone
+still using this release?" check is exact instead of approximate.
+ADR-0010 has the full design.
+
+Operationally this means:
+
+- =POST /v1/admin/software/<sw>/gc=  with =min_user_count > 0=
+  now actually protects in-use releases.  Pre-v1.5 the threshold
+  was structurally off because no agent ever reported.
+- =GET /v1/admin/stats/...= exposes a curated catalogue of
+  queries against the snapshot + the event log.
+- =ota-server stats <name> [flags]= is the cron-friendly mirror
+  of the HTTP surface.
+
+** The query catalogue
+
+| Name                     | Required params      | Optional        | Returns                          |
+|--------------------------+----------------------+-----------------+----------------------------------|
+| =population-per-release= | =software=           | -               | (release_id, clients)            |
+| =fleet-summary=          | -                    | -               | (software, clients, distinct_releases, most_recent_update) |
+| =stale-clients=          | =software=           | =since-days=30= | (client_id, current_release_id, last_updated_at) |
+| =gc-impact=              | =software=           | -               | (release_id, version, published_at, uncollectable, clients) |
+| =recent-events=          | =software=           | =since-days=30= | (day, kind, status, n)           |
+| =upgrade-failure-rate=   | =software=           | =since-days=30= | (from_release_id, to_release_id, failures, attempts, failure_pct) |
+| =adoption-curve=         | =software=, =release-id= | -           | (day, adopted_today, total)      |
+| =recovery-events=        | =software=           | =since-days=30= | (day, from_release_id, to_release_id, status, n) |
+
+=GET /v1/admin/stats= (no path component) lists every available
+query with its parameters and result schema — useful when an
+admin tool wants to render a dynamic UI.
+
+Per-row result cap: 1000.  Operators wanting fuller dumps run
+=sqlite3 db/ota.db= directly (single-host deployment) or the
+PostgreSQL CLI (when that backend ships).
+
+** Example: pre-GC sanity check
+
+#+begin_example
+$ curl -sS -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+       "https://ota.example.com/v1/admin/stats/gc-impact?software=myapp" \
+  | jq -r '.rows[] | @tsv'
+myapp/linux-x86_64/2.0.0   2.0.0   2026-05-08...   0   2847
+myapp/linux-x86_64/1.9.3   1.9.3   2026-04-15...   1     0   ← pinned, GC will keep
+myapp/linux-x86_64/1.9.2   1.9.2   2026-03-10...   0     5   ← protected by min_user_count if > 5
+myapp/linux-x86_64/1.8.0   1.8.0   2025-12-01...   0     0   ← prunable
+#+end_example
+
+** Example: stale clients
+
+#+begin_example
+$ ota-server stats stale-clients --software=myapp --since-days=60
+client_id      current_release_id           last_updated_at
+c-1a2b3c4d     myapp/linux-x86_64/1.4.2    2026-02-11T08:14:33Z
+c-5e6f7g8h     myapp/linux-x86_64/1.4.2    2026-02-13T19:02:18Z
+...
+12 rows
+#+end_example
+
+** Audit trail
+
+Every stats query is logged with =action = "stats-run"=,
+=target = <query-name>=, =detail = <query-string>= in the v1.4
+admin audit log.  Operators can prove who looked at fleet data
+and when.
+
+** Agent-side opt-out
+
+A deployment that doesn't want the server to know which release
+each install is running can set =OTA_DISABLE_REPORTING=1= in
+the agent's environment.  The local install proceeds normally;
+only the server-side snapshot row is suppressed.  =count-
+users-at-release= then returns 0 for that client's release, so
+the GC's =min_user_count= protection is structurally off for
+opted-out clients — operators should pair this with
+=uncollectable= pins on releases they want to keep.
+
 * Resumable downloads (since v1.3)
 
 The server honours =Range: bytes=N-[M]= on =/v1/blobs/<sha>= and
@@ -802,3 +883,5 @@ Operational implications:
 | Admin call returns 403 "subject not authorised"  | Operator's cert DN not in =[tls].admin_subjects= | Add the DN to the allowlist (or remove =admin_subjects= entirely to disable enforcement) |
 | Admin call returns 403 "client cert required"    | =[tls].require_mtls = true= but no cert reached the server | Verify the reverse proxy is requesting + verifying client certs AND injecting the configured header |
 | Admin operations hit 429 unexpectedly             | Per-endpoint cap is tighter than the workload   | Set =[rate_limits].<endpoint> = "C/R"= to raise the cap; see ADR-0009 |
+| GC skips releases that have no real users         | Snapshot empty (pre-v1.5 agents still in fleet) | Set =min_user_count=0= until the fleet finishes upgrading to v1.5 agents |
+| =count-users-at-release= reports 0 for known-active release | =OTA_DISABLE_REPORTING=1= on that client's agent | Pin the release as =uncollectable= or accept that opted-out clients don't count toward the threshold |

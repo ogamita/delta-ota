@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -378,3 +380,130 @@ func writeTmp(t *testing.T, data []byte) string {
 // Quiet `imported and not used: io` for go test if a future change
 // removes the only io use.  Keep this side-effect import inert.
 var _ = io.EOF
+
+// ---------------------------------------------------------------------------
+// ReportClientState (v1.5)
+// ---------------------------------------------------------------------------
+
+func TestReportClientState_PutsBodyWithAuth(t *testing.T) {
+	var seenAuth string
+	var seenBody map[string]any
+	var seenMethod string
+	var seenPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		seenAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&seenBody)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"client_id":"c-x","software":"myapp","current_release_id":"myapp/linux-x86_64/1.0.0"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER123"
+	err := c.ReportClientState(context.Background(),
+		"myapp",
+		"myapp/linux-x86_64/1.0.0",
+		"myapp/linux-x86_64/0.9.0",
+		"upgrade")
+	if err != nil {
+		t.Fatalf("ReportClientState: %v", err)
+	}
+	if seenMethod != "PUT" {
+		t.Errorf("method = %q, want PUT", seenMethod)
+	}
+	if seenPath != "/v1/clients/me/software/myapp" {
+		t.Errorf("path = %q, want /v1/clients/me/software/myapp", seenPath)
+	}
+	if seenAuth != "Bearer BEARER123" {
+		t.Errorf("authorization = %q, want Bearer BEARER123", seenAuth)
+	}
+	if seenBody["kind"] != "upgrade" {
+		t.Errorf("kind = %v, want upgrade", seenBody["kind"])
+	}
+	if seenBody["current_release_id"] != "myapp/linux-x86_64/1.0.0" {
+		t.Errorf("current_release_id wrong: %v", seenBody["current_release_id"])
+	}
+	if seenBody["previous_release_id"] != "myapp/linux-x86_64/0.9.0" {
+		t.Errorf("previous_release_id wrong: %v", seenBody["previous_release_id"])
+	}
+}
+
+func TestReportClientState_NullCurrentForUninstall(t *testing.T) {
+	var seenBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&seenBody)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "BEARER123"
+	err := c.ReportClientState(context.Background(),
+		"myapp", "", "myapp/linux-x86_64/1.0.0", "uninstall")
+	if err != nil {
+		t.Fatalf("ReportClientState: %v", err)
+	}
+	// Uninstall sends an explicit null (not the empty string) so the
+	// server-side JSON parser sees the field as missing-vs-NULL the
+	// way operations.org documents.
+	if v, ok := seenBody["current_release_id"]; !ok || v != nil {
+		t.Errorf("current_release_id should be JSON null on uninstall, got %v", v)
+	}
+}
+
+func TestReportClientState_OptOutHonoured(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	t.Setenv("OTA_DISABLE_REPORTING", "1")
+	c := New(srv.URL)
+	c.Auth = "BEARER123"
+	err := c.ReportClientState(context.Background(), "myapp", "v1", "", "install")
+	if err != nil {
+		t.Fatalf("ReportClientState (opt-out): %v", err)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Errorf("OTA_DISABLE_REPORTING=1 should suppress the network call, saw %d", calls)
+	}
+}
+
+func TestReportClientState_NetworkFailureSurfaced(t *testing.T) {
+	// Connect-refused on a closed listener.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close() // ensure subsequent dials fail
+	c := New(url)
+	c.Auth = "BEARER123"
+	err := c.ReportClientState(context.Background(), "myapp", "v1", "", "install")
+	if err == nil {
+		t.Fatalf("expected error on closed-server PUT")
+	}
+	if !strings.Contains(err.Error(), "report-state") {
+		t.Errorf("error should be wrapped with 'report-state', got %q", err)
+	}
+}
+
+func TestReportClientState_4xxReportedAsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":"unauthorised"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	c.Auth = "WRONG"
+	err := c.ReportClientState(context.Background(), "myapp", "v1", "", "install")
+	if err == nil {
+		t.Fatalf("expected error on 401")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("error should mention 401, got %q", err)
+	}
+}

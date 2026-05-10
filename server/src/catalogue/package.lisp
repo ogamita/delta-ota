@@ -44,6 +44,11 @@
            #:fail-patch-job
            #:list-patch-jobs-for-release
            #:count-patch-jobs
-           #:reset-stale-running-jobs))
+           #:reset-stale-running-jobs
+           #:delete-patch-jobs-touching
+           ;; v1.5 — client-software state snapshot
+           #:record-client-software-state
+           #:get-client-software-state
+           #:list-client-software-states))
 
 (in-package #:ota-server.catalogue)

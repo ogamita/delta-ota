@@ -83,6 +83,12 @@
       (let ((path (ota-server.storage:cas-patch-path cas (getf p :sha256))))
         (when (probe-file path) (delete-file path))))
     (ota-server.catalogue:delete-patches-touching catalogue rid)
+    ;; 1b. v1.5: patch_jobs audit rows touching this release.  Without
+    ;; this, the snapshot table would have dangling references to a
+    ;; release_id that no longer exists in `releases`.  Pinned
+    ;; releases are protected because drop-release is never called
+    ;; on them (uncollectable check in gc-software).
+    (ota-server.catalogue:delete-patch-jobs-touching catalogue rid)
     ;; 2. Manifest .json and .sig.
     (let ((mj (merge-pathnames (format nil "~A/~A.json" sw vers) manifests-dir))
           (ms (merge-pathnames (format nil "~A/~A.sig"  sw vers) manifests-dir)))

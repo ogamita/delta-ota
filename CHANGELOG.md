@@ -19,6 +19,44 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **Client-software state snapshot (v1.5 foundation).** New
+  `client_software_state` catalogue table records `(client_id,
+  software_name) → (current_release_id, previous_release_id,
+  last_kind, last_updated_at)`. Maintained idempotently by
+  `ota-agent` via `PUT /v1/clients/me/software/<sw>` on every
+  successful install / upgrade / revert / recover / uninstall.
+  Replaces the lossy event-log scan in `count-users-at-release`
+  with an exact `COUNT(*)`; the GC's `min_user_count` threshold
+  now actually protects in-use releases (it was structurally off
+  pre-v1.5 because no agent reported events). `install_events`
+  stays around for analytics. Opt-out via `OTA_DISABLE_REPORTING=1`.
+  See [docs/adr/0010-client-software-state-snapshot.org](docs/adr/0010-client-software-state-snapshot.org).
+- **Admin SQL statistics catalogue.** Eight curated named queries
+  exposed via `GET /v1/admin/stats[/<name>]` and the
+  `ota-server stats <name>` CLI subcommand: `population-per-release`,
+  `fleet-summary`, `stale-clients`, `gc-impact`, `recent-events`,
+  `upgrade-failure-rate`, `adoption-curve`, `recovery-events`.
+  Curated, not generic — operators wanting richer queries run
+  `sqlite3 db/ota.db` directly. Admin-authenticated (v1.4
+  cert-subject identity), audit-logged, rate-limited.
+- **`patch_jobs` orphan cleanup.** `drop-release` (the release GC
+  path) now also deletes the `patch_jobs` rows touching the
+  dropped release, so the audit-trail table doesn't accumulate
+  references to release_ids that no longer exist. Pinned
+  releases inherit protection automatically (`drop-release` is
+  never called on them).
+
+### Changed
+- `count-users-at-release` now reads `client_software_state`
+  instead of scanning `install_events`. Same signature; same
+  callers; exact instead of approximate. `window-days` becomes
+  optional (no default).
+- Agent's `state.json` gains `os` / `arch` fields so the v1.5
+  state report can construct the canonical release_id
+  (`<software>/<os>-<arch>/<version>`) without re-fetching the
+  manifest on every transition.
+
 ### Planning
 - **Release-1.5 plan landed.** Foundation slice for client-software
   state tracking (snapshot table) + exact `count-users-at-release`
