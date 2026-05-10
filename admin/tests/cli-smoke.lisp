@@ -111,7 +111,8 @@ errors with a clear message about the token."
   ;; from reporting; the process exits non-zero if any one failed.
   (let ((ok t))
     (dolist (suite '(ota-admin-cli-smoke
-                     ota-admin-error-friendlification))
+                     ota-admin-error-friendlification
+                     ota-admin-ndjson-consumer))
       (when (find-symbol (symbol-name suite) :ota-admin.tests)
         (setf ok (and (run! suite) ok))))
     (unless ok

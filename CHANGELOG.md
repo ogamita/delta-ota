@@ -20,6 +20,51 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Added
+- **Real-time publish progress over HTTP (chunked NDJSON).** When
+  `ota-admin publish` opts in via `Accept: application/x-ndjson`
+  (the new default; opt out with `--no-stream`), the server's
+  publish handler responds `200` with a chunked
+  `application/x-ndjson` stream of progress events instead of
+  buffering until the bsdiff fan-in completes. Operators see
+  per-patch progress as it arrives:
+
+  ```
+  $ ota-admin publish ./build/release --software=foo \
+      --version=1.0.4 --os=linux --arch=amd64
+  publish foo/linux-amd64 version 1.0.4 …
+    · stored foo/linux-amd64/1.0.4 (22603776 bytes)
+    · building 3 patches …
+    · patch 1/3 from 1.0.1 (213 bytes)
+    · patch 2/3 from 1.0.2 (12024033 bytes)
+    · patch 3/3 from 1.0.3 (11716933 bytes)
+    · fan-in done (3 built)
+    · manifest re-signed
+  publish: code=200 body={"event":"done","release_id":...,"patches_built":3}
+  ```
+
+  Event types: `stored`, `patches-started`, `patch-built`,
+  `patches-done`, `manifest-resigned`, `done`, plus `error` on
+  mid-stream failure. The final `done` event carries the same
+  payload as the legacy 201 body — simple consumers can ignore
+  intermediate events and parse only the last line.
+
+  **Backwards-compatible.** Clients that don't send `Accept:
+  application/x-ndjson` still get the v1.0/v1.1.0 single-shot
+  `201 application/json` response. The pre-streaming gates
+  (`200 idempotent`, `409 conflict`) keep their HTTP status
+  codes too — streaming only kicks in for the actually-long
+  patch fan-in. No wire-format break.
+
+  Implementation: server-side `streaming-ndjson-response` helper
+  + `client-accepts-ndjson-p`; patcher
+  `build-patches-for-release` gains `:on-progress` callback.
+  Client-side `%post-stream` (uses dexador's `:want-stream
+  :force-binary`), `%read-utf8-line`, and
+  `%consume-publish-response` (parses NDJSON line-by-line for
+  `application/x-ndjson`, falls back to slurping the whole body
+  for `application/json`). 23 new client-side unit tests + 14
+  new server-side. Live-verified against a v1.1.1 server with
+  0/1/2 priors.
 - **`ota-server gc` CLI subcommand is now real**, not a stub
   ("phase-1 stub." was its entire body in v1.0.x–v1.1.0). It
   invokes the same `ota-server.workers:gc-software` worker the

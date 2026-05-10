@@ -178,43 +178,199 @@ pass that can take minutes).  Other errors propagate unchanged."
               (error friendly)
               (error c)))))))
 
+(defun %post-stream (url &rest args)
+  "Like %POST but returns the response as a stream so the caller can
+read incrementally.  Required for the v1.1.1 server's NDJSON
+publish stream (Transfer-Encoding: chunked); without :want-stream
+dexador buffers the whole body until the connection closes,
+defeating the point of streaming.
+
+:FORCE-BINARY T ensures we always get the same kind of stream
+(KEEP-ALIVE-CHUNKED-STREAM, byte-oriented) regardless of the
+response Content-Type -- dexador only wraps in a UTF-8 decoding
+stream when the content-type matches its text-detection heuristic,
+which `application/x-ndjson' does not.  We do the UTF-8 decoding
+ourselves in %READ-UTF8-LINE.
+
+Returns (values stream status headers).  Caller must CLOSE the
+stream when done."
+  (let ((rt (%resolve-timeout "OTA_ADMIN_READ_TIMEOUT"
+                              +default-read-timeout-seconds+))
+        (ct (%resolve-timeout "OTA_ADMIN_CONNECT_TIMEOUT"
+                              +default-connect-timeout-seconds+)))
+    (handler-case
+        (apply #'dexador:post url
+               :want-stream     t
+               :force-binary    t
+               :read-timeout    rt
+               :connect-timeout ct
+               args)
+      (error (c)
+        (let ((friendly (%friendlier-message c url)))
+          (if friendly
+              (error friendly)
+              (error c)))))))
+
+;; ---------------------------------------------------------------------------
+;; NDJSON stream consumer (v1.1.1).  The server's publish handler
+;; emits one JSON object per line as the bsdiff fan-in progresses;
+;; here we render each event to stderr as it arrives, capture the
+;; final {"event":"done", …}, and hand it back as the result.
+;; ---------------------------------------------------------------------------
+
+(defun %read-utf8-line (stream)
+  "Read bytes from STREAM (binary; dexador's :force-binary +
+:want-stream gives a KEEP-ALIVE-CHUNKED-STREAM that supports
+READ-BYTE) up to the next #\\Newline, decode as UTF-8, return
+the line without the trailing newline.  Returns NIL on EOF
+before any byte has been consumed."
+  (let ((bytes (make-array 256 :element-type '(unsigned-byte 8)
+                               :adjustable t :fill-pointer 0)))
+    (loop
+      (let ((b (read-byte stream nil nil)))
+        (cond
+          ((null b)
+           (return-from %read-utf8-line
+             (and (plusp (length bytes))
+                  #+sbcl (sb-ext:octets-to-string bytes :external-format :utf-8)
+                  #-sbcl (babel:octets-to-string bytes :encoding :utf-8))))
+          ((= b 10)
+           (return-from %read-utf8-line
+             #+sbcl (sb-ext:octets-to-string bytes :external-format :utf-8)
+             #-sbcl (babel:octets-to-string bytes :encoding :utf-8)))
+          (t (vector-push-extend b bytes)))))))
+
+(defun %render-publish-event (parsed)
+  "Print a one-line summary of one NDJSON publish event to stderr.
+PARSED is a hash-table from com.inuoe.jzon."
+  (let ((event (and (hash-table-p parsed) (gethash "event" parsed))))
+    (cond
+      ((null event)                nil)   ; not an event object; ignore
+      ((string= event "stored")
+       (format *error-output* "  · stored ~A (~A bytes)~%"
+               (gethash "release_id" parsed)
+               (gethash "blob_size"  parsed)))
+      ((string= event "patches-started")
+       (let ((n (gethash "total" parsed)))
+         (format *error-output* "  · building ~A patch~:[~;es~] …~%"
+                 n (and (numberp n) (/= n 1)))))
+      ((string= event "patch-built")
+       (format *error-output* "  · patch ~A/~A from ~A (~A bytes)~%"
+               (gethash "i"    parsed) (gethash "total" parsed)
+               (gethash "from" parsed) (gethash "size"  parsed)))
+      ((string= event "patches-done")
+       (format *error-output* "  · fan-in done (~A built)~%"
+               (gethash "built" parsed)))
+      ((string= event "manifest-resigned")
+       (format *error-output* "  · manifest re-signed~%"))
+      ((string= event "done")          nil)   ; stdout will print the result
+      ((string= event "error")
+       (format *error-output* "  ✗ error: ~A~%" (gethash "message" parsed)))
+      (t
+       (format *error-output* "  · ~A~%" event)))
+    (force-output *error-output*)))
+
+(defun %consume-publish-response (stream headers)
+  "Read STREAM until EOF.  When HEADERS' Content-Type contains
+\"x-ndjson\", parse each non-blank line as JSON, render it to
+stderr, and capture the final {\"event\":\"done\", …}.  Otherwise
+read the whole body and parse it as a single JSON object (the
+v1.0/v1.1.0 sync response shape).  Returns the parsed final
+object (a hash-table)."
+  (let ((content-type (and headers (gethash "content-type" headers))))
+    (cond
+      ((and content-type (search "x-ndjson" content-type :test #'char-equal))
+       (let (final)
+         (loop for line = (%read-utf8-line stream)
+               while line
+               unless (zerop (length (string-trim '(#\Space #\Tab #\Return) line)))
+                 do (let ((parsed (handler-case (com.inuoe.jzon:parse line)
+                                    (error () nil))))
+                      (when parsed
+                        (%render-publish-event parsed)
+                        (when (and (hash-table-p parsed)
+                                   (string= "done" (gethash "event" parsed)))
+                          (setf final parsed)))))
+         (or final
+             ;; Stream ended without a :done event (server crash,
+             ;; client-side EOF, …).  Synthesize a clear failure.
+             (let ((h (make-hash-table :test 'equal)))
+               (setf (gethash "event"   h) "error"
+                     (gethash "message" h) "publish stream ended without a final 'done' event")
+               h))))
+      (t
+       ;; Legacy sync path: STREAM is binary (we forced :force-binary
+       ;; T to keep one shape); slurp all bytes then UTF-8 decode +
+       ;; JSON parse.
+       (let ((all (make-array 1024 :element-type '(unsigned-byte 8)
+                                    :adjustable t :fill-pointer 0)))
+         (loop for b = (read-byte stream nil nil)
+               while b
+               do (vector-push-extend b all))
+         (com.inuoe.jzon:parse
+          #+sbcl (sb-ext:octets-to-string all :external-format :utf-8)
+          #-sbcl (babel:octets-to-string all :encoding :utf-8)))))))
+
 (defun publish (&key dir software version os arch
                      (server "http://127.0.0.1:8080")
                      (token (uiop:getenv "OTA_ADMIN_TOKEN"))
-                     (os-versions ""))
-  "Tar DIR with the deterministic tar writer, then upload it as a new
-   release of SOFTWARE/VERSION on SERVER.  Requires the server's
-   admin TOKEN."
+                     (os-versions "")
+                     (stream t))
+  "Tar DIR with the deterministic tar writer, upload it as a new
+release of SOFTWARE/VERSION on SERVER.  Requires the server's
+admin TOKEN.
+
+When STREAM is T (the default, since v1.1.1), opt into the
+server's NDJSON publish stream via Accept: application/x-ndjson:
+each step (stored, patches-started, patch-built, patches-done,
+manifest-resigned) is rendered to stderr as it arrives, with the
+final {\"event\":\"done\", …} as the result.  When STREAM is NIL
+(or against an older server that doesn't speak NDJSON), the
+response is the legacy single-shot JSON body."
   (unless token
     (error "ota-admin publish: OTA_ADMIN_TOKEN env var or :token argument required"))
   (let ((tar-path (merge-pathnames (format nil "~A-~A-publish.tar"
                                            software version)
                                    (uiop:temporary-directory))))
     (ota-server.storage:tar-directory-to-file dir tar-path)
-    (let ((bytes (with-open-file (in tar-path
-                                     :direction :input
-                                     :element-type '(unsigned-byte 8))
-                   (let* ((n (file-length in))
-                          (buf (make-array n :element-type '(unsigned-byte 8))))
-                     (read-sequence buf in)
-                     buf))))
-      (multiple-value-bind (resp code)
-          (%post (format nil "~A/v1/admin/software/~A/releases"
-                         server software)
-                 :headers (list (cons "Authorization"
-                                      (format nil "Bearer ~A" token))
-                                (cons "X-Ota-Version" version)
-                                (cons "X-Ota-Os" os)
-                                (cons "X-Ota-Arch" arch)
-                                (cons "X-Ota-Os-Versions" os-versions)
-                                (cons "Content-Type" "application/octet-stream"))
-                 :content bytes)
-        (delete-file tar-path)
-        (format t "publish: code=~A body=~A~%" code resp)
-        (force-output)
-        (unless (= code 201)
-          (uiop:quit 1))
-        resp))))
+    (let* ((bytes (with-open-file (in tar-path
+                                      :direction :input
+                                      :element-type '(unsigned-byte 8))
+                    (let* ((n (file-length in))
+                           (buf (make-array n :element-type '(unsigned-byte 8))))
+                      (read-sequence buf in)
+                      buf)))
+           (url (format nil "~A/v1/admin/software/~A/releases" server software))
+           (req-headers
+             (let ((h (list (cons "Authorization" (format nil "Bearer ~A" token))
+                            (cons "X-Ota-Version" version)
+                            (cons "X-Ota-Os" os)
+                            (cons "X-Ota-Arch" arch)
+                            (cons "X-Ota-Os-Versions" os-versions)
+                            (cons "Content-Type" "application/octet-stream"))))
+               (when stream
+                 (setf h (append h (list (cons "Accept" "application/x-ndjson")))))
+               h)))
+      (when stream
+        (format *error-output* "publish ~A/~A-~A version ~A …~%"
+                software os arch version)
+        (force-output *error-output*))
+      (multiple-value-bind (body-stream code resp-headers)
+          (%post-stream url :headers req-headers :content bytes)
+        (let ((parsed (unwind-protect
+                           (%consume-publish-response body-stream resp-headers)
+                        (when (streamp body-stream) (close body-stream)))))
+          (delete-file tar-path)
+          (format t "publish: code=~A body=~A~%"
+                  code
+                  (handler-case (com.inuoe.jzon:stringify parsed :pretty nil)
+                    (error () parsed)))
+          (force-output)
+          (let ((event (and (hash-table-p parsed) (gethash "event" parsed))))
+            (cond
+              ((string= event "error") (uiop:quit 1))
+              ((not (or (= code 201) (= code 200))) (uiop:quit 1))
+              (t parsed))))))))
 
 (defun parse-ttl (s)
   "Parse a TTL like \"7d\", \"3h\", \"45m\", \"60s\" into seconds."
@@ -305,7 +461,7 @@ pass that can take minutes).  Other errors propagate unchanged."
 Usage:
   ota-admin publish <dir> --software=NAME --version=X --os=OS --arch=ARCH
                           [--os-versions=12,13] [--classifications=stable]
-                          [--server=URL]
+                          [--server=URL] [--no-stream]
 
   ota-admin mint-tokens --csv=PATH --classifications=stable [--ttl=7d]
                         [--server=URL] [--output=tokens.tsv]
@@ -367,5 +523,6 @@ Environment:
                       :os-versions (or (get-flag rest "os-versions") "")
                       :server      (or (get-flag rest "server")
                                        (uiop:getenv "OTA_SERVER")
-                                       "http://127.0.0.1:8080"))))
+                                       "http://127.0.0.1:8080")
+                      :stream      (not (member "--no-stream" rest :test #'string=)))))
           (t (usage)))))

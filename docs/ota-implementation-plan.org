@@ -645,7 +645,7 @@ that are not wired up; today they print
   operators must set =OTA_ADMIN_TOKEN= via env (or systemd's
   =EnvironmentFile=).  Wiring it through =load-config-from-file=
   is ~5 lines + a test.  Ship target: v1.0.x.
-- [ ] *Real-time publish progress over HTTP (chunked transfer).*
+- [X] *Real-time publish progress over HTTP (chunked transfer).* — landed in v1.1.1.
   Today the publish handler's response only arrives once the
   bsdiff fan-in completes; per-patch progress is logged
   server-side but not visible to =ota-admin=.  Switching to a

@@ -18,6 +18,7 @@
   :pathname "tests/"
   :components ((:file "package")
                (:file "cli-smoke" :depends-on ("package"))
-               (:file "error-friendlification-tests" :depends-on ("package")))
+               (:file "error-friendlification-tests" :depends-on ("package"))
+               (:file "ndjson-consumer-tests" :depends-on ("package")))
   :perform (test-op (op c)
              (uiop:symbol-call :ota-admin.tests :run-all)))

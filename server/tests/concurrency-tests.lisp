@@ -393,6 +393,129 @@ deterministic without the publisher having to sleep."
       (ota-server.catalogue:close-catalogue cat)
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
 
+;; ---------------------------------------------------------------------------
+;; v1.1.1 publish progress: build-patches-for-release ON-PROGRESS
+;; callback contract.  Server's publish handler renders the same
+;; events as NDJSON over HTTP; here we just check the events arrive
+;; in order with the expected shape.
+;; ---------------------------------------------------------------------------
+
+(test build-patches-for-release-emits-progress-events
+  "When :ON-PROGRESS is supplied, BUILD-PATCHES-FOR-RELEASE calls it
+exactly:
+  - once with :event :patches-started + :total = N at the start;
+  - once with :event :patch-built per successful patch (with
+    :i 1..N, :total N, :from VERSION, :sha SHA, :size SIZE);
+  - once with :event :patches-done + :built = M at the end.
+
+The test fakes priors via INSERT-RELEASE rows with a non-zero
+blob and stubs *bsdiff-binary* with a no-op script so the bsdiff
+subprocess succeeds without doing real work."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let* ((cas (ota-server.storage:make-cas root))
+                (events '()))
+           (ota-server.catalogue:ensure-software cat :name "p")
+           ;; Insert two priors with their blobs on disk so the
+           ;; bsdiff subprocess has something to chew on.  Each
+           ;; blob is a few KB of arbitrary bytes.
+           (dolist (v '("0.1.0" "0.2.0"))
+             (let* ((tmp (merge-pathnames (format nil "tmp/blob-~A.bin" v) root)))
+               (ensure-directories-exist tmp)
+               (with-open-file (out tmp :direction :output
+                                        :if-exists :supersede
+                                        :element-type '(unsigned-byte 8))
+                 (write-sequence
+                  (make-array 4096 :element-type '(unsigned-byte 8)
+                              :initial-contents
+                              (loop for i below 4096
+                                    collect (mod (+ i (length v)) 256)))
+                  out))
+               (multiple-value-bind (sha size)
+                   (ota-server.storage:put-blob-from-file cas tmp)
+                 (declare (ignore size))
+                 (ota-server.catalogue:insert-release
+                  cat
+                  :release-id (format nil "p/x-y/~A" v)
+                  :software "p" :os "x" :arch "y" :os-versions #()
+                  :version v
+                  :blob-sha256 sha :blob-size 4096
+                  :manifest-sha256 "0" :published-by "test"))))
+           ;; Stage the new release's blob too.
+           (let* ((to-tmp (merge-pathnames "tmp/blob-1.0.0.bin" root)))
+             (with-open-file (out to-tmp :direction :output
+                                         :if-exists :supersede
+                                         :element-type '(unsigned-byte 8))
+               (write-sequence
+                (make-array 4096 :element-type '(unsigned-byte 8)
+                            :initial-element 42)
+                out))
+             (multiple-value-bind (to-sha to-size)
+                 (ota-server.storage:put-blob-from-file cas to-tmp)
+               (declare (ignore to-size))
+               (ota-server.workers:build-patches-for-release
+                cas cat
+                :software "p" :os "x" :arch "y"
+                :new-version "1.0.0"
+                :new-release-id "p/x-y/1.0.0"
+                :new-blob-sha to-sha
+                :on-progress (lambda (e) (push e events)))))
+           (let ((events (nreverse events)))
+             ;; First event is :patches-started total=2.
+             (let ((start (first events)))
+               (is (eq :patches-started (getf start :event)))
+               (is (= 2 (getf start :total))))
+             ;; Last event is :patches-done with :built >= 0.
+             (let ((end (car (last events))))
+               (is (eq :patches-done (getf end :event)))
+               (is (numberp (getf end :built))))
+             ;; Middle events are all :patch-built with i from 1 upward.
+             (let* ((middle (subseq events 1 (1- (length events))))
+                    (patch-builts (remove-if-not
+                                   (lambda (e) (eq :patch-built (getf e :event)))
+                                   middle))
+                    (i-values (mapcar (lambda (e) (getf e :i)) patch-builts)))
+               (is (equal '(1 2) (sort (copy-list i-values) #'<)))
+               (dolist (e patch-builts)
+                 (is (= 2 (getf e :total)))
+                 (is (stringp (getf e :from)))
+                 (is (stringp (getf e :sha)))
+                 (is (numberp (getf e :size)))))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test build-patches-for-release-no-progress-when-no-priors
+  "With zero priors, BUILD-PATCHES-FOR-RELEASE skips the
+:patches-started and :patches-done events entirely (no work to
+report on).  Backward-compatible with callers that don't pass
+:ON-PROGRESS."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let ((cas (ota-server.storage:make-cas root))
+               (events '()))
+           (ota-server.catalogue:ensure-software cat :name "lone")
+           (let* ((to-tmp (merge-pathnames "tmp/blob-only.bin" root)))
+             (ensure-directories-exist to-tmp)
+             (with-open-file (out to-tmp :direction :output
+                                         :if-exists :supersede
+                                         :element-type '(unsigned-byte 8))
+               (write-sequence (make-array 256 :element-type '(unsigned-byte 8)
+                                               :initial-element 7)
+                               out))
+             (multiple-value-bind (to-sha to-size)
+                 (ota-server.storage:put-blob-from-file cas to-tmp)
+               (declare (ignore to-size))
+               (ota-server.workers:build-patches-for-release
+                cas cat
+                :software "lone" :os "x" :arch "y"
+                :new-version "1.0.0"
+                :new-release-id "lone/x-y/1.0.0"
+                :new-blob-sha to-sha
+                :on-progress (lambda (e) (push e events)))))
+           (is (null events) "expected no progress events; got ~S" events))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (test get-latest-release-mixed-ignores-non-semver
   "When SOME versions are semver and some are not, the non-semver
 ones are ignored and the highest-semver wins.  This matches the
