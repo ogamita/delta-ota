@@ -257,3 +257,164 @@ distinct rows; the lookup returns the right one for each."
                     cat "no-such" "no" "no" "0.0.0")))
       (ota-server.catalogue:close-catalogue cat)
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+;; ---------------------------------------------------------------------------
+;; Semver-aware "latest" -- v1.1.0 fix.  The v1.0.x sort by
+;; published_at DESC silently downgraded clients when an older
+;; version was re-published after a newer one was already out.
+;; ---------------------------------------------------------------------------
+
+(test parse-semver-shapes
+  "PARSE-SEMVER returns (NUMS . PRERELEASE-OR-NIL) for valid input
+and NIL for non-semver."
+  (is (equal '((1 2 3))           (ota-server.catalogue:parse-semver "1.2.3")))
+  (is (equal '((1 2 3) . "rc1")   (ota-server.catalogue:parse-semver "1.2.3-rc1")))
+  (is (equal '((10 0 4))          (ota-server.catalogue:parse-semver "10.0.4")))
+  (is (equal '((1 0))             (ota-server.catalogue:parse-semver "1.0")))
+  (is (null (ota-server.catalogue:parse-semver "alpha")))
+  (is (null (ota-server.catalogue:parse-semver "1.x.0")))
+  (is (null (ota-server.catalogue:parse-semver "")))
+  (is (null (ota-server.catalogue:parse-semver nil))))
+
+(test semver-compare
+  "SEMVER< orders versions per the spec's numeric rule."
+  (let ((v (lambda (s) (ota-server.catalogue:parse-semver s))))
+    (is (ota-server.catalogue:semver< (funcall v "1.0.0") (funcall v "1.0.1")))
+    (is (ota-server.catalogue:semver< (funcall v "1.0.9") (funcall v "1.0.10")))
+    (is (ota-server.catalogue:semver< (funcall v "1.9.9") (funcall v "2.0.0")))
+    (is (not (ota-server.catalogue:semver< (funcall v "1.0.1") (funcall v "1.0.0"))))
+    (is (not (ota-server.catalogue:semver< (funcall v "1.0.0") (funcall v "1.0.0"))))
+    ;; prerelease < release
+    (is (ota-server.catalogue:semver< (funcall v "1.0.0-rc1") (funcall v "1.0.0")))
+    (is (not (ota-server.catalogue:semver< (funcall v "1.0.0") (funcall v "1.0.0-rc1"))))
+    ;; missing tail = 0
+    (is (not (ota-server.catalogue:semver< (funcall v "1.0") (funcall v "1.0.0"))))
+    (is (not (ota-server.catalogue:semver< (funcall v "1.0.0") (funcall v "1.0"))))))
+
+(test get-latest-release-prefers-highest-semver-not-most-recent
+  "v1.1.0 fix: when releases are published OUT of version order,
+GET-LATEST-RELEASE returns the highest-semver one, NOT the
+most-recently-published one (which v1.0.x did and which silently
+downgraded clients)."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "lat")
+           ;; Insert OLDEST -> NEWEST published_at order, but the
+           ;; semver order is 1.0.0 < 1.0.1 < 1.0.2 < 1.0.3 < 1.0.4.
+           ;; The v1.0.x bug: "latest" would be 1.0.0 (last inserted,
+           ;; newest published_at).  v1.1.0 fix: "latest" is 1.0.4
+           ;; (highest semver), regardless of insert order.
+           (dolist (v '("1.0.4" "1.0.2" "1.0.3" "1.0.1" "1.0.0"))
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "lat/x-y/~A" v)
+              :software "lat"
+              :os "x" :arch "y" :os-versions #()
+              :version v
+              :blob-sha256 (format nil "~64,'0X" (sxhash v))
+              :blob-size 1
+              :manifest-sha256 "0"
+              :published-by "test"))
+           (let ((latest (ota-server.catalogue:get-latest-release cat "lat")))
+             (is (string= "1.0.4" (getf latest :version))
+                 "expected 1.0.4 (highest semver), got ~S" (getf latest :version))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test get-latest-release-falls-back-to-published-at-for-non-semver
+  "If NO release has a parseable semver, GET-LATEST-RELEASE falls
+back to v1.0.x published_at-DESC behaviour (the only sensible
+ordering when versions look like 'alpha', 'beta-build', ...)."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "ns")
+           (dolist (v '("alpha" "beta" "gamma"))
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "ns/x-y/~A" v)
+              :software "ns"
+              :os "x" :arch "y" :os-versions #()
+              :version v
+              :blob-sha256 (format nil "~64,'0X" (sxhash v))
+              :blob-size 1
+              :manifest-sha256 "0"
+              :published-by "test"))
+           ;; No semver parses -> we fall back to LIST-RELEASES's
+           ;; first row (sorted published_at DESC).  Since v1.1.0
+           ;; INSERT-RELEASE makes published_at *strictly* monotonic
+           ;; per software, the last-inserted (gamma) is unambiguously
+           ;; the newest -- the test no longer needs the "any of
+           ;; three" relaxation that worked around the same-second tie.
+           (let ((latest (ota-server.catalogue:get-latest-release cat "ns")))
+             (is (string= "gamma" (getf latest :version))
+                 "fallback returned ~S; expected gamma (last inserted)"
+                 (getf latest :version))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test published-at-is-strictly-monotonic-per-software
+  "Two back-to-back inserts in the same wall-clock second must NOT
+tie on published_at.  v1.1.0: INSERT-RELEASE computes published_at
+catalogue-side as max(MAX(prior published_at) + 1s, now), so any
+ORDER BY published_at DESC consumer (notably the v1.0.x
+get-latest-release fallback for non-semver versions) is
+deterministic without the publisher having to sleep."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "mono")
+           ;; Five tight inserts; we're betting these all happen
+           ;; inside one wall-clock second on every reasonable host.
+           (dotimes (i 5)
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "mono/x-y/r~D" i)
+              :software "mono"
+              :os "x" :arch "y" :os-versions #()
+              :version (format nil "~D" i)
+              :blob-sha256 (format nil "~64,'0X" i)
+              :blob-size 1
+              :manifest-sha256 "0"
+              :published-by "test"))
+           (let* ((rels (ota-server.catalogue:list-releases cat "mono"))
+                  (timestamps (mapcar (lambda (r) (getf r :published-at)) rels)))
+             ;; LIST-RELEASES returns published_at DESC, so the list
+             ;; should be strictly decreasing.
+             (loop for (a b) on timestamps
+                   while b
+                   do (is (string> a b)
+                          "published_at not strictly monotonic: ~S then ~S"
+                          a b))
+             ;; And: every timestamp is unique.
+             (is (= (length timestamps) (length (remove-duplicates timestamps :test #'string=)))
+                 "duplicate published_at: ~S" timestamps)))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test get-latest-release-mixed-ignores-non-semver
+  "When SOME versions are semver and some are not, the non-semver
+ones are ignored and the highest-semver wins.  This matches the
+operator intuition that 'real' releases should always be reachable
+as `latest` even if a debug build like 'wip' is also in the
+catalogue."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "mix")
+           (dolist (v '("1.0.0" "wip" "1.2.0" "alpha-build" "1.1.0"))
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "mix/x-y/~A" v)
+              :software "mix"
+              :os "x" :arch "y" :os-versions #()
+              :version v
+              :blob-sha256 (format nil "~64,'0X" (sxhash v))
+              :blob-size 1
+              :manifest-sha256 "0"
+              :published-by "test"))
+           (let ((latest (ota-server.catalogue:get-latest-release cat "mix")))
+             (is (string= "1.2.0" (getf latest :version)))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))

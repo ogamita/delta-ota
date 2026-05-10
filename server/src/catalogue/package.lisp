@@ -14,6 +14,9 @@
            #:get-release
            #:get-release-by-tuple
            #:get-latest-release
+           #:highest-semver-release
+           #:parse-semver
+           #:semver<
            #:record-install-event
            #:insert-patch
            #:list-patches-to

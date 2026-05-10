@@ -583,3 +583,169 @@ older release without engineer help.
 with one Lisp-leaning engineer on the server/admin tracks and one
 Go-leaning engineer on the client track running in parallel from
 phase 1 onward.
+
+* Post-1.0 backlog
+
+Items that were noticed during v1.0.x cuts (and a sweep through
+the source on 2026-05-10) but are not blocking any release.
+Grouped by area.  Some have a candidate ship target listed
+(=v1.0.x= for "small enough for a patch", =v1.1= for "needs a
+sub-phase").  Pick off opportunistically; promote a cluster into
+a v1.1 scope when one materialises.
+
+** ota-agent (client) — subcommands stubbed as "not implemented"
+
+The Go binary's =main.go= advertises six subcommands in =Usage=
+that are not wired up; today they print
+=ota-agent: "X" not implemented yet= and exit 1
+([[file:../client/agent/main.go::64][client/agent/main.go:64]]).
+
+- [X] *=list [--remote|--local]=* — listing installed software
+  (=--local=) and listing what the server has on offer
+  (=--remote=).  Local listing is a directory walk under
+  =$OTA_HOME/=; remote listing is =GET /v1/software= followed
+  by per-software =GET /v1/software/<sw>/manifest=.  Ship target:
+  v1.0.x (small).
+- [X] *=show <name>=* — print the active version, server URL,
+  classifications, install date, signing key.  Reads
+  =$OTA_HOME/<sw>/state.json=; pure-local, no server call.  Ship
+  target: v1.0.x.
+- [X] *=verify <name>=* — recompute SHA-256 of every file under
+  =$OTA_HOME/<sw>/distribution-<active>/=, compare against the
+  manifest, report mismatches.  Operator's first move when an
+  install looks corrupted.  Ship target: v1.0.x.
+- [X] *=prune <name> [--archive-depth=N]=*  (landed in v1.1.0) — drop archived
+  distribution-* directories beyond the depth, keeping the
+  current and (= --archive-depth) most recent for revert.  Frees
+  disk on long-lived clients.  Ship target: v1.0.x.
+
+** Catalogue semantics
+
+- [X] *Semver-aware "latest" sort* — landed in v1.1.0.
+  =GET /v1/software/<sw>/releases/latest= now returns the highest
+  *semver* version (with most-recently-published as fallback when
+  no version string parses).  Real-world bug surfaced when
+  =ota-agent watch= silently downgraded an install whose server
+  had a hotfix re-published after a newer release.  See
+  operations.org § Latest-release semantics for the full rules.
+
+** ota-server — incomplete subcommands and gaps
+
+- [ ] *=ota-server gc= CLI subcommand is a stub*
+  ([[file:../server/src/main.lisp::126][main.lisp:126]]).  The actual GC logic is fully
+  implemented at the HTTP layer (=POST /v1/admin/software/<sw>/gc=
+  with =dry_run / min_user_count / min_age_days= per
+  operations.org), but =/opt/ota/ota-server gc= just prints
+  "phase-1 stub.".  Wire the subcommand to call into
+  =ota-server.workers.operations:run-gc= for an offline /
+  cron-friendly invocation that doesn't go through HTTP.  Ship
+  target: v1.0.x.
+- [ ] *TOML =[server].admin_token= key is not read by the loader.*
+  Documented as a gap in operations.org and the CHANGELOG;
+  operators must set =OTA_ADMIN_TOKEN= via env (or systemd's
+  =EnvironmentFile=).  Wiring it through =load-config-from-file=
+  is ~5 lines + a test.  Ship target: v1.0.x.
+- [ ] *Real-time publish progress over HTTP (chunked transfer).*
+  Today the publish handler's response only arrives once the
+  bsdiff fan-in completes; per-patch progress is logged
+  server-side but not visible to =ota-admin=.  Switching to a
+  chunked response with periodic JSON heartbeats would let the
+  client show a progress bar and would also obsolete the
+  read-timeout knob added in v1.0.4.  Touches the publish
+  handler, the patcher worker (callback hook), and =ota-admin=
+  (stream consumer).  Ship target: v1.1.
+- [ ] *Async patch-build worker pool (job queue).*  The
+  patcher's preamble notes
+  ([[file:../server/src/workers/patcher.lisp::7][patcher.lisp:7]]) that the
+  proper async worker pool with a Postgres-backed job queue
+  lands in phase 5; today the bsdiff fan-in runs synchronously
+  in the publish handler thread.  Multi-worker Woo (v1.0.4)
+  prevents wedging the server, but a really long publish still
+  occupies a worker for the duration.  Ship target: v1.1.
+
+** Backends still on the v1 minimum
+
+Both already documented in operations.org "Backends not yet
+implemented":
+
+- [ ] *PostgreSQL catalogue backend.*  The catalogue function
+  surface (=ota-server.catalogue=) is stable; the v1
+  implementation calls =cl-sqlite= directly.  Adding PG means
+  switching to =cl-dbi= behind the same surface.  Migration files
+  are already valid SQL on both DBs except for SQLite's
+  =strftime= (a per-driver helper hides it).  Ship target:
+  sub-phase between v1 and v1.1, driven by first customer
+  hitting SQLite's single-writer ceiling.
+- [ ] *S3 / S3-compatible blob storage.*  The CAS interface
+  (=make-cas=, =put-blob-from-file=, =cas-blob-path=,
+  =put-patch-from-file=) admits a second backend; only the
+  filesystem implementation exists.  An =s3-cas= variant using
+  =zs3= (or shelling out to =aws s3=) is straightforward.  Ship
+  target: sub-phase, driven by the first customer hosting on
+  cloud object storage.
+
+** Security
+
+- [ ] *Mandatory mTLS for admin endpoints
+  (cert-subject identity).*  Today TLS is opt-in (=[tls].cert= /
+  =.key=) and any mTLS is implicit at the proxy layer; the
+  server doesn't verify a client cert subject against an
+  authorised admin list.  Plan reference:
+  [[file:ota-implementation-plan.org::*Phase 4][Phase 4 § "deferred"]].
+  Ship target: v1.1.
+- [ ] *Per-endpoint rate limits.*  The install-page rate limit
+  is in place (token-bucket per channel); admin endpoints rely
+  on the bearer-token alone with no QPS cap.  Plan reference:
+  Phase 4 line 362.  Ship target: v1.1.
+
+** Cross-platform client polish
+
+- [ ] *Windows full junction-via-IOCTL path.*  The client falls
+  back to the =current.path= shim when symlinks aren't
+  privileged; the proper junction-creation IOCTL path is
+  deferred ([[file:ota-implementation-plan.org::*Phase 3][Phase 3]]).  Empirically the shim is adequate; this
+  is a "nice to have" only if a customer actually hits a
+  scenario the shim mis-serves.  Ship target: v1.1+ if needed.
+
+** Channels
+
+- [ ] *Channel CRUD admin UI / CLI surface.*  The =channels=
+  column on releases exists (and is honoured by classification
+  filtering), but there's no admin endpoint to create / list /
+  rename channels independently — channels are implicit from
+  the values used at publish time.  Plan reference: Phase 4
+  lines 356-357.  Ship target: v1.1.
+
+** libota — dead code to remove
+
+- [ ] *=ErrNotImplemented= is defined but no entry point uses it*
+  ([[file:../client/libota/libota.go::29][libota.go:29-30]]).  All five C ABI exports
+  (=ota_install / ota_upgrade / ota_revert / ota_version /
+  ota_last_error=) are real.  Either delete the dead var or
+  add a comment explaining what entry point it's reserved for.
+  Ship target: trivial; fold into any libota touch.
+
+** CI compute optimisation (noticed v1.0.4)
+
+Cutting v1.0.1 → v1.0.4 burned through the Ogamita group's
+shared-runner monthly compute allowance fast enough that the
+v1.0.4 =release= job sat queued until minutes were topped up.
+The two heaviest contributors are the =build-server-image= job
+(multi-arch buildx with QEMU-emulated arm64) and the =e2e=
+job (sequential SBCL boots per shell test).  Two cheap wins:
+
+- [ ] *Verify the dev-image cache is actually hitting in
+  practice.*  =build-dev-image= already declares
+  =--cache-from type=registry= and a =rules: changes:= gate on
+  =docker/Dockerfile.dev= and =.gitlab-ci.yml=, but the cache hit
+  rate isn't measured anywhere.  Run a no-op push, look at the
+  buildx output for "CACHED" lines, and confirm we're not
+  silently rebuilding layers.  If we are, fix the cache key /
+  source ordering.
+- [ ] *Gate =build-server-image= on tags only* (drop the
+  =$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH= rule).  Today it
+  fires on every master push *and* every tag, doubling the
+  buildx burn for no benefit -- nothing pulls
+  =server:latest= or =server:<short-sha>= operationally; the
+  publishable images are the tagged ones.  Cuts a per-pipeline
+  ~10 minutes of QEMU time.

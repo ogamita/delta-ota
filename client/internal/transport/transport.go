@@ -161,6 +161,80 @@ func (c *Client) LatestRelease(ctx context.Context, software string) ([]byte, er
 	return io.ReadAll(resp.Body)
 }
 
+// Software is one row of the catalogue list returned by GET /v1/software.
+type Software struct {
+	Name           string `json:"name"`
+	DisplayName    string `json:"display_name"`
+	DefaultPatcher string `json:"default_patcher"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// Release is one row of /v1/software/<sw>/releases (a subset of the
+// fields the server returns; only what `ota-agent list --remote`
+// uses).
+type Release struct {
+	ReleaseID       string   `json:"release_id"`
+	Software        string   `json:"software"`
+	OS              string   `json:"os"`
+	Arch            string   `json:"arch"`
+	Version         string   `json:"version"`
+	BlobSize        int64    `json:"blob_size"`
+	PublishedAt     string   `json:"published_at"`
+	Channels        []string `json:"channels"`
+	Classifications []string `json:"classifications"`
+	Deprecated      bool     `json:"deprecated"`
+	Uncollectable   bool     `json:"uncollectable"`
+}
+
+// ListReleases fetches /v1/software/<sw>/releases (every release of
+// SOFTWARE in the catalogue) and returns the parsed array.  Used by
+// `ota-agent list --remote` to enumerate every version, not just the
+// most-recently-published one.
+func (c *Client) ListReleases(ctx context.Context, software string) ([]Release, error) {
+	url := fmt.Sprintf("%s/v1/software/%s/releases", c.BaseURL, software)
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list-releases: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list-releases: %s", resp.Status)
+	}
+	var out []Release
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list-releases decode: %w", err)
+	}
+	return out, nil
+}
+
+// ListSoftware fetches /v1/software (the catalogue index) and returns
+// the parsed array.  Used by `ota-agent list --remote` to enumerate
+// what the server has on offer.
+func (c *Client) ListSoftware(ctx context.Context) ([]Software, error) {
+	url := c.BaseURL + "/v1/software"
+	req, err := c.authedRequest(ctx, http.MethodGet, url)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list-software: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list-software: %s", resp.Status)
+	}
+	var out []Software
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list-software decode: %w", err)
+	}
+	return out, nil
+}
+
 // DownloadPatch is like DownloadBlob but for /v1/patches/<sha>.
 func (c *Client) DownloadPatch(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
 	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/patches/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)

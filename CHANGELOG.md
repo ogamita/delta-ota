@@ -20,6 +20,136 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Fixed
+- **Server: `published_at` is now strictly monotonic per software.**
+  v1.0.x stamped publish timestamps via SQL's
+  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`, which has 1-second
+  precision. Two back-to-back publishes within the same second
+  tied on `published_at`, and the fallback `ORDER BY
+  published_at DESC` was nondeterministic about which row counted
+  as "newest". `insert-release` now computes `published_at`
+  catalogue-side as `max(MAX(prior published_at for this
+  software) + 1s, now)`, so a tight publish loop produces
+  strictly increasing timestamps without anyone needing to
+  `sleep 1`. New `published-at-is-strictly-monotonic-per-software`
+  unit test inserts five releases in a tight loop and asserts
+  the timestamps form a strictly decreasing sequence under
+  `list-releases`. Also lets the existing
+  `get-latest-release-falls-back-to-published-at-for-non-semver`
+  test drop its "any of three" relaxation.
+- **Server: `/releases/latest` now returns the highest *semver*
+  version, not the most-recently-*published* one.** Surfaced
+  during v1.1.0 testing: an operator re-published 1.0.1 today
+  after 1.0.4 was already in the catalogue. The v1.0.x semantics
+  (`ORDER BY published_at DESC`) returned 1.0.1 as "latest" — and
+  `ota-agent watch`, which calls `Upgrade(..., "latest")` on a
+  fixed interval, dutifully *downgraded* every installed client
+  from 1.0.2 to 1.0.1. Real-world data-loss potential.
+
+  v1.1.0 changes the server's `get-latest-release` to:
+  - Parse each release's `version` as semver
+    (`MAJOR.MINOR.PATCH[-PRERELEASE]`).
+  - Return the entry with the highest semver triple
+    (`-PRERELEASE` sorts *less than* the same triple without
+    one, per the semver spec).
+  - Fall back to v1.0.x's `published_at DESC` only when *no*
+    version in the catalogue parses as semver.
+  - Ignore non-semver versions (e.g. `wip`, `alpha-build`) when
+    at least one parseable version exists.
+
+  Date-based version strings like `2026.05.10` parse as semver
+  (all components integers) and order correctly. The `latest`
+  semantics change is server-side only — no wire-format or
+  schema_version impact.
+
+### Changed
+- **`ota-agent list --remote` now shows every release**, not just
+  the per-software latest. This is the "I can't see my four
+  releases" fix surfaced during v1.1.0 testing — operators got
+  one row per software product, with `LATEST` populated by the
+  server's `/releases/latest` endpoint, instead of one row per
+  (software, version). The new default does one
+  `GET /v1/software` + one `GET /releases` per software, then
+  prints `SOFTWARE / VERSION / OS-ARCH / BLOB / FLAGS /
+  PUBLISHED`. **Add `--latest` to opt back into the v1.1.0-rc
+  per-software view** (one row per software with latest version
+  + display name + created-at).
+- New `transport.Client.ListReleases(ctx, software)` wrapping
+  `GET /v1/software/<sw>/releases`.
+
+### Fixed
+- **Server log: "patchs" → "patches".** The progress line
+  introduced in v1.0.4 used CL's `~:P` directive, which only
+  knows the English "+s" rule, not the "-ches" exception. Spelt
+  the noun out via an `if`.
+
+### Documentation
+- **operations.org § End-user inspection commands** now flags the
+  "latest = published_at DESC" footgun: a hotfix published to an
+  older version after a newer one is already out becomes
+  "latest". Workarounds (zero-padded version strings, explicit
+  `--version`) are listed; the proper semver-aware sort is a
+  v1.2 backlog item (added to `docs/ota-implementation-plan.org`
+  § Post-1.0 backlog § Catalogue semantics).
+
+### Added
+- **`ota-agent` gains four subcommands previously stubbed as
+  "not implemented yet":**
+  - **`list [--remote|--local]`** — `--local` (the default) walks
+    `$OTA_HOME/`, prints a table of installed software with
+    current / previous version, on-disk bytes, and server URL.
+    `--remote` calls `GET /v1/software` on the server, then
+    `GET /v1/software/<sw>/releases/latest` for each, printing
+    name / latest version / display name / created-at.
+  - **`show <name>`** — purely local: reads
+    `$OTA_HOME/<name>/state.json` and prints the active version,
+    previous version, server URL, last-updated timestamp, history
+    length, on-disk size, and every `distribution-*` directory
+    (with `*` marking active and `p` marking previous).
+  - **`verify <name> [--offline] [--server=URL]`** — two-phase
+    integrity check.  Offline phase: state.json parses, current
+    version is set, current symlink/shim resolves, distribution
+    directory exists and is non-empty.  Online phase (default):
+    fetch the manifest from the server, verify the Ed25519
+    signature, check the pubkey against
+    `OTA_TRUSTED_PUBKEYS`, and — if the saved blob is still on
+    disk — recompute its SHA-256 and compare with the manifest's
+    `blob.sha256`.  Each finding is reported as `✓` / `✗` with a
+    one-line detail.  Exit 0 if every check passes, 1 otherwise.
+  - **`prune <name> [--archive-depth=N] [--dry-run]`** — frees
+    disk by deleting old `distribution-*` directories.  Always
+    keeps the current and previous versions; `--archive-depth=N`
+    (default 2) keeps `N` additional most-recent extras.
+    `--dry-run` reports what would be deleted without touching
+    anything.  Defence-in-depth: only paths whose name starts
+    with `distribution-` can be deleted.
+- **New transport method `transport.Client.ListSoftware()`**
+  wrapping `GET /v1/software`.
+- **New `client/internal/listing` package** — pure-data helpers
+  for `list`, `show`, and `prune` (LocalEntry, RemoteEntry,
+  PruneCandidates, DeleteDistribution).
+- **New `client/internal/verify` package** — `Verify()` returns
+  a `Report` with one `Check` per finding; the CLI command just
+  formats it.
+- **15 new Go unit tests** across `internal/listing` (8 tests:
+  local listing, foreign-dir skipping, prune-candidate selection,
+  defence-in-depth) and `internal/verify` (7 tests: offline-only
+  happy path, every offline failure mode, online happy path,
+  blob-hash mismatch, untrusted pubkey, --offline really skips
+  the network).  Online tests stand up an httptest server with a
+  freshly-generated Ed25519 keypair.
+
+### Notes
+- This release **adds new CLI surfaces** (four new subcommands +
+  one new transport method).  The wire format and libota C ABI
+  are unchanged from v1.0.x, but the new subcommands warrant a
+  minor (not patch) bump per semver — hence `1.1.0` rather than
+  `1.0.5`.
+- Other items still on the post-1.0 backlog (PostgreSQL, S3,
+  mTLS, real-time publish progress, …) remain deferred.
+
+## [1.0.4] - 2026-05-09
+
+### Fixed
 - **`publish` is now idempotent on `(software, os, arch, version)`
   — duplicate publishes no longer crash the server with `500
   UNIQUE constraint failed: releases.…`.** The handler now looks

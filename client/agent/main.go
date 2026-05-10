@@ -6,14 +6,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"gitlab.com/ogamita/delta-ota/client/internal/listing"
 	"gitlab.com/ogamita/delta-ota/client/internal/transport"
+	"gitlab.com/ogamita/delta-ota/client/internal/verify"
 	"gitlab.com/ogamita/delta-ota/client/libota"
 )
 
@@ -61,9 +65,14 @@ func main() {
 		doctorCmd(flag.Args()[1:])
 	case "watch":
 		watchCmd(flag.Args()[1:])
-	case "list", "show", "verify", "prune":
-		fmt.Fprintf(os.Stderr, "ota-agent: %q not implemented yet\n", flag.Arg(0))
-		os.Exit(1)
+	case "list":
+		listCmd(flag.Args()[1:])
+	case "show":
+		showCmd(flag.Args()[1:])
+	case "verify":
+		verifyCmd(flag.Args()[1:])
+	case "prune":
+		pruneCmd(flag.Args()[1:])
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -335,4 +344,288 @@ func printLicenses() {
 	fmt.Println("Ogamita Delta OTA — AGPL-3.0-or-later")
 	fmt.Println("Copyright (C) 2026 Ogamita Ltd.")
 	fmt.Println("See docs/THIRD_PARTY_LICENSES.org for vendored components.")
+}
+
+// otaHomeOrDie returns $OTA_HOME, falling back to $HOME/.ota.
+// Mirrors libota.defaultOTAHome but is reusable from the CLI without
+// pulling libota in.
+func otaHomeOrDie() string {
+	if v := os.Getenv("OTA_HOME"); v != "" {
+		return v
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(h, ".ota")
+	}
+	return ".ota"
+}
+
+// humanBytes formats N bytes as a short power-of-1024 string.
+func humanBytes(n int64) string {
+	const (
+		k = 1 << 10
+		m = 1 << 20
+		g = 1 << 30
+	)
+	switch {
+	case n >= g:
+		return fmt.Sprintf("%.1f GiB", float64(n)/float64(g))
+	case n >= m:
+		return fmt.Sprintf("%.1f MiB", float64(n)/float64(m))
+	case n >= k:
+		return fmt.Sprintf("%.1f KiB", float64(n)/float64(k))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// list [--remote|--local]
+// ---------------------------------------------------------------------------
+
+func listCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	remote := fs.Bool("remote", false, "list software offered by the server")
+	local := fs.Bool("local", false, "list software installed locally (default)")
+	latest := fs.Bool("latest", false,
+		"with --remote: show one row per software with its latest version (default: show every release)")
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL (with --remote)")
+	_ = fs.Parse(args)
+
+	// Default to --local when neither flag is given.
+	if !*remote && !*local {
+		*local = true
+	}
+	if *remote && *local {
+		fmt.Fprintln(os.Stderr, "list: --remote and --local are mutually exclusive")
+		os.Exit(2)
+	}
+
+	if *local {
+		entries, err := listing.ListLocal(otaHomeOrDie())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list: %v\n", err)
+			os.Exit(1)
+		}
+		if len(entries) == 0 {
+			fmt.Printf("(no software installed under %s)\n", otaHomeOrDie())
+			return
+		}
+		fmt.Printf("%-24s %-12s %-12s %-10s %s\n",
+			"SOFTWARE", "CURRENT", "PREVIOUS", "ON DISK", "SERVER")
+		for _, e := range entries {
+			fmt.Printf("%-24s %-12s %-12s %-10s %s\n",
+				e.Software,
+				orDash(e.Current),
+				orDash(e.Previous),
+				humanBytes(e.OnDiskBytes),
+				orDash(e.ServerURL))
+		}
+		return
+	}
+
+	// --remote
+	if *srv == "" {
+		fmt.Fprintln(os.Stderr, "list: --remote requires --server or $OTA_SERVER")
+		os.Exit(2)
+	}
+	tr := transport.New(strings.TrimRight(*srv, "/"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if *latest {
+		// One row per software, with the most-recently-published version.
+		rems, err := listing.ListRemoteSoftware(ctx, tr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list --remote --latest: %v\n", err)
+			os.Exit(1)
+		}
+		if len(rems) == 0 {
+			fmt.Printf("(server %s has no software in its catalogue)\n", *srv)
+			return
+		}
+		fmt.Printf("%-24s %-12s %-30s %s\n",
+			"SOFTWARE", "LATEST", "DISPLAY NAME", "CREATED")
+		for _, r := range rems {
+			ver := r.LatestVersion
+			if ver == "" {
+				if r.LatestErr != nil {
+					ver = "(no release)"
+				} else {
+					ver = "(none)"
+				}
+			}
+			fmt.Printf("%-24s %-12s %-30s %s\n",
+				r.Name, ver, r.DisplayName, r.CreatedAt)
+		}
+		return
+	}
+
+	// Default --remote view: every release of every software.
+	rels, err := listing.ListRemoteReleases(ctx, tr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list --remote: %v\n", err)
+		os.Exit(1)
+	}
+	if len(rels) == 0 {
+		fmt.Printf("(server %s has no releases in its catalogue)\n", *srv)
+		return
+	}
+	fmt.Printf("%-24s %-12s %-12s %-10s %-12s %s\n",
+		"SOFTWARE", "VERSION", "OS-ARCH", "BLOB", "FLAGS", "PUBLISHED")
+	for _, r := range rels {
+		flags := ""
+		if r.Deprecated {
+			flags += "deprecated "
+		}
+		if r.Uncollectable {
+			flags += "uncollectable "
+		}
+		flags = strings.TrimSpace(flags)
+		fmt.Printf("%-24s %-12s %-12s %-10s %-12s %s\n",
+			r.Software,
+			r.Version,
+			r.OS+"-"+r.Arch,
+			humanBytes(r.BlobSize),
+			orDash(flags),
+			r.PublishedAt)
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// show <name>
+// ---------------------------------------------------------------------------
+
+func showCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "show: missing <name>")
+		os.Exit(2)
+	}
+	name := args[0]
+	entry, err := listing.LoadLocal(otaHomeOrDie(), name)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "show: %s is not installed under %s\n", name, otaHomeOrDie())
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "show: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("software         : %s\n", entry.Software)
+	fmt.Printf("current version  : %s\n", orDash(entry.Current))
+	fmt.Printf("previous version : %s\n", orDash(entry.Previous))
+	fmt.Printf("server URL       : %s\n", orDash(entry.ServerURL))
+	if !entry.UpdatedAt.IsZero() {
+		fmt.Printf("last updated     : %s\n", entry.UpdatedAt.UTC().Format(time.RFC3339))
+	}
+	fmt.Printf("history length   : %d revisions\n", entry.HistoryLength)
+	fmt.Printf("on-disk size     : %s\n", humanBytes(entry.OnDiskBytes))
+	fmt.Printf("distributions    : %d directories\n", len(entry.Distributions))
+	for _, d := range entry.Distributions {
+		marker := "  "
+		switch {
+		case d == "distribution-"+entry.Current:
+			marker = "* " // active
+		case d == "distribution-"+entry.Previous:
+			marker = "p " // previous
+		}
+		fmt.Printf("  %s%s\n", marker, d)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// verify <name> [--offline]
+// ---------------------------------------------------------------------------
+
+func verifyCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	offline := fs.Bool("offline", false, "skip the manifest fetch + signature check")
+	srv := fs.String("server", os.Getenv("OTA_SERVER"), "server URL for online checks")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "verify: missing <name>")
+		os.Exit(2)
+	}
+	name := fs.Arg(0)
+	rep, err := verify.Verify(otaHomeOrDie(), name, verify.VerifyOptions{
+		Offline: *offline,
+		Server:  strings.TrimRight(*srv, "/"),
+		Trusted: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verify: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("=== ota-agent verify %s%s ===\n",
+		rep.Software,
+		func() string {
+			if rep.Version != "" {
+				return " @ " + rep.Version
+			}
+			return ""
+		}())
+	for _, c := range rep.Checks {
+		mark := "✓"
+		if !c.OK {
+			mark = "✗"
+		}
+		fmt.Printf("  %s %-22s %s\n", mark, c.Name, c.Detail)
+	}
+	if rep.AllOK() {
+		fmt.Println("OK")
+		return
+	}
+	fmt.Fprintln(os.Stderr, "FAIL: one or more checks did not pass")
+	os.Exit(1)
+}
+
+// ---------------------------------------------------------------------------
+// prune <name> [--archive-depth=N] [--dry-run]
+// ---------------------------------------------------------------------------
+
+func pruneCmd(args []string) {
+	args = reorderFlags(args)
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	depth := fs.Int("archive-depth", 2,
+		"how many extra distribution-* dirs to keep beyond current+previous")
+	dry := fs.Bool("dry-run", false, "list what would be deleted without removing it")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "prune: missing <name>")
+		os.Exit(2)
+	}
+	if *depth < 0 {
+		fmt.Fprintln(os.Stderr, "prune: --archive-depth must be >= 0")
+		os.Exit(2)
+	}
+	name := fs.Arg(0)
+	cands, err := listing.PruneCandidates(otaHomeOrDie(), name, *depth)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "prune: %v\n", err)
+		os.Exit(1)
+	}
+	if len(cands) == 0 {
+		fmt.Printf("nothing to prune under %s/%s (depth=%d)\n",
+			otaHomeOrDie(), name, *depth)
+		return
+	}
+	for _, d := range cands {
+		if *dry {
+			fmt.Printf("would delete  %s\n", d)
+			continue
+		}
+		if err := listing.DeleteDistribution(otaHomeOrDie(), name, d); err != nil {
+			fmt.Fprintf(os.Stderr, "prune: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("deleted       %s\n", d)
+	}
 }

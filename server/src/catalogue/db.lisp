@@ -144,19 +144,25 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
                                       uncollectable deprecated
                                       published-by notes)
   (with-catalogue (db catalogue)
-    (sqlite:execute-non-query
-     db
-     (format nil "INSERT INTO releases (~A) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, ?)"
-             *release-columns*)
-     release-id software os arch
-     (com.inuoe.jzon:stringify os-versions :pretty nil)
-     version blob-sha256 blob-size manifest-sha256
-     (com.inuoe.jzon:stringify channels :pretty nil)
-     (com.inuoe.jzon:stringify classifications :pretty nil)
-     (if uncollectable 1 0)
-     (if deprecated    1 0)
-     published-by
-     (or notes ""))))
+    ;; Compute published_at catalogue-side so that two back-to-back
+    ;; publishes within the same wall-clock second don't tie -- see
+    ;; NEXT-PUBLISHED-AT for the rationale.  (Replaces the prior
+    ;; SQL-side "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".)
+    (let ((published-at (next-published-at db software)))
+      (sqlite:execute-non-query
+       db
+       (format nil "INSERT INTO releases (~A) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+               *release-columns*)
+       release-id software os arch
+       (com.inuoe.jzon:stringify os-versions :pretty nil)
+       version blob-sha256 blob-size manifest-sha256
+       (com.inuoe.jzon:stringify channels :pretty nil)
+       (com.inuoe.jzon:stringify classifications :pretty nil)
+       (if uncollectable 1 0)
+       (if deprecated    1 0)
+       published-at
+       published-by
+       (or notes "")))))
 
 (defun list-releases (catalogue software-name)
   (with-catalogue (db catalogue)
@@ -189,13 +195,103 @@ publish handler for idempotent re-publish detection."
       (when rows (row-to-release (first rows))))))
 
 (defun get-latest-release (catalogue software-name)
-  (with-catalogue (db catalogue)
-    (let ((rows (sqlite:execute-to-list
-                 db
-                 (format nil "SELECT ~A FROM releases WHERE software_name = ? ORDER BY published_at DESC LIMIT 1"
-                         *release-columns*)
-                 software-name)))
-      (when rows (row-to-release (first rows))))))
+  "Return the release of SOFTWARE-NAME that should be served as
+\"latest\".  v1.1.0 semantics: the highest *semver* version when at
+least one release has a parseable semver string; otherwise the
+most-recently-published release (the v1.0.x semantics).
+
+Why the change: under the prior `published_at DESC` rule, a hotfix
+re-published to an older version after a newer one was already out
+would silently become \"latest\" -- and `ota-agent watch` would
+then downgrade every installed client.  Real-world bug; see the
+v1.1.0 CHANGELOG entry."
+  (let ((all (list-releases catalogue software-name)))
+    (cond ((null all) nil)
+          (t (or (highest-semver-release all)
+                 ;; LIST-RELEASES returns published_at DESC; the
+                 ;; first row is the v1.0.x \"latest\".  Used when no
+                 ;; version parses as semver.
+                 (first all))))))
+
+(defun highest-semver-release (releases)
+  "Return the entry of RELEASES (a list of release plists) with the
+highest parseable semver in its :VERSION; NIL when none parse."
+  (let ((parseable
+          (remove-if-not (lambda (r) (parse-semver (getf r :version)))
+                         releases)))
+    (when parseable
+      (first
+       (sort (copy-list parseable)
+             (lambda (a b)
+               (semver< (parse-semver (getf b :version))
+                        (parse-semver (getf a :version)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Semver parsing (subset).  Handles MAJOR.MINOR.PATCH and the
+;; MAJOR.MINOR.PATCH-PRERELEASE form.  No build-metadata support
+;; (`+build`) -- it is not used in our catalogue today.
+;; ---------------------------------------------------------------------------
+
+(defun parse-semver (version-string)
+  "Parse \"1.2.3\" or \"1.2.3-rc1\" into the structured form
+((1 2 3) . PRERELEASE-OR-NIL).  Returns NIL when VERSION-STRING is
+not parseable as semver (e.g. \"alpha\", or has a non-integer
+component)."
+  (when (and version-string (plusp (length version-string)))
+    (let* ((dash (position #\- version-string))
+           (numeric (if dash (subseq version-string 0 dash) version-string))
+           (prerelease (and dash (subseq version-string (1+ dash))))
+           (parts (split-on-dot numeric)))
+      (when (and (consp parts)
+                 (every (lambda (p)
+                          (and (plusp (length p))
+                               (every #'digit-char-p p)))
+                        parts))
+        (cons (mapcar #'parse-integer parts) prerelease)))))
+
+(defun split-on-dot (s)
+  (let ((acc '()) (start 0))
+    (dotimes (i (length s))
+      (when (char= (char s i) #\.)
+        (push (subseq s start i) acc)
+        (setf start (1+ i))))
+    (push (subseq s start) acc)
+    (nreverse acc)))
+
+(defun semver< (a b)
+  "Return T when parsed semver A is strictly less than B.  Both A
+and B must be the (NUMS . PRERELEASE) shape returned by
+PARSE-SEMVER.
+
+Per the semver spec: number lists are compared lexicographically;
+when they tie, a release with a prerelease tag is *less than* one
+without (1.0.0-rc1 < 1.0.0); when both have prerelease tags, they
+are string-compared (a coarse approximation -- spec'd ordering
+rules are subtler but not needed for our publish-monotonic
+catalogue use case)."
+  (let ((nums-a (car a))
+        (nums-b (car b))
+        (pre-a  (cdr a))
+        (pre-b  (cdr b)))
+    (cond
+      ((nums< nums-a nums-b) t)
+      ((nums< nums-b nums-a) nil)
+      ;; numeric components tied
+      ((and pre-a (null pre-b)) t)         ; 1.0.0-rc < 1.0.0
+      ((and (null pre-a) pre-b) nil)
+      ((and pre-a pre-b)        (string< pre-a pre-b))
+      (t nil))))                            ; equal
+
+(defun nums< (a b)
+  "Lex compare of two integer lists, with the missing-tail
+treated as zero (so (1 0) and (1 0 0) are equal)."
+  (cond
+    ((and (null a) (null b)) nil)
+    ((null a) (some #'plusp b))
+    ((null b) nil)
+    ((< (first a) (first b)) t)
+    ((> (first a) (first b)) nil)
+    (t (nums< (rest a) (rest b)))))
 
 (defun insert-patch (catalogue &key sha256 from-release-id to-release-id patcher size)
   (with-catalogue (db catalogue)
@@ -253,6 +349,45 @@ publish handler for idempotent re-publish detection."
 (defun universal-to-iso8601 (univ)
   (multiple-value-bind (s m h d mo y) (decode-universal-time univ 0)
     (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ" y mo d h m s)))
+
+(defun iso8601-to-universal (iso)
+  "Inverse of UNIVERSAL-TO-ISO8601 for the strict
+\"YYYY-MM-DDTHH:MM:SSZ\" shape we emit ourselves."
+  (encode-universal-time
+   (parse-integer iso :start 17 :end 19)   ; ss
+   (parse-integer iso :start 14 :end 16)   ; mm
+   (parse-integer iso :start 11 :end 13)   ; hh
+   (parse-integer iso :start  8 :end 10)   ; dd
+   (parse-integer iso :start  5 :end  7)   ; MM
+   (parse-integer iso :start  0 :end  4)   ; YYYY
+   0))                                      ; UTC
+
+(defun succ-iso8601 (iso)
+  "Return the ISO-8601 string one second after ISO."
+  (universal-to-iso8601 (1+ (iso8601-to-universal iso))))
+
+(defun next-published-at (db software-name)
+  "Return an ISO-8601 timestamp suitable as the new release's
+published_at: the wall-clock now, OR -- if a prior release of
+SOFTWARE-NAME already has that timestamp (or any in its future,
+e.g. after an NTP correction) -- the maximum existing
+published_at plus one second.
+
+This keeps published_at *strictly* monotonic per-software: two
+back-to-back publishes in the same wall-clock second do not tie,
+so any ORDER BY published_at DESC consumer (notably the v1.0.x
+get-latest-release fallback) is deterministic.  No sleeps;
+purely catalogue-side."
+  (let* ((now  (universal-to-iso8601 (get-universal-time)))
+         (rows (sqlite:execute-to-list
+                db
+                "SELECT MAX(published_at) FROM releases WHERE software_name = ?"
+                software-name))
+         (prev (caar rows)))
+    (cond
+      ((null prev)         now)
+      ((string< prev now)  now)            ; clock has advanced; use it
+      (t                   (succ-iso8601 prev)))))
 
 (defun claim-install-token (catalogue token)
   "Mark an install token as used (one-shot).  Returns the token's

@@ -51,12 +51,14 @@
 .DS_Store
 Thumbs.db
 
-# Test artefacts
+# Test artefacts -- every tests/e2e/<script>.sh creates its own
+# tests/e2e/run[-<name>]/ working directory at runtime (payloads,
+# server-root, logs, generated Lisp wrappers).  The glob covers any
+# new e2e script's working dir without further .gitignore edits;
+# the bare /run/ is run.sh's working dir (no suffix).
 /tests/tmp/
 /tests/e2e/run/
-/tests/e2e/run-auth/
-/tests/e2e/run-ops/
-/tests/e2e/run-recovery/
+/tests/e2e/run-*/
 *.log
 
 # Local development

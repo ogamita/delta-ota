@@ -151,7 +151,9 @@ server/build/ota-server                # standalone executable
 admin/build/ota-admin                  # standalone executable
                                        #   subcommands: publish | mint-tokens | version | help
 client/build/<os>-<arch>/ota-agent     # standalone executable (Go, static)
-                                       #   subcommands: install | upgrade | revert | doctor | watch | … | version
+                                       #   subcommands: install | upgrade | revert | doctor | watch
+                                       #               list | show | verify | prune
+                                       #               version | licenses
 ```
 
 Each binary parses its own arguments (`./ota-server help`, `./ota-admin version`,
