@@ -114,6 +114,15 @@ func hasOurMarkers(root string) bool {
 
 // scanDistributions returns the names of every distribution-* directory
 // under root, sorted *descending* by mtime (newest first).
+//
+// Tie-break on name (descending) when mtimes are equal — back-to-back
+// MkdirAll calls on filesystems with coarse mtime resolution (Linux
+// tmpfs, GitHub Actions runners) all stamp the same timestamp, and
+// sort.Slice is not stable.  Without the tie-break, prune-candidate
+// selection becomes filesystem-iteration-order-dependent (passes on
+// macOS APFS, fails on Linux ext4).  Name-descending matches
+// "newest first" for monotonic version-suffixed dirs
+// (distribution-v5 sorts before distribution-v1).
 func scanDistributions(root string) []string {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -137,7 +146,12 @@ func scanDistributions(root string) []string {
 		}
 		items = append(items, item{name: e.Name(), mtime: info.ModTime()})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].mtime.After(items[j].mtime) })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].mtime.Equal(items[j].mtime) {
+			return items[i].name > items[j].name
+		}
+		return items[i].mtime.After(items[j].mtime)
+	})
 	out := make([]string, len(items))
 	for i, it := range items {
 		out[i] = it.name

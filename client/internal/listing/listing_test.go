@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // makeFakeOtaHome lays out a tiny $OTA_HOME under t.TempDir():
@@ -166,6 +167,20 @@ func TestPruneCandidates_ArchiveDepthExtendsKeepList(t *testing.T) {
 	root := makeOnePackage(t, "p", "v5", "v4",
 		[]string{"distribution-v1", "distribution-v2", "distribution-v3",
 			"distribution-v4", "distribution-v5"})
+	// Force every distribution-* dir to share the same mtime, the
+	// way back-to-back MkdirAll calls on Linux ext4 / GitHub
+	// runners leave them.  Without a deterministic tie-breaker in
+	// scanDistributions, sort.Slice's non-stable ordering then
+	// makes the prune-candidate selection filesystem-iteration-
+	// order-dependent (passes on macOS APFS, fails on Linux).
+	sameTime := time.Unix(1700000000, 0)
+	pkg := filepath.Join(root, "p")
+	for _, d := range []string{"distribution-v1", "distribution-v2",
+		"distribution-v3", "distribution-v4", "distribution-v5"} {
+		if err := os.Chtimes(filepath.Join(pkg, d), sameTime, sameTime); err != nil {
+			t.Fatalf("Chtimes %s: %v", d, err)
+		}
+	}
 	// depth=2: keep current+previous (v5,v4) + 2 most recent extras (v3,v2).
 	// v1 is the only candidate.
 	cands, err := PruneCandidates(root, "p", 2)
