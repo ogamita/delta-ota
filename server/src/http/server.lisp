@@ -501,26 +501,161 @@ incrementally — typically a small fraction of the full payload.</small></p>
       (read-sequence buf in)
       buf)))
 
-(defun handle-get-blob (app params)
+(defun handle-get-blob (app env params)
   (let ((path (ota-server.storage:cas-blob-path
                (app-state-cas app) (getf params :sha256))))
-    (cond ((not (probe-file path))
-           (error-response 404 "blob not found"))
-          (t
-           ;; Returning a pathname tells Woo to use sendfile(2).
-           (list 200
-                 (list :content-type "application/octet-stream")
-                 (probe-file path))))))
+    (serve-file-with-optional-range path env "blob not found")))
 
-(defun handle-get-patch (app params)
+(defun handle-get-patch (app env params)
   (let ((path (ota-server.storage:cas-patch-path
                (app-state-cas app) (getf params :sha256))))
-    (cond ((not (probe-file path))
-           (error-response 404 "patch not found"))
-          (t
-           (list 200
-                 (list :content-type "application/octet-stream")
-                 (probe-file path))))))
+    (serve-file-with-optional-range path env "patch not found")))
+
+;; ---------------------------------------------------------------------------
+;; HTTP Range support (since v1.3) for /v1/blobs/<sha> and /v1/patches/<sha>.
+;;
+;; Why: a 2 GB initial install over a flaky link used to throw away the
+;; whole transfer on every disconnect (the client deleted the .part
+;; file).  v1.3 keeps the .part across attempts and resumes via
+;; `Range: bytes=N-`.  Server-side we honour the request and reply
+;; `206 Partial Content` with the requested slice; full-file responses
+;; advertise `Accept-Ranges: bytes` so clients know the option exists.
+;;
+;; Full requests (no Range header) keep the v1.0–v1.2 sendfile(2) fast
+;; path — the kernel ships the file from disk to socket without bytes
+;; ever touching SBCL.  Partial requests use a userspace
+;; lambda-responder loop, which is the price of supporting resume; in
+;; practice partial requests are rare (only after a failed transfer)
+;; and a 64 KB read+write per chunk is bounded by network bandwidth
+;; anyway.
+;;
+;; See ADR-0008 for the design and what was rejected (e.g. patching
+;; Woo for sendfile-with-offset).
+;; ---------------------------------------------------------------------------
+
+(defun serve-file-with-optional-range (path env not-found-msg)
+  "Serve PATH, honouring `Range:` when present.  Falls back to a
+sendfile(2) full-content response when Range is absent.  Returns the
+clack response triple (or a lambda-responder for the streaming
+partial path)."
+  (let ((real (and path (probe-file path))))
+    (cond
+      ((null real)
+       (error-response 404 not-found-msg))
+      (t
+       (let* ((headers (env-get env :headers))
+              (range-hdr (and (hash-table-p headers)
+                              (gethash "range" headers))))
+         (cond
+           ((null range-hdr)
+            ;; Full content, sendfile fast path.  Advertise Accept-Ranges
+            ;; so the client knows it can resume on a subsequent attempt.
+            ;; Content-Length is set by Woo from the file's stat()
+            ;; -- duplicating it here yields two headers which some
+            ;; clients (dexador, curl --fail-with-body) trip over.
+            (list 200
+                  (list :content-type "application/octet-stream"
+                        :|accept-ranges| "bytes")
+                  real))
+           (t
+            (serve-file-range real range-hdr))))))))
+
+(defun file-byte-length (path)
+  (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+    (file-length in)))
+
+(defun parse-range-header (range-header total-size)
+  "Parse a single-range `Range: bytes=N-[M]` or `bytes=-K` header
+against a file of TOTAL-SIZE bytes.  Returns (values START END) where
+both are inclusive byte offsets clamped to [0, TOTAL-SIZE-1], or NIL
+when the header is malformed or unsatisfiable.
+
+We only accept the `bytes=` unit and a single range -- multi-range
+(`bytes=0-99,200-299`) is uncommon in practice and would require
+multipart/byteranges responses, which add complexity for no win on
+our use case (the client always asks for one open-ended `N-` to
+resume)."
+  (block parse
+    (unless (and range-header
+                 (>= (length range-header) 7)
+                 (string-equal "bytes=" (subseq range-header 0 6)))
+      (return-from parse nil))
+    (let* ((spec (subseq range-header 6))
+           (dash (position #\- spec))
+           (comma (position #\, spec)))
+      (when (or (null dash) comma)
+        (return-from parse nil))
+      (let ((before (string-trim " " (subseq spec 0 dash)))
+            (after  (string-trim " " (subseq spec (1+ dash)))))
+        (handler-case
+            (cond
+              ;; `-K` (suffix range): last K bytes.
+              ((and (zerop (length before)) (plusp (length after)))
+               (let* ((k (parse-integer after))
+                      (start (max 0 (- total-size k))))
+                 (when (and (plusp total-size) (plusp k))
+                   (values start (1- total-size)))))
+              ;; `N-` (open-ended) or `N-M`.
+              ((plusp (length before))
+               (let* ((start (parse-integer before))
+                      (end   (cond
+                               ((zerop (length after)) (1- total-size))
+                               (t (parse-integer after)))))
+                 (cond
+                   ;; Out of range entirely -> 416 (caller maps NIL).
+                   ((or (< start 0) (>= start total-size)) nil)
+                   ;; Clamp end to file size.
+                   (t (values start (min end (1- total-size))))))))
+          (error () nil))))))
+
+(defparameter *range-chunk-size* 65536
+  "Chunk size for streaming partial-content responses.  64 KB matches
+the client's read buffer and keeps per-chunk overhead small relative
+to the network write cost.")
+
+(defun serve-file-range (path range-header)
+  "Stream a 206 Partial Content response covering the byte slice
+requested by RANGE-HEADER.  On a malformed or unsatisfiable range,
+reply 416 with `Content-Range: bytes */SIZE` per RFC 7233."
+  (let* ((total (file-byte-length path)))
+    (multiple-value-bind (start end) (parse-range-header range-header total)
+      (cond
+        ((null start)
+         (list 416
+               (list :content-type "text/plain"
+                     :|content-range| (format nil "bytes */~D" total)
+                     :|accept-ranges| "bytes")
+               (list "requested range not satisfiable")))
+        (t
+         (let ((length (1+ (- end start))))
+           (lambda (responder)
+             ;; Note: Woo will use Transfer-Encoding: chunked for the
+             ;; lambda-responder body and adding a fixed Content-Length
+             ;; here would conflict (HTTP forbids both).  The client
+             ;; learns the slice length from Content-Range's "N-M/T".
+             (let ((writer (funcall responder
+                                    (list 206
+                                          (list :content-type "application/octet-stream"
+                                                :|content-range| (format nil "bytes ~D-~D/~D"
+                                                                         start end total)
+                                                :|accept-ranges| "bytes")))))
+               (unwind-protect
+                    (with-open-file (in path :direction :input
+                                             :element-type '(unsigned-byte 8))
+                      (file-position in start)
+                      (let ((buf (make-array *range-chunk-size*
+                                             :element-type '(unsigned-byte 8)))
+                            (remaining length))
+                        (loop while (plusp remaining)
+                              for to-read = (min *range-chunk-size* remaining)
+                              for n = (read-sequence buf in :end to-read)
+                              while (plusp n) do
+                                (funcall writer
+                                         (if (= n (length buf))
+                                             buf
+                                             (subseq buf 0 n)))
+                                (decf remaining n))))
+                 (funcall writer "" :close t))))))))))
 
 (defun handle-admin-create-software (app env)
   (unless (authorised-admin-p env app)
@@ -1208,8 +1343,8 @@ overwrite an existing manifest with one for a different blob."
                  (:latest-release               (handle-latest-release state env params))
                  (:get-release                  (handle-get-release state env params))
                  (:get-manifest                 (handle-get-manifest state env params))
-                 (:get-blob                     (handle-get-blob state params))
-                 (:get-patch                    (handle-get-patch state params))
+                 (:get-blob                     (handle-get-blob state env params))
+                 (:get-patch                    (handle-get-patch state env params))
                  (:admin-create-software        (handle-admin-create-software state env))
                  (:admin-publish-release        (handle-admin-publish-release state env params))
                  (:admin-mint-install-token     (handle-admin-mint-install-token state env))

@@ -233,8 +233,11 @@ auth, no patches yet.
 
 - [ ] *Manifest verify* : parse JSON, verify Ed25519 signature
   against a pinned public key embedded in the binary.
-- [ ] *Transport* : HTTP GET with =Range:= resume, sha256 streaming
-  verifier, progress callback.
+- [X] *Transport* : HTTP GET with =Range:= resume, sha256 streaming
+  verifier, progress callback. — initial sha-streamed download
+  landed in phase 1; the =Range:= resume + =.part= survival +
+  trailing-zero scan landed in v1.3.0.  See
+  [[file:adr/0008-resumable-blob-downloads.org][ADR-0008]].
 - [ ] *State* : =$OTA_HOME/<software>/state.json= read/write,
   =current= / =previous= symlinks (junction code stubbed for
   Windows, exercised in phase 3).

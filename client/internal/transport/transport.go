@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -249,48 +250,214 @@ func (c *Client) DownloadBlob(ctx context.Context, sha256Hex, dstPath string, pr
 }
 
 // downloadHashed is the shared implementation for DownloadBlob and
-// DownloadPatch.
+// DownloadPatch.  It is resumable when the server supports HTTP
+// Range (the OTA server does, since v1.3): on retry the existing
+// <dst>.part file is reused, the trailing-zero tail is trimmed (a
+// torn write may have grown the file's apparent size beyond what
+// was committed to disk), the prefix SHA is recomputed, and the
+// request is re-issued with `Range: bytes=N-`.  If the server
+// returns 200 (Range ignored), the client falls back to a full
+// download starting from byte 0.
+//
+// On any non-final error the .part file is *kept* so the next
+// attempt can resume.  The .part file is only deleted when:
+//   - the final SHA mismatches (corrupted or wrong blob), or
+//   - the rename to the final destination succeeds.
 func (c *Client) downloadHashed(ctx context.Context, url, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
+	tmp := dstPath + ".part"
+
+	// 1. Probe the existing .part for a safe resume point.  See
+	//    safeResumeSize for the trailing-zero policy.
+	resumeFrom, prefixHasher, err := openResumeState(tmp)
+	if err != nil {
+		// Probe failed (e.g. permissions); start fresh.
+		resumeFrom, prefixHasher = 0, nil
+	}
+
+	// 2. Build the request, with Range when we have a prefix.
 	req, err := c.authedRequest(ctx, http.MethodGet, url)
 	if err != nil {
 		return 0, err
 	}
+	if resumeFrom > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		// Network error before the response: keep .part around for
+		// the next attempt.
 		return 0, fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+
+	// 3. Decide whether the server honoured Range.
+	hasher := prefixHasher
+	startOffset := resumeFrom
+	switch {
+	case resumeFrom > 0 && resp.StatusCode == http.StatusPartialContent:
+		// Good — server gave us bytes [resumeFrom..end].
+	case resp.StatusCode == http.StatusOK:
+		// Either we asked for the full thing, or the server ignored
+		// our Range and gave us the whole file anyway.  Restart from
+		// byte 0; truncate any existing .part.
+		startOffset = 0
+		hasher = sha256.New()
+		if err := os.Truncate(tmp, 0); err != nil && !os.IsNotExist(err) {
+			return 0, fmt.Errorf("download truncate: %w", err)
+		}
+	default:
 		return 0, fmt.Errorf("download: %s", resp.Status)
 	}
 
-	tmp := dstPath + ".part"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return 0, fmt.Errorf("download create: %w", err)
+	// 4. Append (when resuming) or write fresh (when starting from 0).
+	flag := os.O_WRONLY | os.O_CREATE
+	if startOffset == 0 {
+		flag |= os.O_TRUNC
+	} else {
+		flag |= os.O_APPEND
 	}
-	hasher := sha256.New()
+	out, err := os.OpenFile(tmp, flag, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("download open: %w", err)
+	}
+	if hasher == nil {
+		hasher = sha256.New()
+	}
 	mw := io.MultiWriter(out, hasher)
 
-	written, err := copyWithProgress(mw, resp.Body, progress)
+	// 5. Copy.  copyWithProgress reports cumulative written bytes
+	//    *of the response body*; combine with startOffset so the
+	//    progress callback sees the absolute position on the full
+	//    file -- otherwise the UI would show "downloaded 50 MB" on
+	//    a resume that has 1.5 GB on disk already.
+	progressAbs := progress
+	if progress != nil && startOffset > 0 {
+		progressAbs = func(w int64) { progress(startOffset + w) }
+	}
+	bodyWritten, err := copyWithProgress(mw, resp.Body, progressAbs)
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(tmp)
-		return written, fmt.Errorf("download copy: %w", err)
+		// Mid-transfer error (network drop, disk full, etc.).  KEEP
+		// the .part around so the next attempt resumes; do *not*
+		// remove it.
+		return startOffset + bodyWritten, fmt.Errorf("download copy: %w", err)
 	}
 
+	// 6. Final integrity check.  A mismatch here means the bytes
+	//    on disk are not what the manifest committed to: drop the
+	//    .part and start over on the next attempt.
 	got := hex.EncodeToString(hasher.Sum(nil))
 	if got != sha256Hex {
 		_ = os.Remove(tmp)
-		return written, fmt.Errorf("download sha mismatch: want %s got %s", sha256Hex, got)
+		return startOffset + bodyWritten,
+			fmt.Errorf("download sha mismatch: want %s got %s", sha256Hex, got)
 	}
 	if err := os.Rename(tmp, dstPath); err != nil {
-		_ = os.Remove(tmp)
-		return written, fmt.Errorf("download rename: %w", err)
+		// Keep .part: a rename failure is usually transient (target
+		// dir gone, permissions); the bytes are correct.
+		return startOffset + bodyWritten, fmt.Errorf("download rename: %w", err)
 	}
-	return written, nil
+	return startOffset + bodyWritten, nil
+}
+
+// openResumeState inspects an existing <dst>.part and returns the
+// safe resume offset along with a SHA-256 hasher pre-fed with the
+// kept prefix.  When .part is absent or empty it returns (0, nil,
+// nil) -- callers then start a fresh download.
+//
+// The "safe" size is computed by safeResumeSize; if that comes
+// back smaller than the on-disk size we truncate the .part down
+// to drop any unsynced trailing zeros from a torn write before
+// the previous crash.
+func openResumeState(partPath string) (int64, hash.Hash, error) {
+	info, err := os.Stat(partPath)
+	if err != nil || info.Size() == 0 {
+		return 0, nil, nil
+	}
+	safe, err := safeResumeSize(partPath, info.Size())
+	if err != nil {
+		return 0, nil, err
+	}
+	if safe < info.Size() {
+		if err := os.Truncate(partPath, safe); err != nil {
+			return 0, nil, err
+		}
+	}
+	if safe == 0 {
+		// Nothing usable; .part is now zero-length.
+		return 0, nil, nil
+	}
+	h, err := hashPrefix(partPath, safe)
+	if err != nil {
+		return 0, nil, err
+	}
+	return safe, h, nil
+}
+
+// safeResumeSize returns a byte offset N such that bytes [0, N) of
+// PARTPATH are guaranteed to be valid blob content -- i.e. not the
+// trailing-zero tail of a torn write.  We do not call fsync(2) on
+// every chunk (that would halve throughput on a 2 GB transfer); the
+// price is that a crash may leave the file's metadata size larger
+// than the data the kernel actually committed, with the gap reading
+// as zeros after recovery.
+//
+// We can't tell legitimate trailing zeros in the blob apart from
+// post-crash zero-fill, so on resume we conservatively re-fetch any
+// trailing zeros at the end of .part.  Worst case: a blob whose
+// last byte is zero costs us re-downloading a few hundred KB on the
+// resume attempt.  Acceptable.
+//
+// To bound the cost of the scan on a multi-GB file we look at most
+// at the last 16 MiB.  If those are *all* zeros we discard the
+// whole window (returning the offset before it) -- that's a safe
+// over-approximation; the next iteration of the resume loop will
+// either land on real data or shrink the window further.
+const safeScanWindowBytes = 16 * 1024 * 1024
+
+func safeResumeSize(path string, fileSize int64) (int64, error) {
+	if fileSize == 0 {
+		return 0, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	bufSize := int64(safeScanWindowBytes)
+	if bufSize > fileSize {
+		bufSize = fileSize
+	}
+	buf := make([]byte, bufSize)
+	offset := fileSize - bufSize
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return 0, err
+	}
+	for i := len(buf) - 1; i >= 0; i-- {
+		if buf[i] != 0 {
+			return offset + int64(i) + 1, nil
+		}
+	}
+	// All zero in the scan window.  Drop it.
+	return offset, nil
+}
+
+// hashPrefix returns a SHA-256 hasher pre-fed with bytes [0, size)
+// of PATH.  Used on resume to rebuild the hash state for the kept
+// prefix so the final SHA still verifies the whole blob.
+func hashPrefix(path string, size int64) (hash.Hash, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.CopyN(h, f, size); err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 func copyWithProgress(dst io.Writer, src io.Reader, progress func(written int64)) (int64, error) {

@@ -654,6 +654,36 @@ v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
 straightforward to add.  Ship target: a sub-phase, driven by the
 first customer who needs it.
 
+* Resumable downloads (since v1.3)
+
+The server honours =Range: bytes=N-[M]= on =/v1/blobs/<sha>= and
+=/v1/patches/<sha>=, replying =206 Partial Content= with the
+requested slice; full responses advertise =Accept-Ranges: bytes=.
+=ota-agent= keeps its =<dst>.part= file across attempts: on retry
+it scans the trailing-zero tail (a torn write may have grown the
+file's apparent size beyond what was committed to disk),
+truncates to the last non-zero byte, recomputes the prefix SHA,
+and asks the server for =bytes=N-=.  If the server (or an
+intermediate proxy) ignores the Range and replies 200, the agent
+falls back to a clean restart from byte 0.  See
+[[file:adr/0008-resumable-blob-downloads.org][ADR-0008]] for the
+full design.
+
+Operational implications:
+
+- =.part= files live next to the final destination
+  (=<OTA_HOME>/<software>/blobs/<sha>.part=).  An aborted install
+  leaves them on disk; the next install resumes from there, or
+  the operator can delete them manually to force a fresh pull.
+- No new configuration knobs.  Range support is always on; resume
+  is always on.  The trailing-zero scan window (16 MiB) is a
+  compile-time constant in =transport.go=.
+- A reverse proxy in front of =ota-server= (nginx, haproxy) MUST
+  pass =Range:= through and not buffer 206 responses, or it will
+  defeat the optimisation.  All commodity proxies do this by
+  default; only check if you've explicitly disabled =proxy_buffering=
+  or set =proxy_force_ranges off= or equivalent.
+
 * Troubleshooting
 
 | Symptom                                         | Likely cause                                     | First action |
@@ -663,3 +693,5 @@ first customer who needs it.
 | =bsdiff= subprocess fails on publish            | Blob exceeds available RAM (= 2 × blob size)     | Stage the patch worker on a host with more RAM, or use =uncollectable= so the build is offline |
 | GC pruned a release a customer still uses       | Telemetry incomplete (no install_event)          | Re-publish the release; investigate why telemetry was missing |
 | =sendfile= path silently breaks under TLS       | TLS encryption happens in userspace              | Move TLS termination to a reverse proxy with kTLS |
+| Big initial install never completes over flaky link | Reverse proxy stripping =Range:= headers      | Test directly against the server: =curl -I -H 'Range: bytes=0-99' .../v1/blobs/<sha>=; expect 206 |
+| =.part= file accumulating disk space             | Aborted install never resumed                   | Delete =<OTA_HOME>/<sw>/blobs/<sha>.part= or run =ota-agent install <sw>= to complete it |
