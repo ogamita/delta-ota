@@ -122,12 +122,54 @@ harness)."
     (force-output)
     0))
 
-(defun run-gc (&key config)
-  "Run garbage collection and exit (currently a stub)."
-  (declare (ignore config))
-  (format t "ota-server gc: phase-1 stub.~%")
-  (force-output)
-  0)
+(defun run-gc (&key config software (min-user-count 0) (min-age-days 30) dry-run)
+  "Run garbage collection for SOFTWARE and exit.  Mirrors the
+HTTP `POST /v1/admin/software/<sw>/gc` handler so cron and
+systemd timers can invoke GC without going through the API.
+
+Required: :software.  Optional: :min-user-count (default 0),
+:min-age-days (default 30), :dry-run.  Exit code 0 on success,
+2 on missing :software, non-zero from the toplevel handler on
+any uncaught error."
+  (unless software
+    (format *error-output* "ota-server gc: --software=NAME required~%")
+    (return-from run-gc 2))
+  (let* ((cfg (%resolve config))
+         (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
+         (cas (ota-server.storage:make-cas root))
+         (db  (ota-server.catalogue:open-catalogue
+               (merge-pathnames "db/ota.db" root)))
+         (kp  (ota-server.manifest:load-or-generate-keypair
+               (merge-pathnames "etc/keys/" root)))
+         (manifests-dir (merge-pathnames "manifests/" root)))
+    (unwind-protect
+         (let ((result (ota-server.workers:gc-software
+                        cas db kp manifests-dir
+                        :software software
+                        :min-user-count min-user-count
+                        :min-age-days   min-age-days
+                        :dry-run        dry-run)))
+           (format t "ota-server gc: software=~A pruned=~D dry-run=~A min-user-count=~A min-age-days=~A~%"
+                   software
+                   (length (getf result :pruned))
+                   (if (getf result :dry-run) "true" "false")
+                   min-user-count min-age-days)
+           (dolist (rid (getf result :pruned))
+             (format t "  ~A  ~A~%"
+                     (if dry-run "would prune" "pruned     ")
+                     rid))
+           (force-output)
+           (ota-server.catalogue:append-audit
+            db
+            :identity "cli"
+            :action "gc"
+            :target software
+            :detail (format nil "pruned=~D dry_run=~A min_user_count=~A min_age_days=~A"
+                            (length (getf result :pruned))
+                            (getf result :dry-run)
+                            min-user-count min-age-days)))
+      (ota-server.catalogue:close-catalogue db))
+    0))
 
 ;; ---------------------------------------------------------------------------
 ;; Usage
@@ -140,7 +182,9 @@ harness)."
 Usage:
   ota-server serve   [--config=PATH]    boot the server (default subcommand)
   ota-server migrate [--config=PATH]    apply catalogue migrations and exit
-  ota-server gc      [--config=PATH]    run garbage collection and exit
+  ota-server gc      [--config=PATH] --software=NAME [--min-user-count=N]
+                     [--min-age-days=N] [--dry-run]
+                                        run garbage collection on SOFTWARE and exit
   ota-server shell                      drop into an SBCL REPL (debug only)
   ota-server version                    print version and exit
   ota-server help                       print this message and exit
@@ -181,7 +225,21 @@ Environment variables (override file values):
       ((string= cmd "migrate")
        (or (migrate :config config) 0))
       ((string= cmd "gc")
-       (or (run-gc :config config) 0))
+       (let ((software       (%get-flag rest "software"))
+             (min-user-count (alexandria:if-let ((v (%get-flag rest "min-user-count")))
+                               (parse-integer v) 0))
+             (min-age-days   (alexandria:if-let ((v (%get-flag rest "min-age-days")))
+                               (parse-integer v) 30))
+             (dry-run        (or (member "--dry-run" rest :test #'string=)
+                                 (let ((v (%get-flag rest "dry-run")))
+                                   (and v (not (string= v "false"))
+                                        (not (string= v "0")))))))
+         (or (run-gc :config config
+                     :software software
+                     :min-user-count min-user-count
+                     :min-age-days min-age-days
+                     :dry-run (and dry-run t))
+             0)))
       ((string= cmd "shell")
        #+sbcl (sb-impl::toplevel-init)
        0)

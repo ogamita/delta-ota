@@ -19,7 +19,40 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **`ota-server gc` CLI subcommand is now real**, not a stub
+  ("phase-1 stub." was its entire body in v1.0.x–v1.1.0). It
+  invokes the same `ota-server.workers:gc-software` worker the
+  HTTP `POST /v1/admin/software/<sw>/gc` handler uses, so cron
+  / systemd timers can run GC without going through the API.
+  Flags: `--software=NAME` (required), `--min-user-count=N`
+  (default 0), `--min-age-days=N` (default 30), `--dry-run`.
+  Exit 2 on missing `--software`, 0 on success. Prints a
+  one-line summary then one row per pruned release-id; also
+  appends an `identity="cli"` row to the audit log so the
+  publish-and-gc flow is traceable end-to-end.
+- **`[server].admin_token` TOML key is now read by the loader.**
+  Documented in `operations.org` § Authentication since v1.0.x
+  but never wired — `[server].admin_token = "x"` was silently
+  ignored, leaving env-var as the only way to set a non-default
+  token. The sample TOMLs ship with the line commented out;
+  `OTA_ADMIN_TOKEN` env-var still wins over the file value (no
+  precedence change). 3 new unit tests in `config-tests.lisp`
+  (file-only, default-when-absent, env-overrides-file).
+
+### Removed
+- **`libota.ErrNotImplemented`** — defined but no entry point
+  ever returned it (every C-ABI export `ota_install /
+  ota_upgrade / ota_revert / ota_version / ota_last_error` is
+  real). Dead code; deleted.
+
+### Notes
+- Closes the three "Operator polish" backlog items in
+  `docs/ota-implementation-plan.org` § Post-1.0 backlog.
+  Plan checkboxes flipped to `[X]`. Server suite is now 154
+  checks (was 141 at v1.1.0 cut).
+
+## [1.1.0] - 2026-05-10
 
 ## [1.1.0] - 2026-05-10
 

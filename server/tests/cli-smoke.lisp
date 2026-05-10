@@ -119,3 +119,85 @@ clear error message."
       (is (not (zerop code)) "expected non-zero exit, got ~A" code)
       (is (or (search "config file not found" err)
               (search "ota-server"             err))))))
+
+;; ---------------------------------------------------------------------------
+;; gc subcommand -- v1.1.1 wired the CLI to the real
+;; ota-server.workers:gc-software (was a stub).
+;; ---------------------------------------------------------------------------
+
+(test cli-gc-without-software-exits-2
+  "`ota-server gc` without --software prints a usage-style error
+to stderr and exits with code 2."
+  (when (%binary-exists-p)
+    (multiple-value-bind (out err code) (%run-server '("gc"))
+      (declare (ignore out))
+      (is (= 2 code) "expected exit 2, got ~A" code)
+      (is (search "--software"  err))
+      (is (search "required"    err)))))
+
+(test cli-gc-runs-against-empty-catalogue
+  "`ota-server gc --software=NAME` against a freshly-migrated empty
+catalogue runs successfully and reports `pruned=0`.  This is the
+`make sure the wiring works' test; deeper GC behaviour is covered
+by ota-server.workers tests + the e2e ops.sh script."
+  (when (%binary-exists-p)
+    (let* ((root (uiop:ensure-directory-pathname
+                  (merge-pathnames
+                   (format nil "ota-cli-gc-~A/" (random 1000000))
+                   (uiop:temporary-directory))))
+           (cfg  (merge-pathnames "ota.toml" root)))
+      (ensure-directories-exist root)
+      (unwind-protect
+           (progn
+             (with-open-file (out cfg :direction :output
+                                      :if-exists :supersede)
+               (format out "[server]~%data_dir = \"~A\"~%" (namestring root)))
+             ;; Migrate first so the db file exists.
+             (multiple-value-bind (mout merr mcode)
+                 (%run-server (list "migrate"
+                                    (concatenate 'string "--config="
+                                                 (namestring cfg))))
+               (declare (ignore mout merr))
+               (is (= 0 mcode) "migrate setup failed with exit ~A" mcode))
+             (multiple-value-bind (out err code)
+                 (%run-server (list "gc"
+                                    (concatenate 'string "--config="
+                                                 (namestring cfg))
+                                    "--software=test-empty"))
+               (declare (ignore err))
+               (is (= 0 code) "gc exit=~A stdout=~A" code out)
+               (is (search "pruned=0"               out))
+               (is (search "software=test-empty"    out))))
+        (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
+
+(test cli-gc-honours-dry-run-flag
+  "`--dry-run` is reflected in the printed summary and the audit log."
+  (when (%binary-exists-p)
+    (let* ((root (uiop:ensure-directory-pathname
+                  (merge-pathnames
+                   (format nil "ota-cli-gc-dry-~A/" (random 1000000))
+                   (uiop:temporary-directory))))
+           (cfg  (merge-pathnames "ota.toml" root)))
+      (ensure-directories-exist root)
+      (unwind-protect
+           (progn
+             (with-open-file (out cfg :direction :output
+                                      :if-exists :supersede)
+               (format out "[server]~%data_dir = \"~A\"~%" (namestring root)))
+             (multiple-value-bind (out err code)
+                 (%run-server (list "migrate"
+                                    (concatenate 'string "--config="
+                                                 (namestring cfg))))
+               (declare (ignore out err))
+               (is (= 0 code)))
+             (multiple-value-bind (out err code)
+                 (%run-server (list "gc"
+                                    (concatenate 'string "--config="
+                                                 (namestring cfg))
+                                    "--software=dry-test"
+                                    "--dry-run"))
+               (declare (ignore err))
+               (is (= 0 code))
+               (is (search "dry-run=true" out)
+                   "expected dry-run=true in summary, got: ~A" out)))
+        (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))

@@ -293,6 +293,37 @@ hostname = \"from-pathname\"
   (signals ota-server.config:config-error
     (ota-server.config:resolve-config '("host" "x" "port" 1))))
 
+;; ---------------------------------------------------------------------------
+;; admin_token from TOML (v1.1.1: closes the gap that operations.org
+;; documented but the loader never delivered -- prior to this, the
+;; key was silently ignored and only OTA_ADMIN_TOKEN worked).
+;; ---------------------------------------------------------------------------
+
+(test toml-admin-token
+  "[server].admin_token populates :admin-token in the resolved plist."
+  (let ((cfg (load-toml-as-plist "[server]
+admin_token = \"production-secret-XYZ\"
+")))
+    (is (equal "production-secret-XYZ" (getf cfg :admin-token)))))
+
+(test toml-admin-token-default-when-absent
+  "When [server].admin_token is missing, :admin-token falls through
+to *DEFAULTS*'s value (the dev-token)."
+  (let ((cfg (load-toml-as-plist "")))
+    (is (equal "dev-token" (getf cfg :admin-token)))))
+
+(test env-admin-token-overrides-toml-value
+  "The OTA_ADMIN_TOKEN env-var wins over [server].admin_token in TOML
+(env always trumps file, per the documented precedence)."
+  (let* ((file (ota-server.config:load-config-from-file
+                (write-toml-tmp "[server]
+admin_token = \"from-file\"
+")))
+         (cfg (ota-server.config:apply-env-overrides
+               file
+               :getenv (env-stub '(("OTA_ADMIN_TOKEN" . "from-env"))))))
+    (is (equal "from-env" (getf cfg :admin-token)))))
+
 (test resolve-precedence-file-then-env
   "When a file AND env-vars are present, env-vars win."
   (let* ((path (write-toml-tmp "[server]

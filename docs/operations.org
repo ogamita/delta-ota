@@ -221,16 +221,16 @@ Resolution order, lowest precedence first
 
 1. *Built-in default* =dev-token= (=*defaults*=).  Convenient for
    local development; *never* acceptable in production.
-2. *TOML configuration file* — currently *not* mapped.  An
-   =admin_token= key in =ota.toml= is ignored today.  This is a
-   known gap (the loader only reads =[server]/[tls]/[storage]/
-   [catalogue]/[patcher]/[gc]/[install_token]= keys; admin token
-   has no TOML key in v1).
+2. *TOML configuration file*: =[server].admin_token= (since v1.1.1).
+   The sample TOMLs ship with the line commented out; uncomment
+   and set when env-vars aren't a good fit.  Avoid committing the
+   resulting file -- the secret is in plain text.
 3. *Environment variable* =OTA_ADMIN_TOKEN= — always wins when set.
-   This is the only supported way to set a non-default token in v1.
+   Recommended for production (keeps the secret out of files
+   under git or backup).
 
-In practice this means: *to set a real production token, set
-=OTA_ADMIN_TOKEN= in the environment of the server process.*
+In practice: env-var first when you can, TOML file when you
+must, default only for local dev.
 
 | Deployment       | Where to set =OTA_ADMIN_TOKEN=                                                |
 |------------------+-------------------------------------------------------------------------------|

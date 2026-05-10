@@ -30,6 +30,13 @@ log_level  = "info"
 # upgrades).  Defaults to 4 when omitted.
 worker_num = 4
 
+# Admin bearer token. Required for every endpoint under /v1/admin/.
+# Either set OTA_ADMIN_TOKEN in the environment (recommended -- avoids
+# storing the secret in a config file under git or backup) OR set the
+# value here.  Env-var wins when both are set.  See operations.org
+# section "Authentication" for rotation procedure.
+# admin_token = "REPLACE-ME-WITH-A-RANDOM-32-BYTE-HEX-STRING"
+
 [tls]
 # Uncomment when terminating TLS in the server itself (no proxy).
 # cert         = "/etc/ota/server.crt"

@@ -631,7 +631,7 @@ that are not wired up; today they print
 
 ** ota-server — incomplete subcommands and gaps
 
-- [ ] *=ota-server gc= CLI subcommand is a stub*
+- [X] *=ota-server gc= CLI subcommand is a stub* — landed in v1.1.1.
   ([[file:../server/src/main.lisp::126][main.lisp:126]]).  The actual GC logic is fully
   implemented at the HTTP layer (=POST /v1/admin/software/<sw>/gc=
   with =dry_run / min_user_count / min_age_days= per
@@ -640,7 +640,7 @@ that are not wired up; today they print
   =ota-server.workers.operations:run-gc= for an offline /
   cron-friendly invocation that doesn't go through HTTP.  Ship
   target: v1.0.x.
-- [ ] *TOML =[server].admin_token= key is not read by the loader.*
+- [X] *TOML =[server].admin_token= key is not read by the loader.* — landed in v1.1.1.
   Documented as a gap in operations.org and the CHANGELOG;
   operators must set =OTA_ADMIN_TOKEN= via env (or systemd's
   =EnvironmentFile=).  Wiring it through =load-config-from-file=
@@ -718,7 +718,7 @@ implemented":
 
 ** libota — dead code to remove
 
-- [ ] *=ErrNotImplemented= is defined but no entry point uses it*
+- [X] *=ErrNotImplemented= is defined but no entry point uses it* — deleted in v1.1.1.
   ([[file:../client/libota/libota.go::29][libota.go:29-30]]).  All five C ABI exports
   (=ota_install / ota_upgrade / ota_revert / ota_version /
   ota_last_error=) are real.  Either delete the dead var or

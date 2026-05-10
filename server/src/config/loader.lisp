@@ -110,7 +110,8 @@ applied here — call APPLY-ENV-OVERRIDES on the result."
                                                (getf defaults :log-level))
          :worker-num                (%toml-get server  "worker_num"
                                                (getf defaults :worker-num))
-         :admin-token               (getf defaults :admin-token)
+         :admin-token               (%toml-get server  "admin_token"
+                                               (getf defaults :admin-token))
          :tls-cert                  (%toml-get tls     "cert")
          :tls-key                   (%toml-get tls     "key")
          :tls-client-ca             (%toml-get tls     "client_ca")

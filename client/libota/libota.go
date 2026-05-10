@@ -26,9 +26,6 @@ import (
 
 const Version = "0.1.0-phase1"
 
-// ErrNotImplemented is returned from API entry points still pending.
-var ErrNotImplemented = errors.New("libota: not implemented yet")
-
 // Config drives an Install. ServerURL is mandatory; OTAHome
 // defaults to ~/.ota; TrustedPubKeys gates which signing keys we
 // accept (hex-encoded). Empty TrustedPubKeys means trust-on-first-use:
