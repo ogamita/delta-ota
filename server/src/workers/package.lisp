@@ -9,6 +9,13 @@
            ;; phase-5
            #:gc-software
            #:verify-storage
-           #:resign-manifests))
+           #:resign-manifests
+           ;; v1.2: async patch-build worker pool
+           #:patch-pool
+           #:make-patch-pool
+           #:start-patch-pool
+           #:stop-patch-pool
+           #:notify-patch-pool
+           #:enqueue-patches-for-release))
 
 (in-package #:ota-server.workers)

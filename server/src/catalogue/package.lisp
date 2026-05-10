@@ -36,6 +36,14 @@
            #:list-patches-by-from-or-to
            #:count-releases-using-blob
            ;; phase-6
-           #:mark-uncollectable))
+           #:mark-uncollectable
+           ;; v1.2 — async patch-build worker pool
+           #:enqueue-patch-job
+           #:claim-next-patch-job
+           #:complete-patch-job
+           #:fail-patch-job
+           #:list-patch-jobs-for-release
+           #:count-patch-jobs
+           #:reset-stale-running-jobs))
 
 (in-package #:ota-server.catalogue)

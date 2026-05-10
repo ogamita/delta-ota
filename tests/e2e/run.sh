@@ -68,6 +68,13 @@ cat > "${run_dir}/run-server.lisp" <<EOF
   (with-open-file (out (merge-pathnames "pubkey.hex" root)
                        :direction :output :if-exists :supersede)
     (write-string (ota-server.manifest:keypair-public-hex kp) out))
+  ;; v1.2: reset stale running jobs from any prior run, then start the
+  ;; async patch-build worker pool.  Wiring it here exercises the new
+  ;; architecture; without it the publish handler falls back to the
+  ;; legacy synchronous fan-in (which is also still tested).
+  (ota-server.catalogue:reset-stale-running-jobs db)
+  (setf (ota-server.http::app-state-pool state)
+        (ota-server.workers:start-patch-pool cas db :size 2))
   (ota-server.http:start-server state :host "127.0.0.1" :port ${OTA_PORT})
   (format t "ota-server: ready on port ${OTA_PORT}~%")
   (force-output)

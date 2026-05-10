@@ -21,7 +21,11 @@
   ;; KEY = client_id|"admin"|"anon-<ip>", VALUE = (cons tokens last-refill).
   (rate-buckets (make-hash-table :test 'equal :synchronized t))
   (rate-capacity 600)              ; tokens
-  (rate-refill-per-sec 10))        ; tokens/sec
+  (rate-refill-per-sec 10)         ; tokens/sec
+  ;; v1.2: async patch-build worker pool (workers/pool.lisp).  NIL when
+  ;; the legacy synchronous fan-in is wanted (some tests, the e2e
+  ;; harness if not yet updated).
+  pool)
 
 (defparameter *app* nil)
 
@@ -542,11 +546,18 @@ incrementally — typically a small fraction of the full payload.</small></p>
                                                  osversions sha size manifest-bytes
                                                  manifest-sha sig notes)
   "Post-INSERT-RELEASE-IF-NEW work: write manifest to disk, append
-audit, run patch fan-in (emitting per-patch progress via EMIT's
-:on-progress hook), re-sign manifest with patches_in, and emit
-the final {:event :done …}.  Called only when the row was newly
-inserted (the :inserted branch of the publish handler) -- so we
-never touch disk for an idempotent re-publish or a 409 conflict.
+audit, enqueue patch jobs, tail them to emit per-patch progress, and
+re-sign the manifest with `patches_in` once they are all done.
+
+v1.2 architecture: the bsdiff invocations themselves run in the async
+worker pool (workers/pool.lisp), not in this thread — we just enqueue
+N jobs and watch the catalogue for completion.  When the pool is NIL
+(some tests / out-of-tree callers), we fall back to the legacy
+synchronous fan-in via BUILD-PATCHES-FOR-RELEASE.
+
+Called only when the row was newly inserted (the :inserted branch of
+the publish handler) — so we never touch disk for an idempotent
+re-publish or a 409 conflict.
 
 EMIT is a one-arg function called with a plist per event."
   (let ((mdir (app-state-manifests-dir app)))
@@ -564,21 +575,28 @@ EMIT is a one-arg function called with a plist per event."
                         :release-id release-id
                         :blob-sha256 sha :blob-size size
                         :manifest-sha256 manifest-sha))
-    ;; Patch fan-in.  Failures don't roll back the publish: the full
-    ;; blob is always available as fallback.
-    (let* ((built (handler-case
-                      (ota-server.workers:build-patches-for-release
-                       (app-state-cas app)
-                       (app-state-catalogue app)
-                       :software software :os os :arch arch
-                       :new-version version
-                       :new-release-id release-id
-                       :new-blob-sha sha
-                       :on-progress emit)
-                    (error (e)
-                      (format *error-output* "publish: patch build failed: ~A~%" e)
-                      nil)))
-           (patches-in built)
+    ;; Patch fan-in.  Two paths:
+    ;;   - Pool present (production): enqueue N jobs and tail the
+    ;;     PATCH_JOBS table for completion events.
+    ;;   - Pool absent (legacy / some tests): run synchronously inline.
+    ;; Failures don't roll back the publish: the full blob is always
+    ;; available as fallback.
+    (let* ((patches-in
+             (handler-case
+                 (cond
+                   ((app-state-pool app)
+                    (%fan-in-via-pool app emit
+                                      :software software :os os :arch arch
+                                      :version version :release-id release-id
+                                      :new-blob-sha sha))
+                   (t
+                    (%fan-in-synchronous app emit
+                                         :software software :os os :arch arch
+                                         :version version :release-id release-id
+                                         :new-blob-sha sha)))
+               (error (e)
+                 (format *error-output* "publish: patch build failed: ~A~%" e)
+                 nil)))
            (final-manifest-sha manifest-sha))
       (when patches-in
         (let* ((mp (ota-server.manifest:build-manifest-plist
@@ -608,6 +626,101 @@ EMIT is a one-arg function called with a plist per event."
                           :blob-sha256 sha :blob-size size
                           :manifest-sha256 final-manifest-sha
                           :patches-built (length patches-in))))))
+
+(defun %fan-in-synchronous (app emit &key software os arch version
+                                          release-id new-blob-sha)
+  "Legacy v1.0–v1.1 path: bsdiff runs inline in this thread."
+  (let ((built (ota-server.workers:build-patches-for-release
+                (app-state-cas app)
+                (app-state-catalogue app)
+                :software software :os os :arch arch
+                :new-version version
+                :new-release-id release-id
+                :new-blob-sha new-blob-sha
+                :on-progress emit)))
+    built))
+
+(defparameter *publish-tail-poll-secs* 0.2
+  "How often the publish handler queries the catalogue for patch-job
+completion when streaming progress to the client.  Smaller =
+snappier progress events at the cost of more SQLite reads; this
+value is fast enough that the user-visible UX matches the v1.1.1
+inline-callback path.")
+
+(defun %fan-in-via-pool (app emit &key software os arch version
+                                       release-id new-blob-sha)
+  "v1.2 path: enqueue one job per prior release, then tail the
+PATCH_JOBS table for state transitions and emit per-patch events.
+Returns the patches_in list (only successful jobs) when all jobs
+have reached a terminal state."
+  (let* ((catalogue (app-state-catalogue app))
+         (enqueued (ota-server.workers:enqueue-patches-for-release
+                    catalogue
+                    :software software :os os :arch arch
+                    :new-version version
+                    :new-release-id release-id
+                    :new-blob-sha new-blob-sha))
+         (total (length enqueued)))
+    (when (plusp total)
+      (funcall emit (list :event :patches-started :total total))
+      (ota-server.workers:notify-patch-pool (app-state-pool app)))
+    (cond
+      ((zerop total) nil)
+      (t
+       (%tail-patch-jobs app emit
+                         :release-id release-id
+                         :total total)))))
+
+(defun %tail-patch-jobs (app emit &key release-id total)
+  "Poll PATCH_JOBS for RELEASE-ID until all rows are in a terminal
+state (done|failed), emitting :patch-built events for each fresh
+completion (in the order the jobs were enqueued).  Returns the list
+of plists for the successful patches, ready to be embedded as the
+manifest's `patches_in`."
+  (let ((catalogue (app-state-catalogue app))
+        (seen     (make-hash-table :test 'eql))
+        (i 0))
+    (loop
+      (let* ((rows (ota-server.catalogue:list-patch-jobs-for-release
+                    catalogue release-id))
+             (still-pending 0))
+        (dolist (job rows)
+          (let ((id     (getf job :id))
+                (status (getf job :status)))
+            (cond
+              ((or (string= status "pending") (string= status "running"))
+               (incf still-pending))
+              ((gethash id seen) nil)
+              (t
+               ;; First time we see this job in a terminal state.
+               (setf (gethash id seen) t)
+               (incf i)
+               (cond
+                 ((string= status "done")
+                  (funcall emit
+                           (list :event :patch-built
+                                 :i i :total total
+                                 :from (getf job :from-version)
+                                 :sha  (getf job :patch-sha256)
+                                 :size (getf job :patch-size))))
+                 (t
+                  (funcall emit
+                           (list :event :patch-failed
+                                 :i i :total total
+                                 :from (getf job :from-version)
+                                 :error (or (getf job :error) "unknown")))))))))
+        (when (zerop still-pending)
+          (let ((built '()))
+            (dolist (job rows)
+              (when (string= (getf job :status) "done")
+                (push (list :from (getf job :from-version)
+                            :sha256 (getf job :patch-sha256)
+                            :size   (getf job :patch-size)
+                            :patcher (getf job :patcher))
+                      built)))
+            (funcall emit (list :event :patches-done :built (length built)))
+            (return-from %tail-patch-jobs (nreverse built))))
+        (sleep *publish-tail-poll-secs*)))))
 
 (defun handle-admin-publish-release (app env params)
   "Single-blob uploader: request body is the binary blob, metadata in

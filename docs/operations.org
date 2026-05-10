@@ -148,25 +148,36 @@ Single TOML file (=ota.toml=).  Reload requires a restart for v1.
 | =[storage]=        | =backend=       | =fs=                   | =fs= (only one in v1) |
 | =[patcher]=        | =default=       | =bsdiff=               | bsdiff is the only patcher in v1 (ADR-0004) |
 | =[patcher]=        | =bsdiff_path=   | =/opt/ota/bin/bsdiff=  | absolute path; never =$PATH= |
+| =[patcher]=        | =worker_count=  | =2=                    | size of the async patch-build worker pool (ADR-0007) |
 
 Environment-variable overrides: =OTA_HOST=, =OTA_PORT=, =OTA_ROOT=,
-=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=, =OTA_WORKER_NUM=.
+=OTA_ADMIN_TOKEN=, =OTA_TLS_CERT=, =OTA_TLS_KEY=, =OTA_WORKER_NUM=,
+=OTA_PATCH_WORKERS=.
 Env-vars take precedence over the TOML file (see
 [[file:../server/src/config/loader.lisp][loader.lisp]]).
 
-On startup the server prints its version, the bound address, and
-the number of worker threads it actually engaged.  Sample:
+On startup the server prints its version, the bound address, the
+number of HTTP worker threads, and the number of patch-build worker
+threads it engaged.  Sample (since v1.2):
 
 #+begin_example
-ota-server 1.0.4
-listening on 127.0.0.1:8443 (4 worker threads)
+patch-pool: 2 worker threads started
+ota-server 1.2.0
+listening on 127.0.0.1:8443 (4 http worker threads, 2 patch workers)
 data_dir=/var/lib/ota/
 manifest pubkey=…
+ota-server: ready.
 #+end_example
 
-If "(N worker threads)" reads "(1 worker thread)" you are on a
-single-threaded loop and a long publish will block every other
+If "(N http worker threads)" reads "(1 http worker thread)" you are
+on a single-threaded loop and a long publish will block every other
 request -- bump =[server].worker_num= or set =OTA_WORKER_NUM=.
+
+If the boot also prints =patch-pool: reset N stale running jobs
+from a previous run= it means the previous process died mid-bsdiff;
+those jobs were moved back to =pending= and the new pool will
+re-run them.  =bsdiff= is deterministic and the patches table dedups
+on (from, to, patcher), so the recovery is idempotent.
 
 * Concurrency model
 
@@ -199,11 +210,18 @@ Sizing guidance:
 | Behind a reverse proxy doing TLS    | ≈ proxy concurrency limit                        |
 
 The patcher worker count is *separate*: =[patcher].worker_count=
-governs how many concurrent =bsdiff(1)= subprocesses the publish
-handler is willing to spawn.  Today the patch build inside
-=publish= is still synchronous in the calling thread (one worker
-per in-flight publish); =worker_num= simply ensures other
-requests stay responsive while it runs.
+governs how many concurrent =bsdiff(1)= subprocesses the *async
+worker pool* will run (default 2; ADR-0007).  Since v1.2 the
+publish handler enqueues one job per prior release into a
+persistent queue (=patch_jobs= table) and the pool drains it; the
+publish handler itself only tails the queue to emit progress
+events on the NDJSON response.  This means a long publish does
+*not* pin a Woo HTTP worker for the duration of bsdiff; HTTP and
+patch-CPU scale independently.
+
+Tune =worker_count= to roughly =CPU/2= on a dedicated host so the
+pool can saturate cores during a publish-storm catch-up without
+starving HTTP.  Override per process with =OTA_PATCH_WORKERS=.
 
 * Authentication — the admin token
 

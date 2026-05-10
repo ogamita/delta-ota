@@ -654,14 +654,23 @@ that are not wired up; today they print
   read-timeout knob added in v1.0.4.  Touches the publish
   handler, the patcher worker (callback hook), and =ota-admin=
   (stream consumer).  Ship target: v1.1.
-- [ ] *Async patch-build worker pool (job queue).*  The
-  patcher's preamble notes
-  ([[file:../server/src/workers/patcher.lisp::7][patcher.lisp:7]]) that the
-  proper async worker pool with a Postgres-backed job queue
-  lands in phase 5; today the bsdiff fan-in runs synchronously
-  in the publish handler thread.  Multi-worker Woo (v1.0.4)
-  prevents wedging the server, but a really long publish still
-  occupies a worker for the duration.  Ship target: v1.1.
+- [X] *Async patch-build worker pool (job queue).* — landed in v1.2.0.
+  Persistent =patch_jobs= table in the catalogue
+  ([[file:../server/src/catalogue/migrations/0004_patch_jobs.sql][migrations/0004_patch_jobs.sql]])
+  consumed by a fixed-size pool of bordeaux-threads workers
+  ([[file:../server/src/workers/pool.lisp][workers/pool.lisp]]).
+  Publish handler enqueues one job per prior release and tails the
+  table to emit the same NDJSON event sequence =ota-admin= already
+  reads.  Restart-safe: =reset-stale-running-jobs= at boot moves any
+  orphaned =running= row back to =pending=, the pool re-claims it,
+  and =insert-patch='s dedup on (from, to, patcher) makes the retry
+  idempotent.  Cross-process atomicity inherits from ADR-0006 via
+  =BEGIN IMMEDIATE= around the claim.  Pool size is
+  =[patcher].worker_count= (default 2) or =OTA_PATCH_WORKERS=.  See
+  [[file:adr/0007-async-patch-build-worker-pool.org][ADR-0007]] for
+  the full design and the alternatives that were rejected.  The
+  same surface will back the future PostgreSQL driver — that
+  becomes a driver swap, not a redesign.
 
 ** Backends still on the v1 minimum
 
