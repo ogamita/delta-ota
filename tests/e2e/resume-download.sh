@@ -132,34 +132,36 @@ fi
 
 blob_url="http://127.0.0.1:${OTA_PORT}/v1/blobs/${blob_sha}"
 
-# --- (3) Interrupted GET: pipe curl through `head -c N` so the cut
-# point is deterministic regardless of network speed.  `head -c N`
-# reads exactly N bytes from stdin and exits; the next write from
-# curl gets EPIPE and curl exits.  The .part file ends up with
-# exactly N bytes -- no timing dependency, no flakiness on fast
-# loopback.
+# --- (3) Stage the "partial download" using a Range request to
+# fetch the first half of the blob, deterministically.  This is
+# what an interrupted full download would leave on disk; the
+# client's resume-decision logic is covered by the Go unit tests
+# (see client/internal/transport/transport_test.go) and isn't
+# what we're exercising here -- the e2e is verifying the
+# *server's* Range handler under realistic conditions.
 #
-# We previously tried `curl --limit-rate 100K --max-time 0.5`, but
-# on GitLab's fast saas runner the rate-limiter wasn't enforced
-# before the whole 4 MiB blob came down -- the test was racing
-# the network and losing.  See ADR-0008 for the resume design;
-# this is purely a test-harness fix.
+# Prior versions of this script tried to simulate an interrupted
+# download with `curl --limit-rate 100K --max-time 0.5s` or a
+# `curl | head -c N` pipe.  The first was flaky on fast CI
+# runners (the rate-limiter didn't engage before the whole 4 MiB
+# came down); the second tripped on `set -o pipefail` portability
+# differences between bash and the runner's /bin/sh.  Range-based
+# fetch needs neither.
 cut=$((blob_size / 2))
 part="${run_dir}/blob.part"
-echo "tests/e2e/resume: starting interrupted GET (cutting at byte ${cut} of ${blob_size})..."
-# head's early-close SIGPIPEs curl; that's by design.  We use -s
-# (silent, also silences the resulting "Failure writing output"
-# stderr message) and discard the pipe-status -- the assertion
-# is on part_size, not on curl's exit code.
-set +o pipefail 2>/dev/null || true
-curl -s "${blob_url}" 2>/dev/null | head -c "${cut}" > "${part}"
-set -o pipefail 2>/dev/null || true
-part_size=$(wc -c < "${part}" | tr -d ' ')
-echo "tests/e2e/resume: interrupted at ${part_size} bytes"
-if [ "${part_size}" -ne "${cut}" ]; then
-    echo "tests/e2e/resume: ✗ expected exactly ${cut} bytes, got ${part_size}"
+echo "tests/e2e/resume: staging first half via Range: bytes=0-$((cut-1))..."
+http_status=$(curl -sS -o "${part}" -w '%{http_code}' \
+                   -H "Range: bytes=0-$((cut-1))" "${blob_url}")
+if [ "${http_status}" != "206" ]; then
+    echo "tests/e2e/resume: ✗ first-half request returned HTTP ${http_status}, want 206"
     exit 1
 fi
+part_size=$(wc -c < "${part}" | tr -d ' ')
+if [ "${part_size}" -ne "${cut}" ]; then
+    echo "tests/e2e/resume: ✗ first-half landed ${part_size} bytes, want ${cut}"
+    exit 1
+fi
+echo "tests/e2e/resume: ✓ first half: ${part_size} bytes"
 
 # --- (4) Resume with Range: bytes=N-
 echo "tests/e2e/resume: resuming with Range: bytes=${part_size}-"

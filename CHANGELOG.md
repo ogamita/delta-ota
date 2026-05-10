@@ -20,18 +20,28 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Fixed
+- **`tests/e2e/resume-download.sh` still broken on CI after 1.4.1.**
+  1.4.1's `curl | head -c N` pipe tripped on `set -o pipefail`
+  portability between bash and the runner's `/bin/sh` (dash) —
+  the script silently exited at the pipeline step. Replaced the
+  pipe trick with a Range-based fetch: the test now stages the
+  "partial download" by issuing `Range: bytes=0-N-1` directly.
+  This is what the server's Range handler does anyway —
+  exercising it from byte 0 instead of byte N covers the same
+  surface, with no timing or pipe-portability assumptions.
+  Verified under bash AND dash locally. No production-code change.
+
+## [1.4.1] - 2026-05-10
+
+### Fixed
 - **`tests/e2e/resume-download.sh` flaky on fast CI runners.** The
-  interrupt was implemented with `curl --limit-rate 100K
-  --max-time 0.5s`, which assumed the rate-limiter would kick in
-  before 4 MiB came down. On GitLab's saas runners it didn't —
-  the whole blob transferred in under 500 ms and the test
-  reported "download somehow finished within max-time". Replaced
-  the timing-based cut with a `curl | head -c N` pipe: `head`
-  reads exactly N bytes and exits, curl gets EPIPE on the next
-  write, the `.part` file has exactly N bytes regardless of
-  network speed. No production-code change; resume itself was
-  never broken — ADR-0008's design works fine, the test
-  harness was wrong.
+  v1.4.0 interrupt used `curl --limit-rate 100K --max-time 0.5s`,
+  which assumed the rate-limiter would kick in before 4 MiB came
+  down. On GitLab's saas runner it didn't — the whole blob
+  transferred in under 500 ms and the test reported "download
+  somehow finished within max-time". Replaced the timing-based
+  cut with a `curl | head -c N` pipe. **This fix subsequently
+  failed on the CI shell (dash) — see 1.4.2's entry above.**
 
 ## [1.4.0] - 2026-05-10
 
