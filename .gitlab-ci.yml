@@ -252,6 +252,7 @@ e2e:
     - tests/e2e/admin-identity.sh
     - tests/e2e/client-state.sh
     - tests/e2e/stats.sh
+    - tests/e2e/lazy-upgrade.sh
   artifacts:
     when: always
     paths:
@@ -265,6 +266,7 @@ e2e:
       - tests/e2e/run-admin-identity/logs/
       - tests/e2e/run-client-state/logs/
       - tests/e2e/run-stats/logs/
+      - tests/e2e/run-lazy-upgrade/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

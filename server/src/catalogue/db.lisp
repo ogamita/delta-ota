@@ -655,9 +655,7 @@ filters may be NIL to widen the match.  Used by the admin stats
 catalogue (workers/stats.lisp); rate-limited at the HTTP layer
 because a no-filter scan can return the whole fleet."
   (with-catalogue (db catalogue)
-    (let ((sql "SELECT client_id, software_name, current_release_id, ~
-                       previous_release_id, last_kind, last_updated_at ~
-                  FROM client_software_state WHERE 1=1")
+    (let ((sql "SELECT client_id, software_name, current_release_id, previous_release_id, last_kind, last_updated_at FROM client_software_state WHERE 1=1")
           (args '()))
       (when client-id
         (setf sql (concatenate 'string sql " AND client_id = ?"))
@@ -685,6 +683,46 @@ because a no-filter scan can return the whole fleet."
     (caar (sqlite:execute-to-list
            db "SELECT COUNT(*) FROM releases WHERE blob_sha256 = ?"
            blob-sha256))))
+
+(defun get-patch-by-tuple (catalogue from-release-id to-release-id
+                           &key (patcher "bsdiff"))
+  "Look up an existing patch by (from, to, patcher).  Returns the
+patch plist or NIL.  Used by the v1.6 lazy-upgrade endpoint to
+decide whether to build on demand."
+  (with-catalogue (db catalogue)
+    (let ((rows (sqlite:execute-to-list
+                 db
+                 "SELECT sha256, from_release_id, to_release_id, patcher, size, built_at FROM patches WHERE from_release_id = ? AND to_release_id = ? AND patcher = ?"
+                 from-release-id to-release-id patcher)))
+      (when rows
+        (destructuring-bind (sha from to p size built-at) (first rows)
+          (list :sha256 sha :from-release-id from :to-release-id to
+                :patcher p :size size :built-at built-at))))))
+
+(defun list-patches-for-software (catalogue software-name)
+  "Return every patch row whose endpoints belong to releases of
+SOFTWARE-NAME.  Used by the v1.6 reachability-aware GC to build
+the patches graph in one query rather than N round-trips through
+LIST-PATCHES-BY-FROM-OR-TO.  Result rows are
+plists :SHA256 :FROM-RELEASE-ID :TO-RELEASE-ID :PATCHER :SIZE.
+
+The join restricts to patches whose `to_release_id` belongs to
+the software; since the fan-in is forward-only and bidirectional
+patches don't exist outside of `admin-build-reverse-patch`, this
+captures every edge in the software's upgrade graph."
+  (with-catalogue (db catalogue)
+    (mapcar (lambda (row)
+              (destructuring-bind (sha from-id to-id patcher size) row
+                (list :sha256 sha :from-release-id from-id
+                      :to-release-id to-id :patcher patcher :size size)))
+            (sqlite:execute-to-list
+             db
+             "SELECT DISTINCT p.sha256, p.from_release_id, p.to_release_id,
+                              p.patcher, p.size
+                FROM patches p
+                JOIN releases r ON r.release_id = p.to_release_id
+               WHERE r.software_name = ?"
+             software-name))))
 
 (defun list-patches-by-from-or-to (catalogue release-id)
   (with-catalogue (db catalogue)

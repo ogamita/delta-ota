@@ -12,49 +12,111 @@
 
 (defun gc-software (cas catalogue keypair manifests-dir
                     &key software (min-user-count 0) (min-age-days 30)
-                         (window-days 180) dry-run)
+                         (window-days 180) dry-run
+                         (ensure-reachability t) (allow-blob-fallback nil)
+                         (max-built-edges 50) (fallback-ratio 0.7))
   "Garbage-collect expendable releases for SOFTWARE.
 
-   A release is pruned when ALL of these hold:
-     - it is not marked uncollectable;
-     - it is not the latest published release;
-     - count-users-at-release(...) <= MIN-USER-COUNT in the recency
-       WINDOW-DAYS;
-     - it has been published longer than MIN-AGE-DAYS.
+A release is on the candidate-drop list when ALL of these hold:
+  - it is not marked uncollectable;
+  - it is not the highest-semver visible release;
+  - count-users-at-release(...) ≤ MIN-USER-COUNT in the recency
+    WINDOW-DAYS;
+  - it has been published longer than MIN-AGE-DAYS.
 
-   Pruning drops the release row, every patch touching it (whether
-   from or to), the manifest .json/.sig pair, and the blob — but
-   only if no surviving release still references the blob's sha.
+v1.6 (reachability layer): with ENSURE-REACHABILITY = T (default),
+the GC first computes a plan partitioning every active client by
+how the simulated drop set affects them, and pre-builds the
+minimum set of `from -> target` patches needed to keep
+blob-fallback clients on a delta path.  When the plan needs more
+than MAX-BUILT-EDGES new patches, the GC refuses to proceed
+unless ALLOW-BLOB-FALLBACK is T -- in that case affected clients
+will fall back to a full-blob download on their next upgrade.
 
-   Returns a plist:
-     (:pruned (release-id ...) :kept-blobs (sha ...) :dry-run BOOL)"
+Returns a plist:
+  :pruned          list of release-ids actually dropped
+  :kept-blobs      list of blob shas kept (still referenced)
+  :dry-run         BOOLEAN
+  :reachability    plist :clients-by-fate :edges-built :edges-to-build
+                          :blocked-clients (when ENSURE-REACHABILITY)"
   (let* ((releases (ota-server.catalogue:list-releases catalogue software))
-         (latest   (first releases))   ; list-releases is published_at DESC
+         (latest-rid
+           (let ((r (ota-server.catalogue:highest-semver-release releases)))
+             (and r (getf r :release-id))))
          (now-univ (get-universal-time))
          (min-age-secs (* min-age-days 86400))
-         (pruned '())
-         (kept-blobs '()))
+         (candidates '()))
     (dolist (rel releases)
       (let* ((rid (getf rel :release-id))
-             (vers (getf rel :version))
              (uncollectable (getf rel :uncollectable))
              (published (getf rel :published-at))
              (age (- now-univ (parse-iso8601 published)))
              (users (ota-server.catalogue:count-users-at-release
                      catalogue software rid :window-days window-days)))
-        (cond
-          (uncollectable          nil)        ; keep
-          ((eq rel latest)        nil)        ; keep latest
-          ((< age min-age-secs)   nil)        ; too young
-          ((> users min-user-count) nil)      ; still in use
-          (t
-           (push rid pruned)
-           (unless dry-run
-             (drop-release cas catalogue keypair manifests-dir
-                           rel kept-blobs))))))
-    (list :pruned (nreverse pruned)
-          :kept-blobs kept-blobs
-          :dry-run (if dry-run t nil))))
+        (when (and (not uncollectable)
+                   (not (and latest-rid (string= rid latest-rid)))
+                   (>= age min-age-secs)
+                   (<= users min-user-count))
+          (push rel candidates))))
+    (setf candidates (nreverse candidates))
+    (let ((drop-set (mapcar (lambda (r) (getf r :release-id)) candidates))
+          (reachability-info nil))
+      (when ensure-reachability
+        (let* ((client-positions
+                 (remove-if-not
+                  (lambda (s)
+                    (and (string= (getf s :software) software)
+                         (getf s :current-release-id)))
+                  (ota-server.catalogue:list-client-software-states
+                   catalogue :software software)))
+               (plan (ota-server.workers:compute-reachability-plan
+                      catalogue
+                      :software software
+                      :drop-set drop-set
+                      :client-positions client-positions
+                      :fallback-ratio fallback-ratio)))
+          (cond
+            ;; Refuse if the plan needs too many builds and the
+            ;; operator didn't authorise blob fallback.
+            ((and (not (ota-server.workers:reachability-plan-feasible-p
+                        plan max-built-edges))
+                  (not allow-blob-fallback))
+             (return-from gc-software
+               (list :pruned nil
+                     :kept-blobs nil
+                     :dry-run t
+                     :reachability
+                     (append plan
+                             (list :feasible-p nil
+                                   :edges-built 0
+                                   :error "edges-to-build exceeds max_built_edges"))
+                     :aborted t)))
+            ((and (not dry-run)
+                  (not allow-blob-fallback))
+             ;; Build the missing edges before any drop happens.
+             (let ((built (ota-server.workers:execute-reachability-builds
+                           cas catalogue plan)))
+               (setf reachability-info
+                     (append plan (list :feasible-p t
+                                        :edges-built built)))))
+            (t
+             ;; Dry-run OR allow-blob-fallback: don't build, just
+             ;; report what the plan would have done.
+             (setf reachability-info
+                   (append plan (list :feasible-p
+                                      (ota-server.workers:reachability-plan-feasible-p
+                                       plan max-built-edges)
+                                      :edges-built 0)))))))
+      (let ((pruned '()) (kept-blobs '()))
+        (dolist (rel candidates)
+          (push (getf rel :release-id) pruned)
+          (unless dry-run
+            (drop-release cas catalogue keypair manifests-dir
+                          rel kept-blobs)))
+        (list :pruned (nreverse pruned)
+              :kept-blobs kept-blobs
+              :dry-run (if dry-run t nil)
+              :reachability reachability-info)))))
 
 (defun parse-iso8601 (s)
   "Parse YYYY-MM-DDTHH:MM:SSZ into universal-time. Tolerant: any

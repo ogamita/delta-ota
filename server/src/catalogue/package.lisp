@@ -35,6 +35,8 @@
            #:delete-patches-touching
            #:list-patches-by-from-or-to
            #:count-releases-using-blob
+           #:list-patches-for-software
+           #:get-patch-by-tuple
            ;; phase-6
            #:mark-uncollectable
            ;; v1.2 — async patch-build worker pool

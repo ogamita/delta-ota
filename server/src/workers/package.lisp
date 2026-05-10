@@ -21,6 +21,11 @@
            #:list-stat-queries
            #:run-stat-query
            #:stats-error
-           #:*stats-catalogue*))
+           #:*stats-catalogue*
+           ;; v1.6: reachability-aware GC
+           #:shortest-patch-path
+           #:compute-reachability-plan
+           #:reachability-plan-feasible-p
+           #:execute-reachability-builds))
 
 (in-package #:ota-server.workers)

@@ -758,6 +758,84 @@ v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
 straightforward to add.  Ship target: a sub-phase, driven by the
 first customer who needs it.
 
+* Reachability-aware GC (since v1.6)
+
+=POST /v1/admin/software/<sw>/gc= now consults the v1.5
+client-software snapshot to make sure dropping a release doesn't
+strand any active client on a no-patch upgrade path.  For each
+client, Dijkstra over the patches graph computes the cheapest
+path to the highest-semver visible release; the simulated drop
+set partitions clients into four fates:
+
+| Fate              | Meaning                                                 |
+|-------------------+---------------------------------------------------------|
+| =unaffected=      | Cheapest path doesn't touch the drop set.               |
+| =graceful=        | Path changed but stays under the fallback-ratio cap.    |
+| =blob-fallback=   | No path under the cap; would download the full blob.    |
+| =unreachable=     | Client's =current= release is also in the drop set.     |
+
+For =blob-fallback= clients, the GC pre-builds the minimum set
+of direct =current → target= patches before dropping anything.
+ADR-0011 has the full design.
+
+** New GC flags
+
+| Body / CLI                | Default | Effect                                                  |
+|---------------------------+---------+---------------------------------------------------------|
+| =ensure_reachability=     | =true=  | Run the reachability layer.  =false= = v1.5 behaviour. |
+| =allow_blob_fallback=     | =false= | Proceed with drops even if pre-built edge count exceeds the cap; affected clients full-blob. |
+| =max_built_edges=         | =50=    | Refuse the GC entirely when more edges would be needed. |
+
+** Dry-run output
+
+=ota-server gc --software=myapp --dry-run= prints (in addition
+to the candidate drop list) a one-line reachability summary:
+
+#+begin_example
+ota-server gc: software=myapp pruned=4 dry-run=true min-user-count=0 min-age-days=30
+  reachability: unaffected=2847 graceful=42 blob-fallback=5 unreachable=0 edges-built=0
+  would prune  myapp/linux-x86_64/1.0.0
+  would prune  myapp/linux-x86_64/1.1.0
+  ...
+#+end_example
+
+When the plan needs more edges than =max-built-edges=, the GC
+aborts (exit code 3) with a message naming the count.  Re-run
+with =--max-built-edges=N= or =--allow-blob-fallback=.
+
+* Lazy upgrade-time patch build (since v1.6)
+
+=GET /v1/software/<sw>/upgrade?from=A&to=T= returns the patch ref
+for the A → T transition.  When the catalogue doesn't already
+have one (out-of-order publishes — a debug version inserted into
+an older release stream — leave gaps the original fan-in didn't
+cover), the server *builds the patch on demand* and serves it.
+
+Response:
+
+#+begin_src json
+{ "from": "1.2.1",  "to": "1.3",
+  "sha256": "...",  "size": 161,  "patcher": "bsdiff",
+  "url": "/v1/patches/...",
+  "built_on_demand": true }
+#+end_src
+
+=built_on_demand= tells the caller whether they paid for the
+build.  Subsequent callers see =false= (cached).  The first
+caller pays the bsdiff time — typically a few seconds for blobs
+up to 100 MB; tens of seconds for multi-GB blobs.
+
+** Operator pre-warming
+
+For deployments that publish out-of-order intentionally (debug
+versions inserted into a long-tail), operators can pre-warm the
+catalogue *before* the first client hits the gap, via the v1.0
+=POST /v1/admin/software/<sw>/patches/reverse= endpoint or by
+calling the lazy-upgrade endpoint with an admin bearer.  The
+audit log records every lazy build under =identity=system=,
+=action=lazy-build-patch=, so an operator can see which paths
+clients are exercising organically.
+
 * Fleet statistics (since v1.5)
 
 The =client_software_state= snapshot table tells the server who

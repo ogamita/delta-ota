@@ -248,6 +248,13 @@ closed automatically when EVENT-BUILDER returns or signals."
           (equal (first segments) "v1") (equal (second segments) "admin")
           (equal (third segments) "stats"))
      (values :admin-stats-run (list :query-name (fourth segments))))
+    ;; v1.6 — lazy upgrade-time patch build.
+    ;; GET /v1/software/<sw>/upgrade?from=A&to=T returns a patch
+    ;; ref, building on demand if the catalogue doesn't yet have one.
+    ((and (eq method :get) (= 4 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "software")
+          (equal (fourth segments) "upgrade"))
+     (values :get-upgrade-patch (list :software (third segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -1446,9 +1453,20 @@ overwrite an existing manifest with one for a different blob."
            (json (and body (ignore-errors
                              (com.inuoe.jzon:parse
                               (sb-ext:octets-to-string body :external-format :utf-8)))))
-           (dry-run (and (hash-table-p json) (gethash "dry_run" json)))
-           (min-users (or (and (hash-table-p json) (gethash "min_user_count" json)) 0))
-           (min-age   (or (and (hash-table-p json) (gethash "min_age_days"   json)) 30))
+           (h          (and (hash-table-p json) json))
+           (dry-run    (and h (gethash "dry_run" h)))
+           (min-users  (or (and h (gethash "min_user_count" h)) 0))
+           (min-age    (or (and h (gethash "min_age_days"   h)) 30))
+           ;; v1.6 (ADR-0011): three new knobs.  Defaults preserve
+           ;; behaviour for callers that haven't been updated --
+           ;; ensure_reachability defaults TRUE so a v1.5 client
+           ;; getting v1.6 server behaviour stays safe.
+           (ensure     (cond ((null h) t)
+                             ((nth-value 1 (gethash "ensure_reachability" h))
+                              (gethash "ensure_reachability" h))
+                             (t t)))
+           (allow-blob (and h (gethash "allow_blob_fallback" h)))
+           (max-built  (or (and h (gethash "max_built_edges" h)) 50))
            (result (ota-server.workers:gc-software
                     (app-state-cas app)
                     (app-state-catalogue app)
@@ -1457,17 +1475,63 @@ overwrite an existing manifest with one for a different blob."
                     :software (getf params :software)
                     :min-user-count min-users
                     :min-age-days min-age
-                    :dry-run dry-run)))
+                    :dry-run dry-run
+                    :ensure-reachability ensure
+                    :allow-blob-fallback allow-blob
+                    :max-built-edges max-built)))
       (ota-server.catalogue:append-audit
        (app-state-catalogue app)
        :identity identity :action "gc"
        :target (getf params :software)
-       :detail (format nil "pruned=~A dry_run=~A"
-                       (length (getf result :pruned)) (getf result :dry-run)))
-      (json-response 200
-                     (obj "software" (getf params :software)
-                          "pruned"   (coerce (getf result :pruned) 'vector)
-                          "dry_run"  (if (getf result :dry-run) t nil))))))
+       :detail (format nil "pruned=~A dry_run=~A ensure_reachability=~A aborted=~A"
+                       (length (getf result :pruned))
+                       (getf result :dry-run)
+                       ensure
+                       (if (getf result :aborted) "true" "false")))
+      (cond
+        ((getf result :aborted)
+         (error-response
+          409
+          "GC aborted: reachability constraint not satisfiable"
+          (format nil "edges-to-build=~D exceeds max_built_edges=~D; ~
+                       set allow_blob_fallback=true to drop anyway"
+                  (length (getf (getf result :reachability) :edges-to-build))
+                  max-built)))
+        (t
+         (json-response 200
+                        (obj "software"     (getf params :software)
+                             "pruned"       (coerce (getf result :pruned) 'vector)
+                             "dry_run"      (if (getf result :dry-run) t nil)
+                             "reachability" (%reachability-to-obj
+                                             (getf result :reachability)))))))))
+
+(defun %reachability-to-obj (plan)
+  "Render the reachability plist as a JSON object for the GC
+response.  When PLAN is NIL (ensure-reachability=false), returns
+an empty object so the field is consistent across responses."
+  (cond
+    ((null plan) (obj))
+    (t
+     (let ((fates (getf plan :clients-by-fate)))
+       (obj "clients_by_fate"
+            (obj "unaffected"     (or (getf fates :unaffected) 0)
+                 "graceful"       (or (getf fates :graceful) 0)
+                 "blob_fallback"  (or (getf fates :blob-fallback) 0)
+                 "unreachable"    (or (getf fates :unreachable) 0))
+            "edges_built"
+            (or (getf plan :edges-built) 0)
+            "edges_to_build"
+            (coerce (mapcar (lambda (e)
+                              (obj "from" (getf e :from)
+                                   "to"   (getf e :to)
+                                   "estimated_size"
+                                   (or (getf e :estimated-size) 0)))
+                            (getf plan :edges-to-build))
+                    'vector)
+            "blocked_clients"
+            (coerce (getf plan :blocked-clients) 'vector)
+            "feasible"
+            (if (getf plan :feasible-p) t nil))))))
 
 (defun handle-admin-verify (app env)
   (with-admin-identity (identity env app)
@@ -1661,6 +1725,101 @@ distinguish the two failure modes."
             (t
              (error-response 400 (princ-to-string c)))))))))
 
+(defun handle-get-upgrade-patch (app env params)
+  "v1.6: lazy upgrade-time patch build.
+
+GET /v1/software/<sw>/upgrade?from=<version>&to=<version>
+returns a JSON object describing the patch the agent should
+download to go from `from` to `to`.  If no such patch exists in
+the catalogue (e.g. an out-of-order publish + GC left a gap, or
+a debug-version backport the original fan-in didn't cover), the
+server builds it on demand via BUILD-PATCH-FROM-BLOBS and serves
+the result.
+
+Response:
+  { \"from\": ..., \"to\": ..., \"sha256\": ..., \"size\": ...,
+    \"patcher\": \"bsdiff\", \"url\": \"/v1/patches/<sha>\",
+    \"built_on_demand\": <bool> }
+
+Authenticated by the per-client bearer; classification filtering
+applies via the existing identity resolution.  The first client
+to request a missing path pays the build time (typically a few
+seconds even for large blobs); subsequent clients hit the now-
+cached patch row."
+  (let* ((qs (env-get env :query-string))
+         (qparams (parse-query-string qs))
+         (software (getf params :software))
+         (from-version (getf qparams :from))
+         (to-version   (getf qparams :to))
+         (id (resolve-identity env app)))
+    (cond
+      ((or (null from-version) (null to-version)
+           (zerop (length from-version)) (zerop (length to-version)))
+       (error-response 400 "from and to query parameters required"))
+      (t
+       (let* ((from-rel (ota-server.catalogue:get-release
+                         (app-state-catalogue app) software from-version))
+              (to-rel   (ota-server.catalogue:get-release
+                         (app-state-catalogue app) software to-version)))
+         (cond
+           ((or (null from-rel) (null to-rel))
+            (error-response 404 "release(s) not found"))
+           ((not (visible-release-p id to-rel))
+            (error-response 404 "release not visible to caller"))
+           (t
+            (%resolve-or-build-upgrade-patch app from-rel to-rel))))))))
+
+(defun %resolve-or-build-upgrade-patch (app from-rel to-rel)
+  "Return the patch ref for from-rel → to-rel, building on demand
+when the catalogue doesn't already have one.  Identical from
+and to is a 400; identity transitions don't need a patch."
+  (let ((from-rid (getf from-rel :release-id))
+        (to-rid   (getf to-rel   :release-id)))
+    (cond
+      ((string= from-rid to-rid)
+       (error-response 400 "from and to refer to the same release"))
+      (t
+       (let ((existing (ota-server.catalogue:get-patch-by-tuple
+                       (app-state-catalogue app) from-rid to-rid)))
+         (cond
+           (existing
+            (json-response 200
+                           (obj "from"           (getf from-rel :version)
+                                "to"             (getf to-rel :version)
+                                "sha256"         (getf existing :sha256)
+                                "size"           (getf existing :size)
+                                "patcher"        (getf existing :patcher)
+                                "url"            (format nil "/v1/patches/~A"
+                                                         (getf existing :sha256))
+                                "built_on_demand" nil)))
+           (t
+            (handler-case
+                (multiple-value-bind (sha size)
+                    (ota-server.workers:build-patch-from-blobs
+                     (app-state-cas app) (app-state-catalogue app)
+                     :from-release-id from-rid
+                     :to-release-id   to-rid
+                     :from-blob-sha   (getf from-rel :blob-sha256)
+                     :to-blob-sha     (getf to-rel   :blob-sha256))
+                  (ota-server.catalogue:append-audit
+                   (app-state-catalogue app)
+                   :identity "system" :action "lazy-build-patch"
+                   :target (format nil "~A->~A" from-rid to-rid)
+                   :detail (format nil "size=~A" size))
+                  (json-response
+                   201
+                   (obj "from"            (getf from-rel :version)
+                        "to"              (getf to-rel :version)
+                        "sha256"          sha
+                        "size"            size
+                        "patcher"         "bsdiff"
+                        "url"             (format nil "/v1/patches/~A" sha)
+                        "built_on_demand" t)))
+              (error (e)
+                (format *error-output* "lazy-build: ~A~%" e)
+                (error-response 500 "patch build failed"
+                                (princ-to-string e)))))))))))
+
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
   (let* ((body (read-request-body-bytes env))
@@ -1775,7 +1934,9 @@ this path)."
                  (:client-list-state            (handle-client-list-state state env))
                  ;; v1.5 — admin stats catalogue.
                  (:admin-stats-index            (handle-admin-stats-index state env))
-                 (:admin-stats-run              (handle-admin-stats-run state env params)))
+                 (:admin-stats-run              (handle-admin-stats-run state env params))
+                 ;; v1.6 — lazy upgrade-time patch build.
+                 (:get-upgrade-patch            (handle-get-upgrade-patch state env params)))
              (error (e)
                (format *error-output* "handler error on ~A: ~A~%" path e)
                (error-response 500 "internal error" (princ-to-string e))))))))))

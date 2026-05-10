@@ -20,6 +20,39 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Added
+- **Reachability-aware GC.** The GC now consults the v1.5
+  client-software snapshot before dropping any release: for
+  every active client position, Dijkstra over the patches
+  graph computes the cheapest path to that client's target
+  release (highest visible semver). When the would-be-drop
+  set breaks a client's only path, the operator can either
+  let `ota-server` pre-build the minimum set of missing edges
+  via the v1.2 patch-build pool (the default) or accept full-
+  blob fallback for affected clients (`allow_blob_fallback`).
+  All-or-nothing: any build failure aborts the entire GC
+  before any release is dropped. See
+  [docs/adr/0011-reachability-aware-gc.org](docs/adr/0011-reachability-aware-gc.org).
+- **Lazy upgrade-time patch build.** When a client requests
+  `GET /v1/software/<sw>/upgrade?from=A&to=T` and no usable
+  patch exists in the catalogue (out-of-order publish + GC
+  through an intermediate, or a debug-version backport that
+  the original fan-in didn't cover), the server now builds
+  `A → T` on demand via the worker pool and serves it. First
+  client at A→T pays the build time; subsequent clients hit
+  the now-cached patch.
+
+### Changed
+- `POST /v1/admin/software/<sw>/gc` accepts three new flags —
+  `ensure_reachability` (default `true`), `allow_blob_fallback`
+  (default `false`), `max_built_edges` (default 50). Response
+  gains a `reachability` block detailing how many clients land
+  in each fate bucket (unaffected / graceful / blob-fallback /
+  unreachable) and how many edges were built.
+- `ota-server gc` CLI mirrors the new flags.
+
+## [1.5.0] - 2026-05-10
+
+### Added
 - **Client-software state snapshot (v1.5 foundation).** New
   `client_software_state` catalogue table records `(client_id,
   software_name) → (current_release_id, previous_release_id,

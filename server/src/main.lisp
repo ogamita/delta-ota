@@ -151,15 +151,24 @@ harness)."
     (force-output)
     0))
 
-(defun run-gc (&key config software (min-user-count 0) (min-age-days 30) dry-run)
+(defun run-gc (&key config software (min-user-count 0) (min-age-days 30)
+                    dry-run (ensure-reachability t) (allow-blob-fallback nil)
+                    (max-built-edges 50))
   "Run garbage collection for SOFTWARE and exit.  Mirrors the
-HTTP `POST /v1/admin/software/<sw>/gc` handler so cron and
-systemd timers can invoke GC without going through the API.
+HTTP `POST /v1/admin/software/<sw>/gc` handler.
 
 Required: :software.  Optional: :min-user-count (default 0),
-:min-age-days (default 30), :dry-run.  Exit code 0 on success,
-2 on missing :software, non-zero from the toplevel handler on
-any uncaught error."
+:min-age-days (default 30), :dry-run, :ensure-reachability
+(default T; v1.6 reachability-aware GC), :allow-blob-fallback
+(default NIL; accept full-blob fallback for affected clients
+instead of pre-building edges), :max-built-edges (default 50;
+ceiling on the patches the plan may pre-build).
+
+Exit codes:
+  0  success (drops applied OR dry-run completed)
+  2  missing required arg
+  3  GC aborted (reachability infeasible without
+                 --allow-blob-fallback)"
   (unless software
     (format *error-output* "ota-server gc: --software=NAME required~%")
     (return-from run-gc 2))
@@ -172,31 +181,55 @@ any uncaught error."
                (merge-pathnames "etc/keys/" root)))
          (manifests-dir (merge-pathnames "manifests/" root)))
     (unwind-protect
-         (let ((result (ota-server.workers:gc-software
-                        cas db kp manifests-dir
-                        :software software
-                        :min-user-count min-user-count
-                        :min-age-days   min-age-days
-                        :dry-run        dry-run)))
-           (format t "ota-server gc: software=~A pruned=~D dry-run=~A min-user-count=~A min-age-days=~A~%"
-                   software
-                   (length (getf result :pruned))
-                   (if (getf result :dry-run) "true" "false")
-                   min-user-count min-age-days)
-           (dolist (rid (getf result :pruned))
-             (format t "  ~A  ~A~%"
-                     (if dry-run "would prune" "pruned     ")
-                     rid))
-           (force-output)
-           (ota-server.catalogue:append-audit
-            db
-            :identity "cli"
-            :action "gc"
-            :target software
-            :detail (format nil "pruned=~D dry_run=~A min_user_count=~A min_age_days=~A"
-                            (length (getf result :pruned))
-                            (getf result :dry-run)
-                            min-user-count min-age-days)))
+         (let* ((result (ota-server.workers:gc-software
+                         cas db kp manifests-dir
+                         :software software
+                         :min-user-count min-user-count
+                         :min-age-days   min-age-days
+                         :dry-run        dry-run
+                         :ensure-reachability ensure-reachability
+                         :allow-blob-fallback allow-blob-fallback
+                         :max-built-edges max-built-edges))
+                (reach (getf result :reachability))
+                (aborted (getf result :aborted)))
+           (cond
+             (aborted
+              (format *error-output*
+                      "ota-server gc: aborted -- ~D edges-to-build exceed max-built-edges=~D; ~
+re-run with --allow-blob-fallback to drop anyway~%"
+                      (length (getf reach :edges-to-build))
+                      max-built-edges)
+              (return-from run-gc 3))
+             (t
+              (format t "ota-server gc: software=~A pruned=~D dry-run=~A ~
+min-user-count=~A min-age-days=~A~%"
+                      software
+                      (length (getf result :pruned))
+                      (if (getf result :dry-run) "true" "false")
+                      min-user-count min-age-days)
+              (when reach
+                (let ((fates (getf reach :clients-by-fate)))
+                  (format t "  reachability: unaffected=~D graceful=~D blob-fallback=~D unreachable=~D ~
+edges-built=~D~%"
+                          (or (getf fates :unaffected) 0)
+                          (or (getf fates :graceful) 0)
+                          (or (getf fates :blob-fallback) 0)
+                          (or (getf fates :unreachable) 0)
+                          (or (getf reach :edges-built) 0))))
+              (dolist (rid (getf result :pruned))
+                (format t "  ~A  ~A~%"
+                        (if dry-run "would prune" "pruned     ")
+                        rid))
+              (force-output)
+              (ota-server.catalogue:append-audit
+               db
+               :identity "cli"
+               :action "gc"
+               :target software
+               :detail (format nil "pruned=~D dry_run=~A ensure_reachability=~A"
+                               (length (getf result :pruned))
+                               (getf result :dry-run)
+                               ensure-reachability)))))
       (ota-server.catalogue:close-catalogue db))
     0))
 
@@ -272,6 +305,8 @@ Usage:
   ota-server migrate [--config=PATH]    apply catalogue migrations and exit
   ota-server gc      [--config=PATH] --software=NAME [--min-user-count=N]
                      [--min-age-days=N] [--dry-run]
+                     [--no-ensure-reachability] [--allow-blob-fallback]
+                     [--max-built-edges=N]
                                         run garbage collection on SOFTWARE and exit
   ota-server stats   [--config=PATH] <query-name> [--<param>=<value> ...]
                                         run an admin stats query; --help-stats
@@ -324,12 +359,24 @@ Environment variables (override file values):
              (dry-run        (or (member "--dry-run" rest :test #'string=)
                                  (let ((v (%get-flag rest "dry-run")))
                                    (and v (not (string= v "false"))
-                                        (not (string= v "0")))))))
+                                        (not (string= v "0"))))))
+             ;; v1.6 reachability knobs.  --no-ensure-reachability
+             ;; disables the new layer; default is on.
+             (no-ensure      (member "--no-ensure-reachability" rest :test #'string=))
+             (allow-blob     (or (member "--allow-blob-fallback" rest :test #'string=)
+                                 (let ((v (%get-flag rest "allow-blob-fallback")))
+                                   (and v (not (string= v "false"))
+                                        (not (string= v "0"))))))
+             (max-built      (alexandria:if-let ((v (%get-flag rest "max-built-edges")))
+                               (parse-integer v) 50)))
          (or (run-gc :config config
                      :software software
                      :min-user-count min-user-count
                      :min-age-days min-age-days
-                     :dry-run (and dry-run t))
+                     :dry-run (and dry-run t)
+                     :ensure-reachability (not no-ensure)
+                     :allow-blob-fallback (and allow-blob t)
+                     :max-built-edges max-built)
              0)))
       ((string= cmd "stats")
        (cond
