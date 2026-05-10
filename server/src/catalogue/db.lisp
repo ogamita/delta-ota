@@ -69,21 +69,48 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
   (with-catalogue (db catalogue)
     (dolist (mig '("src/catalogue/migrations/0001_init.sql"
                    "src/catalogue/migrations/0002_patches.sql"
-                   "src/catalogue/migrations/0003_auth.sql"))
+                   "src/catalogue/migrations/0003_auth.sql"
+                   "src/catalogue/migrations/0004_patch_jobs.sql"))
       (dolist (stmt (split-statements (read-migration-file mig)))
         (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) stmt)))
           (when (plusp (length trimmed))
             (sqlite:execute-non-query db trimmed)))))))
 
 (defun split-statements (sql)
-  "Split a SQL string at top-level semicolons.  Good enough for our
-   migrations (no semicolons inside strings or quoted identifiers)."
+  "Split a SQL string at top-level semicolons.  Skips `--` line
+comments and single-quoted string literals so that a `;` inside
+either does not start a new statement.  Good enough for our
+migrations; if we ever need C-style /* … */ block comments or
+double-quoted identifiers with semicolons in them, extend here."
   (let ((statements '())
-        (start 0))
-    (dotimes (i (length sql))
-      (when (char= (char sql i) #\;)
-        (push (subseq sql start i) statements)
-        (setf start (1+ i))))
+        (start 0)
+        (i 0)
+        (n (length sql)))
+    (loop while (< i n) do
+      (let ((c (char sql i)))
+        (cond
+          ;; -- ... \n  : skip the rest of the line.
+          ((and (char= c #\-) (< (1+ i) n) (char= (char sql (1+ i)) #\-))
+           (loop while (and (< i n) (not (char= (char sql i) #\Newline)))
+                 do (incf i)))
+          ;; '...' : skip to the matching quote (SQL doubles '' to escape).
+          ((char= c #\')
+           (incf i)
+           (loop while (< i n)
+                 for ch = (char sql i)
+                 do (cond
+                      ((and (char= ch #\') (< (1+ i) n)
+                            (char= (char sql (1+ i)) #\'))
+                       (incf i 2))
+                      ((char= ch #\') (return))
+                      (t (incf i))))
+           (when (< i n) (incf i)))
+          ;; Top-level semicolon: end of statement.
+          ((char= c #\;)
+           (push (subseq sql start i) statements)
+           (setf start (1+ i))
+           (incf i))
+          (t (incf i)))))
     (let ((tail (subseq sql start)))
       (when (some (lambda (c) (not (member c '(#\Space #\Tab #\Newline #\Return))))
                   tail)
@@ -576,6 +603,153 @@ purely catalogue-side."
     (sqlite:execute-non-query
      db "UPDATE releases SET uncollectable = 1 WHERE software_name = ? AND version = ?"
      software-name version)))
+
+;; ---------------- v1.2: persistent patch-build job queue ----------------
+;;
+;; The schema in 0004_patch_jobs.sql declares UNIQUE (from, to, patcher),
+;; so an INSERT that conflicts with an existing row no-ops.  We exploit
+;; that for idempotent re-publishes: the publish handler enqueues one
+;; job per prior release, and a duplicate enqueue (idempotent re-publish
+;; or a transient retry) silently does nothing.
+
+(defparameter *patch-job-columns*
+  "id, from_release_id, to_release_id, software_name, os, arch, from_version, from_blob_sha256, to_blob_sha256, patcher, status, attempts, error, patch_sha256, patch_size, enqueued_at, started_at, completed_at")
+
+(defun row-to-patch-job (row)
+  (destructuring-bind (id from-id to-id sw os arch from-ver
+                       from-sha to-sha patcher status
+                       attempts error sha size
+                       enqueued started completed)
+      row
+    (list :id id
+          :from-release-id from-id :to-release-id to-id
+          :software sw :os os :arch arch
+          :from-version from-ver
+          :from-blob-sha256 from-sha :to-blob-sha256 to-sha
+          :patcher patcher :status status
+          :attempts attempts :error error
+          :patch-sha256 sha :patch-size size
+          :enqueued-at enqueued :started-at started :completed-at completed)))
+
+(defun enqueue-patch-job (catalogue &key from-release-id to-release-id
+                                         software os arch from-version
+                                         from-blob-sha256 to-blob-sha256
+                                         (patcher "bsdiff"))
+  "Enqueue one bsdiff job.  Idempotent: an INSERT that conflicts with
+the (from, to, patcher) UNIQUE silently no-ops, so a re-publish or
+double-enqueue does not duplicate work.  Returns one of:
+
+  (values :enqueued JOB-ID)   -- newly inserted row
+  (values :existing JOB-ID)   -- a row was already there"
+  (with-catalogue (db catalogue)
+    (let ((now (universal-to-iso8601 (get-universal-time))))
+      (sqlite:execute-non-query
+       db
+       "INSERT OR IGNORE INTO patch_jobs (from_release_id, to_release_id, software_name, os, arch, from_version, from_blob_sha256, to_blob_sha256, patcher, status, enqueued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)"
+       from-release-id to-release-id software os arch from-version
+       from-blob-sha256 to-blob-sha256 patcher now)
+      ;; SQLite's changes() reports 1 when the INSERT actually wrote a
+      ;; row, 0 when OR IGNORE swallowed it (i.e. UNIQUE conflict).
+      (let* ((changed (or (caar (sqlite:execute-to-list db "SELECT changes()")) 0))
+             (id (caar (sqlite:execute-to-list
+                        db
+                        "SELECT id FROM patch_jobs WHERE from_release_id = ? AND to_release_id = ? AND patcher = ?"
+                        from-release-id to-release-id patcher))))
+        (values (if (plusp changed) :enqueued :existing) id)))))
+
+(defun claim-next-patch-job (catalogue)
+  "Atomically pick the oldest pending job and mark it running.  Returns
+the claimed job's plist, or NIL when no pending job exists.  Wrapped
+in `BEGIN IMMEDIATE` so two workers (or two server processes) racing
+on the same row see exactly one winner.  attempts is incremented on
+each claim so a recovered stale-running job that fails repeatedly is
+visible."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query db "BEGIN IMMEDIATE")
+    (handler-case
+        (let* ((rows (sqlite:execute-to-list
+                      db
+                      (format nil "SELECT ~A FROM patch_jobs WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+                              *patch-job-columns*)))
+               (job (and rows (row-to-patch-job (first rows)))))
+          (cond
+            ((null job)
+             (sqlite:execute-non-query db "COMMIT")
+             nil)
+            (t
+             (let ((now (universal-to-iso8601 (get-universal-time))))
+               (sqlite:execute-non-query
+                db
+                "UPDATE patch_jobs SET status = 'running', started_at = ?, attempts = attempts + 1 WHERE id = ?"
+                now (getf job :id)))
+             (sqlite:execute-non-query db "COMMIT")
+             ;; Reflect the field updates in the returned plist so the
+             ;; caller sees the post-claim state without a re-fetch.
+             (setf (getf job :status) "running")
+             (incf (getf job :attempts))
+             job)))
+      (error (c)
+        (handler-case (sqlite:execute-non-query db "ROLLBACK")
+          (error () nil))
+        (error c)))))
+
+(defun complete-patch-job (catalogue job-id &key sha256 size)
+  "Mark JOB-ID as done with the resulting patch (sha, size)."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "UPDATE patch_jobs SET status = 'done', completed_at = ?, patch_sha256 = ?, patch_size = ?, error = NULL WHERE id = ?"
+     (universal-to-iso8601 (get-universal-time)) sha256 size job-id)))
+
+(defun fail-patch-job (catalogue job-id error-msg)
+  "Mark JOB-ID as failed with ERROR-MSG (a short string)."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "UPDATE patch_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?"
+     (universal-to-iso8601 (get-universal-time))
+     (or error-msg "")
+     job-id)))
+
+(defun list-patch-jobs-for-release (catalogue to-release-id)
+  "All patch jobs targeting TO-RELEASE-ID, oldest id first."
+  (with-catalogue (db catalogue)
+    (mapcar #'row-to-patch-job
+            (sqlite:execute-to-list
+             db
+             (format nil "SELECT ~A FROM patch_jobs WHERE to_release_id = ? ORDER BY id ASC"
+                     *patch-job-columns*)
+             to-release-id))))
+
+(defun count-patch-jobs (catalogue &key status to-release-id)
+  "Count rows in patch_jobs filtered by STATUS and/or TO-RELEASE-ID.
+Either filter may be NIL.  Returns an integer."
+  (with-catalogue (db catalogue)
+    (let ((sql "SELECT COUNT(*) FROM patch_jobs WHERE 1=1")
+          (args '()))
+      (when status
+        (setf sql (concatenate 'string sql " AND status = ?"))
+        (push status args))
+      (when to-release-id
+        (setf sql (concatenate 'string sql " AND to_release_id = ?"))
+        (push to-release-id args))
+      (or (caar (apply #'sqlite:execute-to-list db sql (nreverse args)))
+          0))))
+
+(defun reset-stale-running-jobs (catalogue)
+  "Boot-time recovery: any job left in 'running' (because a worker or
+the whole server died mid-bsdiff) is reset to 'pending' so the pool
+re-picks it up.  Bsdiff is deterministic and INSERT-PATCH dedupes on
+(from, to, patcher), so re-running a partially-completed job is
+idempotent.  Returns the number of rows reset."
+  (with-catalogue (db catalogue)
+    (let ((before (or (caar (sqlite:execute-to-list
+                             db "SELECT COUNT(*) FROM patch_jobs WHERE status = 'running'"))
+                      0)))
+      (sqlite:execute-non-query
+       db
+       "UPDATE patch_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
+      before)))
 
 (defun list-audit (catalogue &optional (limit 100))
   (with-catalogue (db catalogue)

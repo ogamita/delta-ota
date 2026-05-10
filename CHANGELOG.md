@@ -19,6 +19,31 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **Async patch-build worker pool.** The bsdiff fan-in that runs
+  after every publish no longer executes synchronously inside
+  the publish handler thread. Patches are persisted as `patch_jobs`
+  rows in the catalogue and consumed by a fixed-size pool of
+  worker threads started at server boot. The publish handler
+  enqueues one job per prior release and returns immediately;
+  clients that want progress events stream them from the queue
+  rather than from in-handler bsdiff. Restart-safe: any job left
+  in `running` at boot is reset to `pending` and re-picked up
+  (bsdiff is deterministic; `insert-patch` deduplicates on
+  (from, to, patcher), so re-running a partially-completed job
+  is idempotent). Closes the patcher.lisp:7 TODO and the
+  implementation-plan "Async patch-build worker pool" backlog
+  item. See [docs/adr/0007-async-patch-build-worker-pool.org](docs/adr/0007-async-patch-build-worker-pool.org).
+
+### Changed
+- Publish handler streams per-job progress by tailing the
+  `patch_jobs` rows for the new release, not by direct
+  callback from the bsdiff worker. The on-the-wire NDJSON
+  shape is unchanged for `ota-admin` (same `:patches-started /
+  :patch-built / :patches-done / :done` event sequence).
+
+## [1.1.2] - 2026-05-10
+
 ### Fixed
 - **`TestDefaultOTAHome_FallsBackToHome` was Unix-only and broke
   the GitHub Actions Windows runner.** `os.UserHomeDir()` reads

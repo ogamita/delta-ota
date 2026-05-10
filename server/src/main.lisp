@@ -83,17 +83,31 @@ harness)."
                  :admin-token (getf cfg :admin-token)
                  :hostname (or (getf cfg :hostname) "localhost")
                  :tls-cert (getf cfg :tls-cert)
-                 :tls-key  (getf cfg :tls-key))))
+                 :tls-key  (getf cfg :tls-key)))
+         (patch-worker-count (or (getf cfg :patcher-worker-count) 2)))
     (ota-server.catalogue:run-migrations db)
     (ensure-directories-exist
      (ota-server.http::app-state-manifests-dir state))
+    ;; v1.2: reset any patch_jobs the previous process left in 'running'
+    ;; before starting the new pool.  Bsdiff is deterministic and
+    ;; INSERT-PATCH dedupes on (from, to, patcher), so re-running a
+    ;; partially-completed job is idempotent.
+    (let ((reset (ota-server.catalogue:reset-stale-running-jobs db)))
+      (when (plusp reset)
+        (format t "patch-pool: reset ~D stale running job~:P from a previous run~%"
+                reset)
+        (force-output)))
+    (let ((pool (ota-server.workers:start-patch-pool
+                 cas db :size patch-worker-count)))
+      (setf (ota-server.http::app-state-pool state) pool))
     (format t "ota-server ~A~%~
-               listening on ~A:~A (~A worker thread~:P)~%~
+               listening on ~A:~A (~A http worker thread~:P, ~A patch worker~:P)~%~
                data_dir=~A~%~
                manifest pubkey=~A~%"
             (version-string)
             (getf cfg :host) (getf cfg :port)
             (or (getf cfg :worker-num) 1)
+            patch-worker-count
             root
             (ota-server.manifest:keypair-public-hex kp))
     (force-output)
@@ -104,10 +118,13 @@ harness)."
                                           :worker-num (getf cfg :worker-num))))
       (format t "ota-server: ready.~%")
       (force-output)
-      (handler-case
-          (loop (sleep 86400))
-        (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
-      (ota-server.http:stop-server handler))
+      (unwind-protect
+           (handler-case
+               (loop (sleep 86400))
+             (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
+        (ota-server.workers:stop-patch-pool
+         (ota-server.http::app-state-pool state))
+        (ota-server.http:stop-server handler)))
     0))
 
 (defun migrate (&key config)

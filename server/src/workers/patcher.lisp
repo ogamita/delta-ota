@@ -1,10 +1,21 @@
 ;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;; Copyright (C) 2026 Ogamita Ltd.
 ;;;
-;;; Patch builder.  Phase-2 simplification: each new release publish
-;;; builds patches synchronously from every prior release of the same
-;;; (software, os, arch) to the new release.  The proper async worker
-;;; pool with a Postgres-backed job queue lands in phase 5.
+;;; Patch builder.
+;;;
+;;; v1.0–v1.1: each publish ran the bsdiff fan-in synchronously inside
+;;; the publish handler thread (BUILD-PATCHES-FOR-RELEASE).
+;;;
+;;; v1.2: the fan-in is asynchronous — ENQUEUE-PATCHES-FOR-RELEASE
+;;; inserts one row per prior release into PATCH_JOBS and the worker
+;;; pool (workers/pool.lisp) consumes them.  The publish handler tails
+;;; the jobs to emit per-patch progress events on the NDJSON response.
+;;;
+;;; BUILD-PATCH-FROM-BLOBS is the bsdiff invocation itself, used by
+;;; both the legacy synchronous BUILD-PATCHES-FOR-RELEASE (still
+;;; available for tests / out-of-tree callers) and by the pool's
+;;; per-job worker.  The Postgres-backed queue is the same surface,
+;;; just a different driver — see ADR-0007.
 
 (in-package #:ota-server.workers)
 
@@ -120,3 +131,43 @@ before."
     (when (and on-progress (plusp total))
       (funcall on-progress (list :event :patches-done :built (length built))))
     (nreverse built)))
+
+(defun enqueue-patches-for-release (catalogue
+                                    &key software os arch new-version
+                                         new-release-id new-blob-sha
+                                         (patcher "bsdiff"))
+  "Enqueue one PATCH_JOBS row per prior release of (software, os, arch)
+to NEW-RELEASE-ID.  Returns the list of plists describing each enqueued
+job's catalogue row (ordered oldest prior first).  Does NOT run bsdiff
+itself — the worker pool consumes the queue.  Idempotent: a re-publish
+silently no-ops on the UNIQUE (from, to, patcher) constraint, so the
+returned list of :existing rows can be tailed exactly the same way as
+:enqueued ones."
+  (let* ((all (ota-server.catalogue:list-releases catalogue software))
+         (priors (remove-if-not
+                  (lambda (rel)
+                    (and (string= (getf rel :os) os)
+                         (string= (getf rel :arch) arch)
+                         (not (string= (getf rel :version) new-version))))
+                  all))
+         (enqueued '()))
+    (dolist (rel priors)
+      (multiple-value-bind (status job-id)
+          (ota-server.catalogue:enqueue-patch-job
+           catalogue
+           :from-release-id (getf rel :release-id)
+           :to-release-id   new-release-id
+           :software        software
+           :os              os
+           :arch            arch
+           :from-version    (getf rel :version)
+           :from-blob-sha256 (getf rel :blob-sha256)
+           :to-blob-sha256   new-blob-sha
+           :patcher         patcher)
+        (push (list :id job-id
+                    :status status
+                    :from-release-id (getf rel :release-id)
+                    :from-version (getf rel :version)
+                    :from-blob-size (getf rel :blob-size))
+              enqueued)))
+    (nreverse enqueued)))

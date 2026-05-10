@@ -1,0 +1,285 @@
+#+TITLE: ADR-0007 — Async patch-build worker pool
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.2.0.  Supersedes the synchronous fan-in path that ran
+inside the publish handler thread from v1.0 through v1.1.2.
+
+* Context
+
+A publish of release N triggers a "patch fan-in" pass: build one
+=bsdiff= patch from each of the previous (software, os, arch)
+releases to N.  Through v1.1, that fan-in ran inline inside the
+publish handler thread.
+
+This had a measurable cost.  bsdiff on a 100 MB blob takes 5–30 s on
+the reference host; with 10 priors, a single publish could occupy a
+Woo worker thread for several minutes.  v1.0.4's switch to a
+multi-worker Woo (default 4) hid the worst symptom — the server
+stopped wedging — but a long publish still pinned 1 of N workers
+until completion, and a deployer publishing M software lines
+back-to-back could starve the pool.
+
+v1.1.1 then added chunked-NDJSON progress streaming to make the
+publish handler feel responsive ([[file:../../server/src/http/server.lisp][http/server.lisp]]
+=streaming-ndjson-response=).  That improved the UX but did not
+change the underlying scheduling: the bsdiff CPU work was still
+co-tenanted with HTTP request handling, on the same thread, with no
+backpressure model and no recovery if the thread died.
+
+The implementation plan
+([[file:../ota-implementation-plan.org][ota-implementation-plan.org]]
+"Async patch-build worker pool") had carried this as a known
+follow-up since phase 2; the patcher.lisp preamble noted
+([[file:../../server/src/workers/patcher.lisp::7][patcher.lisp:7]])
+that "the proper async worker pool with a Postgres-backed job queue
+lands in phase 5".  v1.2 lands the SQLite version of that — the
+public surface is the same shape any future Postgres backend would
+expose, so the eventual switch is a driver change, not a redesign.
+
+** Requirements
+
+The new architecture must:
+
+1. Decouple bsdiff CPU work from the HTTP worker pool — a long
+   publish must not consume a Woo worker for its duration.
+2. Be /restart-safe/ : a server restart in the middle of a fan-in
+   does not lose work, and the catalogue's invariants
+   (=patches.UNIQUE (from, to, patcher)=) are preserved across the
+   recovery.
+3. Be /idempotent under replay/ : if the same job is run twice
+   (because of a crash, an admin retry, or the cross-process race
+   guard from ADR-0006), the second run is a no-op at the database
+   level.  This falls naturally out of the bsdiff determinism +
+   =insert-patch='s OR REPLACE on (sha, from, to, patcher).
+4. Preserve the v1.1.1 publish-streaming UX byte-for-byte: the
+   NDJSON event sequence
+   (=patches-started → patch-built × N → patches-done → done=)
+   that =ota-admin= already consumes does not change.
+5. Keep the legacy synchronous path available so tests, the e2e
+   harness, and any out-of-tree caller that wires up
+   =make-app-state= directly can opt out of the pool by leaving
+   =app-state-pool= NIL.
+
+** Constraints
+
+- The catalogue is SQLite (single-writer; one writer / many readers
+  in WAL mode).  A naïve "queue lives in process memory" design is
+  one process restart away from data loss.
+- The implementation language is SBCL Common Lisp.  Threading is
+  via =bordeaux-threads=, which gives portable lock + CV primitives
+  but no portable timed-join.
+- The eventual Postgres backend (per the implementation plan) wants
+  the same surface; this design must not cement SQLite-specific
+  semantics into the public API.
+
+* Decision
+
+The fan-in is asynchronous, backed by a /persistent job queue/
+inside the existing SQLite catalogue.
+
+** Schema
+
+A new table =patch_jobs= ([[file:../../server/src/catalogue/migrations/0004_patch_jobs.sql][migrations/0004_patch_jobs.sql]]):
+
+#+begin_src sql
+CREATE TABLE patch_jobs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_release_id    TEXT NOT NULL,
+    to_release_id      TEXT NOT NULL,
+    software_name      TEXT NOT NULL,
+    os                 TEXT NOT NULL,
+    arch               TEXT NOT NULL,
+    from_version       TEXT NOT NULL,
+    from_blob_sha256   TEXT NOT NULL,
+    to_blob_sha256     TEXT NOT NULL,
+    patcher            TEXT NOT NULL DEFAULT 'bsdiff',
+    status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','running','done','failed')),
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    error              TEXT,
+    patch_sha256       TEXT,
+    patch_size         INTEGER,
+    enqueued_at        TEXT NOT NULL,
+    started_at         TEXT,
+    completed_at       TEXT,
+    UNIQUE (from_release_id, to_release_id, patcher)
+);
+#+end_src
+
+The =UNIQUE= on (from, to, patcher) is the idempotency hinge.  An
+=INSERT OR IGNORE= that conflicts with an existing row silently
+no-ops, which means a re-publish or a retried enqueue cannot create
+duplicate work.  The two filtered indexes (=status=, =to_release_id=)
+keep the queue O(1) under normal load.
+
+** Catalogue surface
+
+[[file:../../server/src/catalogue/db.lisp][catalogue/db.lisp]] gets
+six new functions, all under the existing =with-catalogue= recursive
+lock:
+
+| Function                           | Purpose                                                   |
+|------------------------------------+-----------------------------------------------------------|
+| =enqueue-patch-job=                | Insert one row.  Returns =:enqueued JOB-ID= or =:existing JOB-ID=.  |
+| =claim-next-patch-job=             | =BEGIN IMMEDIATE= → SELECT pending → UPDATE running.  Returns the plist or NIL. |
+| =complete-patch-job=               | Mark =done=, store the resulting (sha, size).             |
+| =fail-patch-job=                   | Mark =failed=, store the short error string.              |
+| =list-patch-jobs-for-release=      | Used by the publish handler to tail the queue.            |
+| =count-patch-jobs=                 | Filterable counter; used by the test surface and metrics. |
+| =reset-stale-running-jobs=         | Boot-time recovery.  Returns the number of rows reset.    |
+
+The =BEGIN IMMEDIATE= around claim is the same trick as ADR-0006
+=insert-release-if-new=: it acquires SQLite's write lock at BEGIN
+time, so two workers (or two server processes) racing on the same
+=pending= row see exactly one winner.
+
+** Worker pool
+
+[[file:../../server/src/workers/pool.lisp][workers/pool.lisp]] is a
+fixed-size pool of =bordeaux-threads:make-thread= workers.  Each
+worker:
+
+1. =claim-next-patch-job= → atomic dequeue.
+2. If a job came back: =build-patch-from-blobs= (the unchanged
+   bsdiff invocation), then =complete-patch-job= or
+   =fail-patch-job=.
+3. If the queue was empty: =condition-wait= on the pool's CV with
+   a 1 s timeout (belt-and-braces against missed signals).
+
+The publish handler calls =notify-patch-pool= after enqueueing one
+batch; that signals the CV so workers don't pay the 1-second poll
+on the common path.
+
+The pool size is configured via =[patcher].worker_count= in TOML
+(default 2) or =OTA_PATCH_WORKERS= as an env override.
+
+** Publish handler
+
+[[file:../../server/src/http/server.lisp][http/server.lisp]] picks
+the path at request time:
+
+- =app-state-pool= bound (production): call
+  =enqueue-patches-for-release= → emit =:patches-started= → tail
+  =list-patch-jobs-for-release= every 200 ms, emit =:patch-built=
+  for each transition into a terminal state, emit =:patches-done=,
+  re-sign the manifest with =patches_in= drawn from the successful
+  rows, emit =:done=.
+- =app-state-pool= NIL (tests, legacy callers): the v1.0–v1.1
+  =build-patches-for-release= still runs inline.  Same NDJSON
+  shape, same final state.
+
+The 200 ms tail-poll is conservative — empirically a bsdiff over a
+9 KB blob completes in <50 ms, so the user-visible event cadence
+matches what the inline-callback path produced through v1.1.
+
+** Boot sequence
+
+[[file:../../server/src/main.lisp][main.lisp]] =serve= runs:
+
+1. =run-migrations= (0004 is applied if the deployment is being
+   upgraded from a 1.1.x install).
+2. =reset-stale-running-jobs= — any row left =running= by a previous
+   process is moved back to =pending=.  Logged when nonzero.
+3. =start-patch-pool= — N workers come up.
+4. The Woo HTTP server is started.
+5. On shutdown (=SIGINT= / =SIGTERM= reaches the
+   =sb-sys:interactive-interrupt= handler), the pool is stopped
+   first (=stop-patch-pool=) and only then is the HTTP server torn
+   down — so an in-flight bsdiff has up to 30 s to complete and
+   record its outcome before the process exits.
+
+* Consequences
+
+** Positive
+
+- *HTTP workers are no longer pinned by bsdiff.*  A 5-minute publish
+  consumes one Woo worker for the duration of the upload + the
+  tail-poll loop, but that loop is cheap (a few SQL reads per second)
+  — not the multi-minute CPU spin of v1.1.
+- *Restart-safety.*  Killing the server mid-fan-in leaves =running=
+  rows that the next process resets to =pending= and re-runs.  The
+  full blob download path is unaffected (clients always have a
+  fallback even if patches haven't been built yet).
+- *Concurrent publishes share the pool.*  Two simultaneous publishes
+  of different software lines used to compete for two HTTP workers
+  doing CPU; now they enqueue jobs that the pool drains FIFO.
+- *Cross-process atomicity carries over from ADR-0006.*  Two
+  =ota-server= processes against the same data dir each run their
+  own pool; =BEGIN IMMEDIATE= around =claim-next-patch-job= ensures
+  no row is claimed by two workers.
+- *Future Postgres backend is a driver swap.*  The public surface
+  (=enqueue-patch-job=, =claim-next-patch-job=, …) is the same
+  shape any =cl-dbi=-backed driver would expose — the SQL is
+  ANSI-ish (the only SQLite-specific bit is =strftime=, already
+  hidden behind =universal-to-iso8601=).
+
+** Negative
+
+- *Storage growth.*  =patch_jobs= rows accumulate.  At today's
+  publish rate (handful per week per software) this is negligible
+  (~200 bytes/row), but a future GC pass should prune
+  =status IN ('done', 'failed')= rows older than N days.  Tracked
+  in [[file:../ota-implementation-plan.org][the implementation plan]].
+- *Tail-poll latency floor.*  Per-patch progress events on the
+  NDJSON stream lag actual completion by up to 200 ms.  Acceptable
+  for human consumption; if a future client wants tighter feedback
+  we can swap the poll for a CV-signalled per-handler subscription.
+
+** Neutral
+
+- The legacy synchronous fan-in is preserved as a fallback (when
+  =app-state-pool= is NIL).  No callers are forced to migrate; this
+  costs a few dozen lines of code and is worth it for the test /
+  embedding ergonomics.
+- The 200 ms poll constant is exposed as
+  =*publish-tail-poll-secs*=.  Operators who care can rebind it.
+
+* Alternatives considered
+
+** A. Keep it synchronous, just bigger Woo pool
+
+Rejected.  Doesn't help with the "single 5-minute publish pins one
+worker" pathology; just buys more workers to pin.  Doesn't change
+restart behaviour either — a kill mid-bsdiff still drops the work.
+
+** B. In-memory job queue
+
+Rejected.  Would have to persist =pending= jobs across restarts
+anyway (otherwise we lose work the deployer thought completed).
+At which point the queue is in the catalogue, modulo a thin
+per-process cache layer that adds nothing.
+
+** C. Direct call to a thread pool, no queue table
+
+Considered briefly: spawn a thread per patch job from the publish
+handler, fan-in via =join-thread=, no DB involvement.  Loses
+restart-safety, loses cross-process atomicity, doesn't generalise
+to a future operator-visible "list pending jobs" endpoint.
+
+** D. External queue (Redis / NATS / SQS)
+
+Rejected for v1.2.  The deployment story is "a single dedicated
+host runs SBCL+SQLite from one binary"; introducing a second
+service for the queue contradicts the self-containment principle
+([[file:../../CLAUDE.md::*Self-containment][CLAUDE.md]]).  When the
+PostgreSQL catalogue lands the same table moves to PG; the
+enterprise customer who needs Redis can write the driver.
+
+* Operational notes
+
+- =[patcher].worker_count= : default 2.  Tune to ~CPU/2 on a
+  dedicated host so the pool can saturate cores during catch-up
+  without starving HTTP.
+- =OTA_PATCH_WORKERS= : env override (operators with no TOML).
+- Boot logs:
+  - =patch-pool: 2 worker threads started=
+  - =patch-pool: reset N stale running jobs from a previous run=
+    (only when nonzero).
+- Per-job logs: =patch-pool[N]: job M done (FROM->TO, BYTES bytes)=.
+- Per-job failure: =patch-pool[N]: job M failed: <error>=
+  → row stays =failed= with the error string captured; not retried
+  automatically.  Operator can manually =UPDATE patch_jobs SET
+  status='pending' WHERE id=M= to retry.
