@@ -631,7 +631,7 @@ that are not wired up; today they print
 
 ** ota-server — incomplete subcommands and gaps
 
-- [ ] *=ota-server gc= CLI subcommand is a stub*
+- [X] *=ota-server gc= CLI subcommand is a stub* — landed in v1.1.1.
   ([[file:../server/src/main.lisp::126][main.lisp:126]]).  The actual GC logic is fully
   implemented at the HTTP layer (=POST /v1/admin/software/<sw>/gc=
   with =dry_run / min_user_count / min_age_days= per
@@ -640,12 +640,12 @@ that are not wired up; today they print
   =ota-server.workers.operations:run-gc= for an offline /
   cron-friendly invocation that doesn't go through HTTP.  Ship
   target: v1.0.x.
-- [ ] *TOML =[server].admin_token= key is not read by the loader.*
+- [X] *TOML =[server].admin_token= key is not read by the loader.* — landed in v1.1.1.
   Documented as a gap in operations.org and the CHANGELOG;
   operators must set =OTA_ADMIN_TOKEN= via env (or systemd's
   =EnvironmentFile=).  Wiring it through =load-config-from-file=
   is ~5 lines + a test.  Ship target: v1.0.x.
-- [ ] *Real-time publish progress over HTTP (chunked transfer).*
+- [X] *Real-time publish progress over HTTP (chunked transfer).* — landed in v1.1.1.
   Today the publish handler's response only arrives once the
   bsdiff fan-in completes; per-patch progress is logged
   server-side but not visible to =ota-admin=.  Switching to a
@@ -718,7 +718,7 @@ implemented":
 
 ** libota — dead code to remove
 
-- [ ] *=ErrNotImplemented= is defined but no entry point uses it*
+- [X] *=ErrNotImplemented= is defined but no entry point uses it* — deleted in v1.1.1.
   ([[file:../client/libota/libota.go::29][libota.go:29-30]]).  All five C ABI exports
   (=ota_install / ota_upgrade / ota_revert / ota_version /
   ota_last_error=) are real.  Either delete the dead var or
@@ -734,18 +734,22 @@ The two heaviest contributors are the =build-server-image= job
 (multi-arch buildx with QEMU-emulated arm64) and the =e2e=
 job (sequential SBCL boots per shell test).  Two cheap wins:
 
-- [ ] *Verify the dev-image cache is actually hitting in
-  practice.*  =build-dev-image= already declares
-  =--cache-from type=registry= and a =rules: changes:= gate on
-  =docker/Dockerfile.dev= and =.gitlab-ci.yml=, but the cache hit
-  rate isn't measured anywhere.  Run a no-op push, look at the
-  buildx output for "CACHED" lines, and confirm we're not
-  silently rebuilding layers.  If we are, fix the cache key /
-  source ordering.
-- [ ] *Gate =build-server-image= on tags only* (drop the
-  =$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH= rule).  Today it
-  fires on every master push *and* every tag, doubling the
-  buildx burn for no benefit -- nothing pulls
-  =server:latest= or =server:<short-sha>= operationally; the
-  publishable images are the tagged ones.  Cuts a per-pipeline
-  ~10 minutes of QEMU time.
+- [X] *Dev-image cache verified + fixed* (v1.1.1).  Inspection
+  found =--cache-to type=inline= -- silently a no-op on
+  multi-platform manifests (docker/buildx docs: inline cache
+  exporter is only supported by single-platform exporters).
+  Subsequent pipelines therefore had nothing to cache from
+  beyond what happened to land in the image manifest, and were
+  rebuilding the apt-get + go-tarball + quicklisp prebake stages
+  every time.  Switched to =--cache-to type=registry,ref=$CI_REGISTRY_IMAGE/dev:cache,mode=max=
+  with a matching =--cache-from= so every intermediate layer is
+  pushed to a sibling cache ref and the next build can actually
+  reuse them.
+- [X] *Gate =build-server-image= on tags only* (v1.1.1).  Dropped
+  the =$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH= rule.  The
+  versioned image (=server:vX.Y.Z=) and the rolling =:latest=
+  are both rebuilt only on tag pushes, halving the QEMU-emulated
+  arm64 buildx burn (~10 min per pipeline) on master.  The
+  =release= publish job (already tag-gated) still fires correctly
+  because its =needs:= on =build-server-image= is satisfied on
+  tag pushes.

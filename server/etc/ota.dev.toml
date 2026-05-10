@@ -13,6 +13,10 @@ log_level  = "debug"
 # not block requests on the others.
 worker_num = 4
 
+# Local dev only.  In production set OTA_ADMIN_TOKEN in the env
+# instead -- env-var wins over this value.
+admin_token = "dev-token"
+
 [tls]
 require_mtls = false
 

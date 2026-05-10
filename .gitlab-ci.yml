@@ -54,10 +54,17 @@ build-dev-image:
     - docker buildx create --name otabuilder --use
     - docker buildx inspect --bootstrap
   script:
+    # Cache backend = registry, ref = a sibling 'dev:cache' tag.
+    # `inline` (the prior choice) is silently a no-op on multi-
+    # platform manifests; only single-platform exporters write
+    # cache metadata into the image manifest itself.  With the
+    # registry backend + mode=max, every intermediate layer's
+    # blob is pushed to the cache ref so the next pipeline can
+    # actually skip the apt-get + go-tarball + quicklisp stages.
     - docker buildx build
         --platform "$PLATFORMS"
-        --cache-from "type=registry,ref=$DEV_IMAGE"
-        --cache-to   "type=inline"
+        --cache-from "type=registry,ref=$CI_REGISTRY_IMAGE/dev:cache"
+        --cache-to   "type=registry,ref=$CI_REGISTRY_IMAGE/dev:cache,mode=max"
         --tag "$DEV_IMAGE"
         --file docker/Dockerfile.dev
         --push
@@ -240,6 +247,7 @@ e2e:
     - tests/e2e/ops.sh
     - tests/e2e/recovery.sh
     - tests/e2e/parallel.sh
+    - tests/e2e/two-process-publish.sh
   artifacts:
     when: always
     paths:
@@ -248,6 +256,7 @@ e2e:
       - tests/e2e/run-ops/logs/
       - tests/e2e/run-recovery/logs/
       - tests/e2e/run-parallel/logs/
+      - tests/e2e/run-two-process/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
@@ -342,8 +351,14 @@ build-server-image:
         --file docker/Dockerfile.server
         --push
         .
+  # v1.1.1: gated on tags only.  Operators pull versioned image
+  # tags for production (registry.../server:vX.Y.Z); the rolling
+  # `:latest` was being rebuilt on every master push too,
+  # doubling the QEMU-emulated arm64 buildx burn (~10 min per
+  # pipeline) for no operational benefit.  The most recent tag's
+  # build still updates `:latest`, so anyone who really wants
+  # "the latest tagged release" still gets it.
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
 
 # ---------- publish ----------

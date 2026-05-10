@@ -1,0 +1,232 @@
+#+TITLE: ADR-0006 — Multi-process access to one catalogue
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.1.1.  Re-walk if a customer asks for HA / multi-master
+deployments — at that point a true job-queue architecture probably
+supersedes the in-process locking decisions documented here.
+
+* Context
+
+The supported deployment model is *one =ota-server= process per data
+directory*.  In practice, operators sometimes find themselves running
+two: an in-place upgrade with overlap, a misconfigured systemd unit
+that double-starts, a debug instance brought up alongside the
+production one to investigate something, two pods sharing a PVC by
+accident in Kubernetes.  The question is what happens then -- and
+whether that "what" is correct enough that operators don't have to
+treat the misconfiguration as a critical incident.
+
+Two ota-server processes pointed at the same data directory share:
+
+  - the SQLite catalogue file (=db/ota.db= + =-shm= + =-wal=);
+  - the content-addressed blob/patch storage (=blobs/=, =patches/=);
+  - the manifests directory (=manifests/<sw>/<version>.json= + =.sig=);
+  - the Ed25519 signing keypair (=etc/keys/=).
+
+Different ports for HTTP (otherwise =bind(2)= fails immediately, and
+the question doesn't arise).
+
+* Per-layer analysis
+
+** SQLite catalogue
+
+WAL mode is on (=PRAGMA journal_mode=WAL=, since v1.0.4).  WAL is
+designed for multi-process access:
+
+  - any number of concurrent readers; one writer at a time;
+  - the writer lock is held only across the actual write, not for
+    the duration of the transaction's reads.
+
+=PRAGMA busy_timeout=10000= (also v1.0.4) makes a writer that loses
+the lock retry for up to 10 s before giving up with =SQLITE_BUSY=.
+Cross-process this is correct -- both processes go through the same
+file-level locks and both back off.
+
+** Content-addressed storage (CAS)
+
+Blob and patch filenames are derived from their SHA-256.  Two
+processes writing the same blob produce byte-identical contents at
+the same path; the writes use a tmp + atomic rename so a partial
+write never appears under the final name.  Last-writer-wins is fine
+because the contents agree.
+
+** Manifests directory
+
+Files are =<sw>/<version>.json= and =.sig=.  For the same release,
+two processes compute byte-identical manifest bytes (the manifest
+plist is deterministic) and byte-identical signatures (same key,
+same input).  Same atomic-rename pattern.  Concurrent writes to the
+same manifest path are safe.
+
+** Ed25519 keypair
+
+Read-only after boot.  No race.
+
+* The races we actually had
+
+Despite the above, two narrow time-of-check / time-of-use windows
+existed in the publish handler before this ADR was written.
+
+** Race A: simultaneous publish of the same =(software, os, arch, version)=
+
+The handler used to:
+
+  1. =get-release-by-tuple= -- look up the tuple.
+  2. (compute manifest, write to disk)
+  3. =insert-release= -- write the row.
+
+Two processes A and B publishing the same tuple:
+
+  - A.lookup -> empty.
+  - B.lookup -> empty.       (still empty; A hasn't inserted yet)
+  - A.insert -> commits.
+  - B.insert -> SQLITE_CONSTRAINT (UNIQUE on (software, os, arch, version)).
+
+B's handler did not catch =SQLITE_CONSTRAINT= explicitly, so it
+propagated as a 500 to the client.  Operators expected the v1.0.4
+"200 idempotent / 409 conflict" semantics; they instead got a
+confusing 500 in this race.
+
+** Race B: simultaneous publish of *different* releases of the same software
+
+=insert-release= itself does:
+
+  1. =SELECT MAX(published_at) FROM releases WHERE software_name = ?=
+  2. (compute next published_at = max(prev+1s, now))
+  3. =INSERT INTO releases (..., published_at, ...)=
+
+Two processes both running step 1 before either runs step 3 see the
+same =MAX=, compute the same next timestamp, and both insert with
+the same =published_at= -- defeating the v1.1.0 strict-monotonic
+guarantee.
+
+* Decision
+
+** Wrap lookup-and-insert in =BEGIN IMMEDIATE=
+
+Add a single new catalogue function,
+=ota-server.catalogue:insert-release-if-new=, which does both
+the existence check and the insert *inside one transaction* opened
+with =BEGIN IMMEDIATE=.  =IMMEDIATE= acquires SQLite's reserved
+write lock at =BEGIN= time, so a competing process either:
+
+  - blocks at =BEGIN IMMEDIATE= until the holder commits (and then
+    re-runs its own lookup, which now sees the inserted row), or
+  - times out per =busy_timeout= and the call fails cleanly (the
+    handler can retry or surface a clean 503 -- both better than a
+    spurious 500).
+
+Returns one of:
+
+  =(values :inserted nil)=   ; this caller wrote the row
+  =(values :existing row)=   ; another caller had already written it
+
+closing race A: B's lookup happens AFTER A's commit, so B sees the
+row and returns =:existing= instead of trying to insert.  The
+handler dispatches normally on idempotent vs. conflict.
+
+The =next-published-at= step (race B) runs inside the same
+transaction, so its =SELECT MAX= sees no concurrent inserts -- the
+strict-monotonic =published_at= guarantee holds across processes
+too, not just within one.
+
+** Reorder publish: compute manifest in memory, then insert, then write
+
+The pre-v1.1.1 handler wrote =manifests/<sw>/<version>.json= and
+=.sig= to disk *before* inserting the row.  In the conflict case
+(B's blob differs from A's), the v1.0.4 code returned 409 -- but
+B had ALREADY overwritten the on-disk manifest with one for B's
+blob.  Subsequent =GET /manifest= would have served B's signed
+manifest while the catalogue row pointed at A's blob.  Bug.
+
+The new handler:
+
+  1. computes manifest plist + bytes + sha + signature *in memory*;
+  2. calls =insert-release-if-new= with the computed sha;
+  3. only writes the manifest files on the =:inserted= branch.
+
+Idempotent (same blob) and conflict (different blob) paths never
+touch disk -- the existing files (or absence of files) for the
+existing row stay intact.
+
+** Out of scope: full HA
+
+A two-process deployment is *tolerated*, not *recommended*.  We
+do not document multi-master in =docs/operations.org=; the install
+guide still shows a single systemd unit / single Docker container
+per data directory.  This ADR closes the races so an accidental
+two-process configuration produces correct (if not maximally
+performant) behaviour, not silent data corruption.
+
+True HA (active-active across machines, with a shared object store
+and a real database) wants the v1.2-backlog "PostgreSQL backend" +
+"async patch-build worker pool" rather than a fix to the SQLite
+path.
+
+* Implementation
+
+  - =server/src/catalogue/db.lisp::insert-release-if-new= --
+    BEGIN IMMEDIATE / SELECT / (INSERT or skip) / COMMIT, with
+    ROLLBACK on any error inside the transaction.  Exported from
+    =ota-server.catalogue=.
+  - =server/src/catalogue/db.lisp::insert-release= -- unchanged;
+    the test harness and out-of-tree callers can keep using it.
+    Only the publish handler needs the stronger guarantee.
+  - =server/src/http/server.lisp::handle-admin-publish-release=
+    -- refactored to compute the manifest in memory first, then
+    dispatch on the =insert-release-if-new= result.  The
+    extracted =%publish-finalize-and-emit= does the disk writes
+    + audit + patch fan-in only on the =:inserted= branch.
+
+* Tests
+
+3 new fiveam tests in =server/tests/concurrency-tests.lisp=:
+
+  - =insert-release-if-new-returns-inserted-on-first-call= -- the
+    happy path.
+  - =insert-release-if-new-returns-existing-on-duplicate-tuple=
+    -- a second call for the same tuple but with a *different*
+    blob-sha256 returns =:existing= + the FIRST row (not the
+    just-attempted one).  This is what lets the publish handler
+    distinguish idempotent re-publish (sha matches) from conflict
+    (sha differs).
+  - =insert-release-if-new-is-atomic-under-concurrent-callers=
+    -- 8 threads racing on the same tuple via a barrier.  Asserts
+    exactly 1 returns =:inserted=, 7 return =:existing=, and no
+    thread surfaces a SQLITE_CONSTRAINT.  This is the regression
+    test for race A.
+
+Server suite is now 177 checks (was 168 at v1.1.1's pre-ADR commit).
+
+* Open items
+
+  - The handler does not currently catch =SQLITE_BUSY= from a
+    timed-out =BEGIN IMMEDIATE=.  Under a 10-second contention
+    window that's vanishingly rare, but a future commit should
+    map it to a 503 with a clear "publish in flight; retry"
+    body and a =Retry-After= header.
+
+  - The audit log entry for an idempotent or conflict response
+    is currently *not* written (the audit is in
+    =%publish-finalize-and-emit=, which only runs on
+    =:inserted=).  Worth deciding whether re-publish attempts
+    deserve their own audit row -- arguably yes, for traceability.
+
+  - [X] *Real two-process e2e test* — landed in v1.1.1 alongside
+    this ADR.  =tests/e2e/two-process-publish.sh= boots two
+    independent =sbcl + ota-server= processes against the same
+    data dir on different ports and runs three races:
+
+      1. Same =(sw, os, arch, version)= + same blob → expect
+         exactly one 201 and one 200 (idempotent), no 5xx.
+      2. Same tuple + DIFFERENT blob → expect exactly one 201
+         and one 409 (conflict), no 5xx.
+      3. Different versions on each server → both 201, no
+         interference.
+
+    Followed by a catalogue-consistency check: both servers must
+    list the same 4 versions afterwards.  Wired into =make e2e=
+    as =e2e-two-process= and into the GitLab CI =e2e= job.

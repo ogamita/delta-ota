@@ -393,6 +393,257 @@ deterministic without the publisher having to sleep."
       (ota-server.catalogue:close-catalogue cat)
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
 
+;; ---------------------------------------------------------------------------
+;; v1.1.1 publish progress: build-patches-for-release ON-PROGRESS
+;; callback contract.  Server's publish handler renders the same
+;; events as NDJSON over HTTP; here we just check the events arrive
+;; in order with the expected shape.
+;; ---------------------------------------------------------------------------
+
+(test build-patches-for-release-emits-progress-events
+  "When :ON-PROGRESS is supplied, BUILD-PATCHES-FOR-RELEASE calls it
+exactly:
+  - once with :event :patches-started + :total = N at the start;
+  - once with :event :patch-built per successful patch (with
+    :i 1..N, :total N, :from VERSION, :sha SHA, :size SIZE);
+  - once with :event :patches-done + :built = M at the end.
+
+The test fakes priors via INSERT-RELEASE rows with a non-zero
+blob and stubs *bsdiff-binary* with a no-op script so the bsdiff
+subprocess succeeds without doing real work."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let* ((cas (ota-server.storage:make-cas root))
+                (events '()))
+           (ota-server.catalogue:ensure-software cat :name "p")
+           ;; Insert two priors with their blobs on disk so the
+           ;; bsdiff subprocess has something to chew on.  Each
+           ;; blob is a few KB of arbitrary bytes.
+           (dolist (v '("0.1.0" "0.2.0"))
+             (let* ((tmp (merge-pathnames (format nil "tmp/blob-~A.bin" v) root)))
+               (ensure-directories-exist tmp)
+               (with-open-file (out tmp :direction :output
+                                        :if-exists :supersede
+                                        :element-type '(unsigned-byte 8))
+                 (write-sequence
+                  (make-array 4096 :element-type '(unsigned-byte 8)
+                              :initial-contents
+                              (loop for i below 4096
+                                    collect (mod (+ i (length v)) 256)))
+                  out))
+               (multiple-value-bind (sha size)
+                   (ota-server.storage:put-blob-from-file cas tmp)
+                 (declare (ignore size))
+                 (ota-server.catalogue:insert-release
+                  cat
+                  :release-id (format nil "p/x-y/~A" v)
+                  :software "p" :os "x" :arch "y" :os-versions #()
+                  :version v
+                  :blob-sha256 sha :blob-size 4096
+                  :manifest-sha256 "0" :published-by "test"))))
+           ;; Stage the new release's blob too.
+           (let* ((to-tmp (merge-pathnames "tmp/blob-1.0.0.bin" root)))
+             (with-open-file (out to-tmp :direction :output
+                                         :if-exists :supersede
+                                         :element-type '(unsigned-byte 8))
+               (write-sequence
+                (make-array 4096 :element-type '(unsigned-byte 8)
+                            :initial-element 42)
+                out))
+             (multiple-value-bind (to-sha to-size)
+                 (ota-server.storage:put-blob-from-file cas to-tmp)
+               (declare (ignore to-size))
+               (ota-server.workers:build-patches-for-release
+                cas cat
+                :software "p" :os "x" :arch "y"
+                :new-version "1.0.0"
+                :new-release-id "p/x-y/1.0.0"
+                :new-blob-sha to-sha
+                :on-progress (lambda (e) (push e events)))))
+           (let ((events (nreverse events)))
+             ;; First event is :patches-started total=2.
+             (let ((start (first events)))
+               (is (eq :patches-started (getf start :event)))
+               (is (= 2 (getf start :total))))
+             ;; Last event is :patches-done with :built >= 0.
+             (let ((end (car (last events))))
+               (is (eq :patches-done (getf end :event)))
+               (is (numberp (getf end :built))))
+             ;; Middle events are all :patch-built with i from 1 upward.
+             (let* ((middle (subseq events 1 (1- (length events))))
+                    (patch-builts (remove-if-not
+                                   (lambda (e) (eq :patch-built (getf e :event)))
+                                   middle))
+                    (i-values (mapcar (lambda (e) (getf e :i)) patch-builts)))
+               (is (equal '(1 2) (sort (copy-list i-values) #'<)))
+               (dolist (e patch-builts)
+                 (is (= 2 (getf e :total)))
+                 (is (stringp (getf e :from)))
+                 (is (stringp (getf e :sha)))
+                 (is (numberp (getf e :size)))))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test build-patches-for-release-no-progress-when-no-priors
+  "With zero priors, BUILD-PATCHES-FOR-RELEASE skips the
+:patches-started and :patches-done events entirely (no work to
+report on).  Backward-compatible with callers that don't pass
+:ON-PROGRESS."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let ((cas (ota-server.storage:make-cas root))
+               (events '()))
+           (ota-server.catalogue:ensure-software cat :name "lone")
+           (let* ((to-tmp (merge-pathnames "tmp/blob-only.bin" root)))
+             (ensure-directories-exist to-tmp)
+             (with-open-file (out to-tmp :direction :output
+                                         :if-exists :supersede
+                                         :element-type '(unsigned-byte 8))
+               (write-sequence (make-array 256 :element-type '(unsigned-byte 8)
+                                               :initial-element 7)
+                               out))
+             (multiple-value-bind (to-sha to-size)
+                 (ota-server.storage:put-blob-from-file cas to-tmp)
+               (declare (ignore to-size))
+               (ota-server.workers:build-patches-for-release
+                cas cat
+                :software "lone" :os "x" :arch "y"
+                :new-version "1.0.0"
+                :new-release-id "lone/x-y/1.0.0"
+                :new-blob-sha to-sha
+                :on-progress (lambda (e) (push e events)))))
+           (is (null events) "expected no progress events; got ~S" events))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+;; ---------------------------------------------------------------------------
+;; INSERT-RELEASE-IF-NEW (v1.1.1) -- atomic lookup-then-insert that
+;; closes the multi-process publish race.  See ADR-0006.
+;; ---------------------------------------------------------------------------
+
+(defun %make-release-args (version &optional (sha nil))
+  "Common kwargs for INSERT-RELEASE-IF-NEW under software=irn."
+  (list :release-id      (format nil "irn/x-y/~A" version)
+        :software        "irn"
+        :os              "x"
+        :arch            "y"
+        :os-versions     #()
+        :version         version
+        :blob-sha256     (or sha (format nil "~64,'0X" (sxhash version)))
+        :blob-size       1
+        :manifest-sha256 "0"
+        :published-by    "test"))
+
+(test insert-release-if-new-returns-inserted-on-first-call
+  "First call for a (sw, os, arch, version) tuple returns
+:inserted + NIL, and the row is queryable afterwards via
+GET-RELEASE-BY-TUPLE."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           (multiple-value-bind (status existing)
+               (apply #'ota-server.catalogue:insert-release-if-new
+                      cat (%make-release-args "1.0.0" "deadbeef"))
+             (is (eq :inserted status))
+             (is (null existing)))
+           (let ((r (ota-server.catalogue:get-release-by-tuple
+                     cat "irn" "x" "y" "1.0.0")))
+             (is (string= "deadbeef" (getf r :blob-sha256)))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test insert-release-if-new-returns-existing-on-duplicate-tuple
+  "Second call for the SAME tuple returns :existing + the previously-
+stored row (not the newly-supplied args).  This is what the publish
+handler dispatches its `200 idempotent` / `409 conflict` decision
+on -- the existing row's blob-sha256 is the source of truth."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           (apply #'ota-server.catalogue:insert-release-if-new
+                  cat (%make-release-args "1.0.0" "first-blob"))
+           ;; Second call with a DIFFERENT blob-sha256 still gets
+           ;; back the FIRST blob in :existing -- this is what
+           ;; lets the handler distinguish idempotent re-publish
+           ;; (sha matches) from conflict (sha differs).
+           (multiple-value-bind (status existing)
+               (apply #'ota-server.catalogue:insert-release-if-new
+                      cat (%make-release-args "1.0.0" "second-blob"))
+             (is (eq :existing status))
+             (is (string= "first-blob" (getf existing :blob-sha256))
+                 ":existing must return the row already in the DB, ~
+                  not the just-attempted one")))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test insert-release-if-new-is-atomic-under-concurrent-callers
+  "N parallel threads racing on the same tuple: exactly ONE returns
+:inserted, the rest return :existing.  This is the v1.1.1 fix --
+prior to BEGIN IMMEDIATE wrapping the lookup+insert, the loser of
+the race hit a SQLITE_CONSTRAINT 500 because both callers passed
+the bare GET-RELEASE-BY-TUPLE check before either INSERT landed."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let* ((n-threads 8)
+                (results-lock (bordeaux-threads:make-lock "results"))
+                (statuses '())
+                (errors '())
+                (start-barrier (bordeaux-threads:make-condition-variable))
+                (start-mutex (bordeaux-threads:make-lock "start"))
+                (ready 0)
+                (go nil)
+                (threads
+                  (loop for i below n-threads
+                        collect
+                        (bordeaux-threads:make-thread
+                         (lambda ()
+                           ;; Wait for the conductor to release us all
+                           ;; together so the contention is real.
+                           (bordeaux-threads:with-lock-held (start-mutex)
+                             (incf ready)
+                             (loop until go
+                                   do (bordeaux-threads:condition-wait
+                                       start-barrier start-mutex)))
+                           (handler-case
+                               (multiple-value-bind (status existing)
+                                   (apply #'ota-server.catalogue:insert-release-if-new
+                                          cat (%make-release-args "1.0.0"
+                                                                  (format nil "~64,'0X" i)))
+                                 (declare (ignore existing))
+                                 (bordeaux-threads:with-lock-held (results-lock)
+                                   (push status statuses)))
+                             (error (e)
+                               (bordeaux-threads:with-lock-held (results-lock)
+                                 (push (princ-to-string e) errors)))))))))
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           ;; Wait for every worker to be parked on the barrier.
+           (loop until (bordeaux-threads:with-lock-held (start-mutex)
+                         (= ready n-threads))
+                 do (sleep 0.01))
+           (bordeaux-threads:with-lock-held (start-mutex)
+             (setf go t)
+             (bordeaux-threads:condition-notify start-barrier)
+             ;; condition-notify wakes one; broadcast wakes all.
+             #+sbcl (loop repeat n-threads
+                          do (bordeaux-threads:condition-notify start-barrier)))
+           (mapc #'bordeaux-threads:join-thread threads)
+           (is (null errors)
+               "no thread should hit SQLITE_CONSTRAINT or any other ~
+                error; got: ~{~%  ~A~}" errors)
+           (is (= n-threads (length statuses))
+               "expected ~A status results, got ~A" n-threads (length statuses))
+           (is (= 1 (count :inserted statuses))
+               "exactly one thread must win and return :inserted; ~
+                got ~A :inserted out of ~A" (count :inserted statuses)
+                                            (length statuses))
+           (is (= (1- n-threads) (count :existing statuses))
+               "all losers must return :existing; got ~A :existing out of ~A"
+               (count :existing statuses) (length statuses)))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (test get-latest-release-mixed-ignores-non-semver
   "When SOME versions are semver and some are not, the non-semver
 ones are ignored and the highest-semver wins.  This matches the

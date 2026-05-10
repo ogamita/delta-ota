@@ -53,14 +53,27 @@
 
 (defun build-patches-for-release (cas catalogue
                                   &key software os arch new-version
-                                       new-release-id new-blob-sha)
+                                       new-release-id new-blob-sha
+                                       on-progress)
   "Build a patch from every previously published release of the same
    (software, os, arch) to the new release.  Returns a list of plists
    describing the patches built.
 
 Logs per-patch progress (\"publish: bsdiff N/M from VERSION ...\")
 to *standard-output* so operators tailing the server log can see
-how far through the fan-in pass the publish is."
+how far through the fan-in pass the publish is.
+
+ON-PROGRESS, when supplied, is a function called once with each of:
+
+  (:event :patches-started :total M)
+  (:event :patch-built     :i I :total M
+                           :from VERSION :sha SHA :size SIZE)
+  (:event :patches-done    :built M)
+
+The publish handler uses ON-PROGRESS to emit NDJSON events on a
+streaming HTTP response (since v1.1.1).  Other callers that don't
+care can omit the callback and get the same return shape as
+before."
   (let* ((all (ota-server.catalogue:list-releases catalogue software))
          (priors (remove-if-not
                   (lambda (rel)
@@ -72,13 +85,12 @@ how far through the fan-in pass the publish is."
          (built '())
          (i 0))
     (when (plusp total)
-      ;; ~:P would print "patchs" (CL's pluraliser only knows "+s",
-      ;; not English's "-ches" rule); use ~:[~;es~] with a (/= 1 total)
-      ;; flag instead.
       (format t "publish: building ~D patch~:[~;es~] for ~A/~A-~A/~A~%"
               total (/= 1 total)
               software os arch new-version)
-      (force-output))
+      (force-output)
+      (when on-progress
+        (funcall on-progress (list :event :patches-started :total total))))
     (dolist (rel priors)
       (incf i)
       (format t "publish: bsdiff ~D/~D from ~A (~A bytes) ...~%"
@@ -94,9 +106,17 @@ how far through the fan-in pass the publish is."
                :to-blob-sha     new-blob-sha)
             (push (list :from (getf rel :version)
                         :sha256 sha :size size :patcher "bsdiff")
-                  built))
+                  built)
+            (when on-progress
+              (funcall on-progress
+                       (list :event :patch-built
+                             :i i :total total
+                             :from (getf rel :version)
+                             :sha sha :size size))))
         (error (e)
           (format *error-output*
                   "build-patches: skipping ~A->~A: ~A~%"
                   (getf rel :release-id) new-release-id e))))
+    (when (and on-progress (plusp total))
+      (funcall on-progress (list :event :patches-done :built (length built))))
     (nreverse built)))

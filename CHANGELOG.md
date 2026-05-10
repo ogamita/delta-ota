@@ -19,6 +19,197 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **libota test backfill** — closes the gap acknowledged in
+  Q1 of `questions.txt`. Coverage went from **0.5 % → 77.6 %**
+  (just shy of the QA-plan's 80 % target for `client/libota/`;
+  the remaining 2.4 pp are in the patch-download branch, the
+  `cfg.Timeout` wiring, and the install-token exchange path,
+  each of which needs more elaborate fixtures and is recorded
+  as a follow-up). 28 new tests across:
+  - **pure-function helpers**: `defaultOTAHome` (env / $HOME /
+    fallback), `(Config) fallbackRatio` (default 0.7 / explicit
+    / non-positive), `pickPatch` (smallest-matching, no-match,
+    non-bsdiff filter, ratio cap, blob_size=0 means no cap),
+    `checkTrust` (TOFU, persisted-key match / change, trusted-
+    set match / unlisted), `short`, `pruneOldArtefacts`
+    (no-op under 3 history entries / drops oldest blob +
+    archived dist + matching patches at ≥ 3).
+  - **`Install` integration** against an `httptest` server with
+    a freshly-generated Ed25519 keypair: happy-path explicit
+    version, `--latest`/`""` resolution, software-mismatch
+    detection, tampered-manifest signature rejection,
+    untrusted-pubkey rejection, blob-hash mismatch rejection,
+    pinned-key-change rejection (TOFU then second install with
+    a different key).
+  - **`Upgrade`** populates Previous correctly (1.0.0 → 1.0.1).
+  - **`Revert`** errors with no Previous; swaps Current/Previous
+    cleanly when Previous exists.
+  - `Drain` utility byte-count.
+
+### Changed
+- **CI: dev-image cache backend switched from `inline` to a
+  registry cache ref.** Buildx's inline cache exporter is
+  silently a no-op on multi-platform manifests
+  (`linux/amd64,linux/arm64`); the prior `--cache-to type=inline`
+  was therefore writing nothing, and every pipeline was
+  rebuilding the apt-get + go-tarball + Quicklisp prebake
+  stages from scratch. Now uses
+  `--cache-to type=registry,ref=$CI_REGISTRY_IMAGE/dev:cache,mode=max`
+  with a matching `--cache-from`. Every intermediate layer is
+  pushed to a sibling `dev:cache` tag so the next build can
+  actually reuse them.
+- **CI: `build-server-image` is gated on tags only** (was: master
+  AND tags). The rolling `:latest` and the versioned
+  `:vX.Y.Z` tags are now both built only on tag pushes,
+  halving the QEMU-emulated arm64 buildx burn (~10 min per
+  pipeline) on master. The `release` publish job (already
+  tag-gated) still fires correctly because its `needs:` on
+  `build-server-image` is satisfied on tag pushes.
+
+### Added
+- **`tests/e2e/two-process-publish.sh`** — boots two independent
+  `ota-server` processes against the same data dir on different
+  ports and races three publish scenarios: same tuple + same
+  blob (expect 201/200, idempotent loser), same tuple + different
+  blob (expect 201/409, conflict loser), different versions (both
+  201, no contention). Followed by a catalogue-consistency check
+  proving both processes list the same 4 versions afterwards.
+  Closes the "real two-process e2e" open item recorded in
+  ADR-0006 — the 8-thread fiveam test exercises the same SQLite
+  locking via threads sharing one connection, this one verifies
+  the same property across actual `fork(2)`-isolated processes.
+  Wired into `make e2e` as `e2e-two-process` and into the GitLab
+  CI `e2e` job. Live-verified: all four checks pass (201/200,
+  201/409, 201/201, 4-version agreement).
+
+### Fixed
+- **Publish handler is now atomic across multiple ota-server
+  processes** sharing one data directory. Two narrow races were
+  documented and closed:
+
+  - *Same `(software, os, arch, version)`*: the lookup-then-insert
+    sequence in the handler used to let two processes both pass
+    the existence check, with the loser then propagating
+    `SQLITE_CONSTRAINT` as a 500. Now wrapped in `BEGIN
+    IMMEDIATE` via the new
+    `ota-server.catalogue:insert-release-if-new` — exactly one
+    caller wins (`:inserted`), the rest see the existing row
+    (`:existing`) and dispatch normally on the v1.0.4
+    idempotent-vs-conflict logic.
+
+  - *Different versions of the same software within one
+    wall-clock second*: the v1.1.0 strict-monotonic
+    `published_at` rule was previously per-process only; now
+    `next-published-at`'s `SELECT MAX` runs inside the same
+    `BEGIN IMMEDIATE` transaction, so the guarantee holds
+    across processes too.
+
+- **Manifest disk writes only happen on `:inserted`** — the
+  pre-v1.1.1 handler wrote `manifests/<sw>/<version>.json` and
+  `.sig` *before* inserting the row. In a 409-conflict race (B's
+  blob differs from A's), B used to overwrite the on-disk
+  manifest with one for B's blob even though B's row was
+  rejected; subsequent `GET /manifest` would have served B's
+  signed manifest while the catalogue pointed at A's blob. Fix:
+  compute manifest fully in memory, dispatch on `insert-release-
+  if-new`, write to disk only on the `:inserted` branch.
+
+  Full analysis in [docs/adr/0006-multi-process-catalogue-access.org](docs/adr/0006-multi-process-catalogue-access.org).
+
+### Added
+- **`ota-server.catalogue:insert-release-if-new`** — atomic
+  lookup-and-insert returning `(values :inserted nil)` or
+  `(values :existing existing-row)`. 9 new unit tests
+  covering the single-call paths AND an 8-thread barrier-
+  synchronised race that proves exactly one thread wins.
+- **ADR-0006: Multi-process access to one catalogue** — per-layer
+  analysis (SQLite WAL, CAS, manifests, key) + the two races
+  + the design choice + open items (SQLITE_BUSY handling,
+  audit row for re-publishes, real two-process e2e).
+
+### Added
+- **Real-time publish progress over HTTP (chunked NDJSON).** When
+  `ota-admin publish` opts in via `Accept: application/x-ndjson`
+  (the new default; opt out with `--no-stream`), the server's
+  publish handler responds `200` with a chunked
+  `application/x-ndjson` stream of progress events instead of
+  buffering until the bsdiff fan-in completes. Operators see
+  per-patch progress as it arrives:
+
+  ```
+  $ ota-admin publish ./build/release --software=foo \
+      --version=1.0.4 --os=linux --arch=amd64
+  publish foo/linux-amd64 version 1.0.4 …
+    · stored foo/linux-amd64/1.0.4 (22603776 bytes)
+    · building 3 patches …
+    · patch 1/3 from 1.0.1 (213 bytes)
+    · patch 2/3 from 1.0.2 (12024033 bytes)
+    · patch 3/3 from 1.0.3 (11716933 bytes)
+    · fan-in done (3 built)
+    · manifest re-signed
+  publish: code=200 body={"event":"done","release_id":...,"patches_built":3}
+  ```
+
+  Event types: `stored`, `patches-started`, `patch-built`,
+  `patches-done`, `manifest-resigned`, `done`, plus `error` on
+  mid-stream failure. The final `done` event carries the same
+  payload as the legacy 201 body — simple consumers can ignore
+  intermediate events and parse only the last line.
+
+  **Backwards-compatible.** Clients that don't send `Accept:
+  application/x-ndjson` still get the v1.0/v1.1.0 single-shot
+  `201 application/json` response. The pre-streaming gates
+  (`200 idempotent`, `409 conflict`) keep their HTTP status
+  codes too — streaming only kicks in for the actually-long
+  patch fan-in. No wire-format break.
+
+  Implementation: server-side `streaming-ndjson-response` helper
+  + `client-accepts-ndjson-p`; patcher
+  `build-patches-for-release` gains `:on-progress` callback.
+  Client-side `%post-stream` (uses dexador's `:want-stream
+  :force-binary`), `%read-utf8-line`, and
+  `%consume-publish-response` (parses NDJSON line-by-line for
+  `application/x-ndjson`, falls back to slurping the whole body
+  for `application/json`). 23 new client-side unit tests + 14
+  new server-side. Live-verified against a v1.1.1 server with
+  0/1/2 priors.
+- **`ota-server gc` CLI subcommand is now real**, not a stub
+  ("phase-1 stub." was its entire body in v1.0.x–v1.1.0). It
+  invokes the same `ota-server.workers:gc-software` worker the
+  HTTP `POST /v1/admin/software/<sw>/gc` handler uses, so cron
+  / systemd timers can run GC without going through the API.
+  Flags: `--software=NAME` (required), `--min-user-count=N`
+  (default 0), `--min-age-days=N` (default 30), `--dry-run`.
+  Exit 2 on missing `--software`, 0 on success. Prints a
+  one-line summary then one row per pruned release-id; also
+  appends an `identity="cli"` row to the audit log so the
+  publish-and-gc flow is traceable end-to-end.
+- **`[server].admin_token` TOML key is now read by the loader.**
+  Documented in `operations.org` § Authentication since v1.0.x
+  but never wired — `[server].admin_token = "x"` was silently
+  ignored, leaving env-var as the only way to set a non-default
+  token. The sample TOMLs ship with the line commented out;
+  `OTA_ADMIN_TOKEN` env-var still wins over the file value (no
+  precedence change). 3 new unit tests in `config-tests.lisp`
+  (file-only, default-when-absent, env-overrides-file).
+
+### Removed
+- **`libota.ErrNotImplemented`** — defined but no entry point
+  ever returned it (every C-ABI export `ota_install /
+  ota_upgrade / ota_revert / ota_version / ota_last_error` is
+  real). Dead code; deleted.
+
+### Notes
+- Closes the three "Operator polish" backlog items in
+  `docs/ota-implementation-plan.org` § Post-1.0 backlog.
+  Plan checkboxes flipped to `[X]`. Server suite is now 154
+  checks (was 141 at v1.1.0 cut).
+
+## [1.1.0] - 2026-05-10
+
+## [1.1.0] - 2026-05-10
+
 ### Fixed
 - **Server: `published_at` is now strictly monotonic per software.**
   v1.0.x stamped publish timestamps via SQL's

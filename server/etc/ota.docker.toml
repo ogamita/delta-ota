@@ -15,6 +15,11 @@ log_level  = "info"
 # cores you want serving HTTP, capped by your patcher.worker_count.
 worker_num = 8
 
+# Admin bearer token.  Set OTA_ADMIN_TOKEN in the container's
+# environment for production -- env-var wins over this file value.
+# Uncomment for evaluation/dev only; never commit a real token.
+# admin_token = "dev-token"
+
 [tls]
 cert         = "/etc/ota/server.crt"
 key          = "/etc/ota/server.key"
