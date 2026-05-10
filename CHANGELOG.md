@@ -19,6 +19,20 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Planning
+- **Release-1.5 plan landed.** Foundation slice for client-software
+  state tracking (snapshot table) + exact `count-users-at-release`
+  + `patch_jobs` orphan cleanup tied to release GC + an admin SQL
+  statistics surface (population-per-release, fleet-summary,
+  stale-clients, gc-impact, recent-events, upgrade-failure-rate,
+  adoption-curve, recovery-events). See
+  [docs/release-1.5-plan.org](docs/release-1.5-plan.org) for the
+  schema, agent reporting contract, query catalogue, test plan,
+  and open questions. Code lands in subsequent commits on this
+  branch.
+
+## [1.4.2] - 2026-05-10
+
 ### Fixed
 - **`tests/e2e/resume-download.sh` still broken on CI after 1.4.1.**
   1.4.1's `curl | head -c N` pipe tripped on `set -o pipefail`
