@@ -1,0 +1,618 @@
+#+TITLE: delta-ota — QA plan
+#+AUTHOR: Ogamita Ltd.
+#+DATE: 2026-05-10
+#+OPTIONS: toc:2 num:t
+
+This document defines the QA strategy for Ogamita Delta OTA at
+v1.1.0.  It is meant to be read by engineering, by sales (when a
+customer asks how the project assures quality), and by reviewers
+auditing a release.  Each section lists the *current state*, the
+*target*, the *concrete tasks* to close the gap, and the *cadence*
+at which the activity runs.
+
+* Aim and scope
+
+The system has three independent shipping artefacts -- =ota-server=
+(SBCL on Linux), =ota-admin= (SBCL CLI), and the client (=libota= +
+=ota-agent=, Go, multi-OS) -- and a public wire contract
+(HTTP/JSON API + manifest schema + libota C ABI + state.json).
+The wire contract is frozen for the v1.x line; everything else
+evolves.
+
+QA must therefore ensure:
+
+1. *Functional correctness* per release (unit + integration +
+   e2e).
+2. *Wire-format stability* (cross-version compatibility tests
+   between an N-1 client and an N server).
+3. *Resilience under stress* (load + soak; the "first-Monday
+   morning upgrade storm" sizing in =docs/operations.org= must be
+   demonstrable, not asserted).
+4. *Defence against malformed / hostile input* (fuzz at every
+   parsing boundary).
+5. *Auditable change discipline* (code review with an explicit
+   checklist, security review for changes that touch the wire,
+   the catalogue, or vendored code).
+
+* Test layers — current state
+
+| Layer                         | Tests today | Cadence                |
+|-------------------------------+-------------+------------------------|
+| Lisp unit (fiveam)            | 82 tests / 141 server checks + 102 admin checks | per-PR via CI =lisp-test= / =lisp-test-admin= |
+| Go unit                       | ≈40 test files (libota, listing, verify, manifest, patch, platform, tarx, transport) | per-PR via CI =go-test= |
+| Go fuzz                       | 5 targets (manifest Parse / Verify, tarx Extract / SafeName, patch Apply) | per-PR =go-fuzz=, FUZZTIME=5s |
+| Shell e2e                     | 5 scripts (run, auth, ops, recovery, parallel) | =make e2e=, run on master + tags + manual |
+| CLI smoke                     | =ota-server= + =ota-admin= subprocess tests against the built binary | included in the Lisp test suites |
+| Multi-arch build verification | linux / darwin / windows × amd64 / arm64 | per-PR =build-client-*= |
+| Self-containment              | =ldd= / =otool -L= ⇒ no third-party dynamic deps | per-PR =self-contained-check= |
+| Vendored-source integrity     | SHA-256 re-hash of every vendored subtree | per-PR =vendor-verify= |
+| Licence-header sweep          | every source file carries an SPDX header | per-PR =licence-headers= |
+| SAST                          | GitLab's Semgrep template | per-PR via =include: SAST= |
+
+What is *not* yet in place:
+
+  - Code coverage measurement (Go and Lisp).
+  - Property-based / generative tests beyond the fuzz targets.
+  - A documented edge-case catalogue (the cases below exist
+    informally as fiveam tests but aren't aggregated).
+  - Long-running soak.
+  - Cross-version compatibility tests.
+  - Performance regression baselines (patch-build time vs blob
+    size, install latency vs patch chain length, etc.).
+  - The headline load test: 10 000 concurrent clients hitting a
+    real Hetzner-hosted server.
+  - A formal code-review process with required reviewers,
+    security-review triggers, and a PR checklist.
+
+The rest of this document closes those gaps.
+
+* Code review
+
+** Process
+
+- *Two-person rule.* Every change to =server/=, =admin/=,
+  =client/libota=, =client/internal/manifest=,
+  =client/internal/patch=, =client/internal/transport=, or
+  =schemas/= requires a reviewer other than the author before
+  merge.  Trivial changes (docs, comments, =.gitignore=, formatting)
+  may be self-approved with an explicit "self-merge: docs-only"
+  in the merge commit message.
+- *Required CI green.* The pipeline (server unit, admin unit,
+  client unit + fuzz + cross-compile, e2e on master/tag, vendor
+  + licence + SAST) must be green before merge.
+- *No force-push to =master=.*  Tags on =master= are immutable;
+  releases are cut on =release-X.Y.Z= branches and merged through
+  a PR.
+
+** Security-review trigger
+
+A change requires an additional security review (any independent
+engineer, recorded as a second sign-off in the PR thread) when
+*any* of these are true:
+
+  - touches Ed25519 sign / verify or any crypto path
+    (=server/src/manifest/=, =client/internal/manifest=);
+  - changes the manifest schema or the HTTP/JSON wire shape
+    (=schemas/=);
+  - touches authentication / install-token handling
+    (=server/src/http/server.lisp= auth helpers,
+    =server/src/catalogue/= bearer storage);
+  - imports or modifies vendored code (=vendor/=,
+    =client/internal/vendor/=);
+  - touches the safe-extractor (=client/internal/tarx/=);
+  - changes the tarball-determinism path (=server/src/storage/tar.lisp=).
+
+** PR checklist (template)
+
+Add =.gitlab/merge_request_templates/Default.md= and the GitHub
+equivalent so PR creators see this list automatically:
+
+#+begin_src markdown
+## Summary
+
+<one paragraph>
+
+## What changed
+
+- <bulleted list>
+
+## Compatibility
+
+- [ ] No public-contract change (HTTP/JSON API, manifest schema,
+      libota C ABI, state.json).
+- [ ] If a public contract changed, the change is additive and
+      backwards-compatible (new optional field, new endpoint).
+- [ ] If neither is true, this is a major-version cut and
+      `schemas/CHANGELOG.md` is updated.
+
+## Tests
+
+- [ ] Unit tests added / updated for the changed behaviour.
+- [ ] Edge cases from the QA-plan catalogue are still covered.
+- [ ] Fuzz target updated (if a parsing boundary changed).
+- [ ] e2e exercises the full path (if a handler changed).
+- [ ] Coverage didn't regress against the per-package threshold.
+
+## Security
+
+- [ ] No new vendored code without a `VENDORED.md` + sha256 +
+      licence audit.
+- [ ] No new crypto / signature / token path without a
+      security-review sign-off.
+- [ ] No external-input parser without a fuzz target.
+
+## Documentation
+
+- [ ] CHANGELOG entry under [Unreleased].
+- [ ] `docs/operations.org` updated if behaviour or config changed.
+- [ ] `docs/dependencies.org` updated if a dep was added.
+#+end_src
+
+** Cadence
+
+Per-PR.
+
+* Unit tests
+
+** Targets
+
+| Package                                       | Threshold | Rationale                                |
+|-----------------------------------------------+-----------+------------------------------------------|
+| =server/src/manifest/=                        | 95 %      | Crypto path; no tolerance for blind spots |
+| =server/src/storage/=                         | 90 %      | Tar determinism is a release-blocker     |
+| =server/src/catalogue/=                       | 90 %      | Has 30+ functions; one-per-table-op      |
+| =server/src/config/=                          | 90 %      | TOML loader is the operator's contact surface |
+| =server/src/http/=                            | 80 %      | Handler arms; some 5xx branches hard to reach |
+| =server/src/workers/=                         | 80 %      | Patch worker shells out; mostly e2e     |
+| =admin/src/=                                  | 80 %      | Mostly orchestration; argv parsing covered |
+| =client/internal/manifest/=                   | 95 %      | Mirror of server crypto                  |
+| =client/internal/patch/=                      | 90 %      | Vendored bspatch wrapper                 |
+| =client/internal/tarx/=                       | 95 %      | Safe-extractor: defence in depth         |
+| =client/internal/state/=, =platform/=, =transport/= | 85 %  | Per-platform paths                       |
+| =client/libota/=                              | 80 %      | Top-level orchestrator                   |
+| =client/agent/=                               | 70 %      | CLI wiring; thin                         |
+
+** Tooling
+
+- *Go*: =go test -coverprofile= per package, aggregated by
+  =go tool cover -func= to a single percent per package.  Wire
+  a =make coverage-go= target that runs the suite and emits a
+  =build/coverage/go.txt= summary plus per-package HTML.
+- *Lisp*: =sb-cover= via a thin wrapper.  Wire =make coverage-lisp=
+  that runs the fiveam suites with =sb-cover:start=, then
+  =sb-cover:report=.  CI publishes the resulting HTML as a job
+  artefact.
+- *Threshold enforcement*: a small =tools/check-coverage.sh= reads
+  the per-package summaries against this table and fails CI when
+  any package regresses below its threshold.
+
+** Tasks
+
+- [ ] Add =make coverage-go=, =make coverage-lisp=, and the
+  =tools/check-coverage.sh= gate.
+- [ ] Wire both into a new =coverage= CI stage that runs after
+  =verify=.
+- [ ] Backfill tests where the current numbers fall short of the
+  threshold (mostly =server/src/http/= and =server/src/workers/=).
+
+** Cadence
+
+Per-PR (CI).  The coverage report is also surfaced on the merge
+request page so reviewers can see deltas.
+
+* Fuzz testing
+
+** Existing targets
+
+  - =manifest.FuzzParse= (rejects malformed JSON, future
+    schema_version)
+  - =manifest.FuzzVerify= (signature verification)
+  - =tarx.FuzzExtract= (rejects path traversal, NUL, absolute
+    paths, Windows reserved names)
+  - =tarx.FuzzSafeName=
+  - =patch.FuzzApply= (bspatch resilience)
+
+** Targets to add
+
+| New target                              | Why                                                        |
+|-----------------------------------------+------------------------------------------------------------|
+| =server toml-loader=  (Lisp via clop)   | Operator's contact surface; malformed TOML must error cleanly |
+| =server admin-publish= (HTTP request body) | Defence against hostile blob uploads (size, sha mismatch, headers) |
+| =server install-token-claim=            | Token format is the auth surface                            |
+| =transport.FuzzManifestResponse=        | Client must reject server responses that don't match expected shape |
+| =state.FuzzLoad=                        | Corrupted =state.json= must fail-closed, not crash          |
+
+** Cadence
+
+- *Per-PR* (CI =go-fuzz=): =FUZZTIME=5s= per target — catches
+  silly crashes only.
+- *Nightly* (a new GitLab scheduled pipeline): =FUZZTIME=5m= per
+  target.  Crash corpus retained as a CI artefact and committed to
+  =tests/fuzz-corpus/= when reproducible.
+- *Pre-release* (manual on the release-X.Y.Z branch):
+  =FUZZTIME=1h= per target.
+
+** Tasks
+
+- [ ] Add the five new fuzz targets.
+- [ ] Create the GitLab scheduled pipeline (nightly at 02:00 UTC,
+  non-blocking, only fires on =master=).
+- [ ] Wire =tests/fuzz-corpus/= into version control with a
+  README explaining how reproducer files land there.
+
+* Integration tests (e2e)
+
+** Existing scripts
+
+  - =run.sh=          install + upgrade + revert path on Linux
+  - =auth.sh=         install-token mint + exchange + bearer reuse
+  - =ops.sh=          publish + GC + verify + audit
+  - =recovery.sh=     anchors + =doctor --recover=
+  - =parallel.sh=     50 concurrent reads while a publish is in
+                      flight (multi-worker Woo regression)
+
+** Scripts to add
+
+| Script                | What it covers                                                      |
+|-----------------------+---------------------------------------------------------------------|
+| =cross-version.sh=    | N-1 client against N server, and N client against N-1 server, asserting compatibility |
+| =full-cycle.sh=       | install v1 → upgrade v2 → upgrade v3 → revert → upgrade-to-latest → verify |
+| =disk-full.sh=        | client with a tmpfs-backed =$OTA_HOME= sized to fit one distribution; assert clean error on second install |
+| =network-drop.sh=     | =tc qdisc= on the loopback to drop packets mid-blob-download; assert resume / retry / clean failure |
+| =corrupted-blob.sh=   | server returns a blob whose bytes don't match the SHA-256; assert client refuses + leaves =current= alone |
+| =postgres.sh= (later) | once PG backend ships, run the existing four scripts against it    |
+
+** Cadence
+
+- =make e2e= (the full set) runs on master + tags + manual on
+  feature branches via the existing =:rules: when: manual=.
+- =cross-version.sh= ALSO runs on every PR that touches =schemas/=,
+  =server/src/http/=, =client/internal/manifest=, or
+  =client/internal/transport= -- enforced via a new CI rule
+  reading =git diff --name-only=.
+
+** Tasks
+
+- [ ] Write the five new scripts (one per row in the table above).
+- [ ] Wire =cross-version.sh= into both the unconditional e2e job
+  and the path-based PR rule.
+
+* Edge-case catalogue
+
+A single catalogue lives at =docs/edge-cases.org= (to be created
+as part of this plan), one row per case, with three columns:
+*description*, *expected behaviour*, *test that covers it*.  No
+case in the catalogue is allowed to have an empty *test* column
+without an explicit "deferred — issue #N" pointer.
+
+Initial seed (53 cases):
+
+** Manifest / wire
+
+  - empty manifest body
+  - manifest with =schema_version: 0= (rejected)
+  - manifest with =schema_version: 99= (rejected)
+  - manifest with =release_id= mismatch from URL
+  - manifest with non-hex blob.sha256
+  - manifest signature using a different (untrusted) key
+  - manifest signed with the right key but tampered body
+  - JSON object key ordering changes ⇒ same manifest_sha256
+    (deterministic encoder)
+
+** Patch chain
+
+  - patch where =from_release_id= is unknown
+  - patch with unknown =patcher= field
+  - patch larger than its target blob (fallback to full blob)
+  - patch chain longer than the fallback ratio (default 0.7)
+  - apply succeeds but resulting blob's SHA-256 ≠ expected
+    (refuse, leave previous current alone)
+
+** Tar / extractor
+
+  - entry with =..= in name
+  - entry with NUL in name
+  - entry with absolute path
+  - entry with Windows reserved name (CON, PRN, …)
+  - symlink loop (a → b, b → a)
+  - duplicate entries (later wins, no truncation/append)
+  - entry with mode 0777 ⇒ normalised to 0644 / 0755
+  - 0-byte release
+  - 8 GiB release (the documented v1 cap)
+  - filenames in CJK / Cyrillic / RTL scripts
+
+** Server (HTTP / catalogue)
+
+  - publish with empty Authorization header
+  - publish with the wrong bearer
+  - publish with =Content-Length: 0=
+  - publish with the wrong content-type
+  - re-publish same =(software, os, arch, version)=, same blob
+    (200 idempotent — covered by v1.0.4 tests)
+  - re-publish same tuple, different blob (409 conflict)
+  - publish out-of-order versions (older after newer; latest
+    must remain semver-highest)
+  - publish two simultaneous within the same wall-clock second
+    (published_at strictly monotonic — covered by v1.1.0 tests)
+  - manifest fetch for a non-existent release (404)
+  - blob fetch with the wrong SHA in the URL (404)
+  - blob fetch from a sendfile path while the file is being
+    overwritten (refuse during write, serve after rename)
+  - install-token claimed twice (second attempt rejected)
+  - install-token expired
+  - GC with =dry_run=true= (no rows deleted)
+  - GC with =min_user_count=0= but =uncollectable= release
+    (release retained)
+
+** Client
+
+  - =OTA_HOME= on a read-only filesystem
+  - =OTA_HOME= = =$HOME/.ota= but =$HOME= unset
+  - Windows symlink fallback to =current.path=
+  - SIGINT during blob download (partial blob removed)
+  - SIGINT during atomic flip (state stays consistent — old
+    current still resolves)
+  - state.json that's syntactically valid JSON but missing
+    =current= (fail-closed message)
+  - state.json that's truncated (fail-closed)
+
+** Configuration / boot
+
+  - server boots with empty config (defaults)
+  - server boots with a TOML that contradicts an env-var (env
+    wins)
+  - server boots with =worker_num=0= (treated as no override)
+  - server boots with TOML that has an unknown key (logged,
+    ignored)
+  - clock jumps backwards mid-boot (catalogue published_at still
+    monotonic)
+
+** Operational
+
+  - =systemctl restart= during a publish (publish either
+    completes before SIGTERM or 503s cleanly)
+  - server killed -9 mid-publish (catalogue + manifests dir
+    survives; partial blob removed on next start)
+  - disk full on the server during a publish (clean 507; no
+    partial release recorded)
+  - 10 000 concurrent agent install_event POSTs (record-best-effort,
+    no 5xx storm)
+
+** Cadence
+
+- The catalogue is a *checklist*: every PR that adds a behavioural
+  branch updates it.  Reviewer enforces.
+- A quarterly sweep verifies that every entry's *test* column
+  still passes (i.e. the test referenced hasn't been disabled or
+  renamed).
+
+** Tasks
+
+- [ ] Create =docs/edge-cases.org= seeded with the 53 cases above.
+- [ ] Backfill missing test references (most exist; the
+    cross-version, disk-full, and network-drop ones are new).
+- [ ] Add the quarterly-sweep step to =docs/operations.org=.
+
+* Performance regression
+
+** What we measure
+
+Three baselines, each tracked over time so a regression shows up
+as a step in a graph rather than a surprise in production:
+
+| Baseline                    | Metric                          | Target              |
+|-----------------------------+---------------------------------+---------------------|
+| Patch build time            | seconds per MiB of blob         | ≤ 0.5 s/MiB on AX  |
+| Manifest fetch latency      | p99 ms, server warm             | ≤ 50 ms             |
+| Blob download throughput    | MiB/s, single client, sendfile  | ≥ 400 MiB/s on 1 Gb |
+| First-Monday upgrade storm  | clients/sec a single AX server can absorb at p95 ≤ 2 s | TBD by load test |
+| Publish wall-time           | s for a 100 MiB blob over LAN   | ≤ 30 s              |
+
+** Tooling
+
+- A small =tools/perf-bench.sh= that:
+  - boots a fresh server (Docker),
+  - publishes synthetic 10 / 100 / 1000 MiB blobs,
+  - records timings into =build/perf/<git-sha>.json=,
+  - posts the JSON to a (TBD) Grafana / Plausible / static-page
+    dashboard.
+
+** Cadence
+
+- *Pre-release*: run =make perf-bench= against the release tag
+  on a known reference host (the same Hetzner box used for load).
+- *Quarterly*: run a "drift sweep" against the last four releases
+  on the same hardware to detect monotonic regressions.
+
+** Tasks
+
+- [ ] Add =tools/perf-bench.sh= and the =make perf-bench= target.
+- [ ] Decide on the dashboard backend (start with a static
+  =build/perf/index.html= committed under =docs/= for transparency).
+
+* Load testing
+
+** The headline scenario: "first Monday morning"
+
+10 000 unique end-user workstations all wake up at 09:00 local
+time on the first Monday of the month.  Each one:
+
+  1. Boots its OS, runs the autostart =ota-agent watch <name>
+     --once= command.
+  2. Fetches =GET /v1/software/<sw>/releases/latest= (small JSON).
+  3. Compares with the locally-installed version; if different,
+     proceeds.
+  4. Fetches =GET /v1/software/<sw>/releases/<latest>/manifest=
+     (small JSON + signature).
+  5. Picks a patch from =patches_in= if one exists for its
+     current version, else falls back to the full blob.
+  6. Downloads the chosen artefact (=GET /v1/blobs/<sha>= or
+     =GET /v1/patches/<sha>= — both =sendfile(2)= on the server).
+  7. Applies the patch / extracts the blob, atomic flip.
+
+The server's job: serve all that without any client timing out
+beyond a generous 10 s p99 wait, and without OOM / file-handle
+exhaustion / catalogue lock contention.
+
+** Topology
+
+#+begin_src text
+                       ┌────────────────────────────┐
+                       │  Hetzner AX dedicated host │
+                       │  (e.g. AX102: Ryzen 9 7950 │
+                       │   X3D, 64 GB DDR5, 2×1.92  │
+                       │   TB NVMe, 1 Gbps unmetered) │
+                       │  Runs ota-server (Docker)  │
+                       │  + Postgres (when ready)   │
+                       │  + Prometheus node-exporter │
+                       └─────────────▲──────────────┘
+                                     │ 1 Gbps
+              ┌──────────────────────┼──────────────────────┐
+              │                      │                      │
+   ┌──────────┴───────┐  ┌───────────┴──────┐   ┌───────────┴──────┐
+   │ Hetzner Cloud    │  │ Hetzner Cloud    │   │ Hetzner Cloud    │
+   │ CPX31 ×N         │  │ CPX31 ×N         │   │ CPX31 ×N         │
+   │ 4 vCPU / 8 GB    │  │ 4 vCPU / 8 GB    │   │ 4 vCPU / 8 GB    │
+   │ k6 + ota-agent   │  │ k6 + ota-agent   │   │ k6 + ota-agent   │
+   │ ×2 500 simulated │  │ ×2 500 simulated │   │ ×2 500 simulated │
+   │ workstations     │  │ workstations     │   │ workstations     │
+   └──────────────────┘  └──────────────────┘   └──────────────────┘
+        4 cloud VMs × 2 500 simulated clients = 10 000 concurrent
+#+end_src
+
+Per-client memory under k6 is small enough that 2 500 fit on a
+CPX31 (8 GB); we adjust if memory or fd limits bite.  Ramp pattern
+is "all 10 000 within a 30 s window" to mimic the real boot-storm
+(not a smooth ramp).
+
+** Test matrix
+
+| Run | Concurrency | Pattern               | Manifest fetch | Patch dl | Full blob dl | Pass criterion              |
+|-----+-------------+-----------------------+----------------+----------+--------------+-----------------------------|
+| L1  |       1 000 | 30 s ramp             | yes            | yes      | no           | p99 manifest < 200 ms       |
+| L2  |       1 000 | 30 s ramp             | yes            | yes      | yes (10 %)   | p99 dl < 5 s, 0 errors      |
+| L3  |       5 000 | 30 s ramp             | yes            | yes      | yes (10 %)   | p99 dl < 8 s, < 0.1 % err   |
+| L4  |      10 000 | 30 s ramp             | yes            | yes      | yes (10 %)   | p99 dl < 15 s, < 1 % err    |
+| L5  |      10 000 | 30 s ramp + 5 % full  | yes            | yes      | yes (50 %)   | server saturates network — ok |
+| L6  |       1 000 | sustained over 24 h   | hourly poll    | rare     | rare         | RSS stable, no fd leak       |
+
+L1–L5 produce the headline numbers shipped on the datasheet.  L6
+catches resource leaks that a 30-second test would miss.
+
+** Tooling
+
+- *Load generator*: =k6= (Apache 2.0; Go-based; runs scripted
+  scenarios in JS).  Each VK invokes =ota-agent install/upgrade=
+  via =os/exec= so we exercise the *real* client code path,
+  not just an HTTP-level approximation.
+- *Server-side metrics*: =node-exporter= (CPU / memory / disk /
+  network) + Woo's own access log + per-handler timings instrumented
+  via a new =server/src/http/metrics.lisp= shim (deferred until
+  load testing actually runs).
+- *Visualisation*: Grafana (cheapest option: a short-lived
+  Hetzner CPX21 with =grafana-oss= scraping the AX node-exporter).
+
+** Tasks
+
+- [ ] Stand up the AX host (=tools/load-test/provision.sh=:
+  installs Docker, pulls =registry.gitlab.com/ogamita/delta-ota/server:vX.Y.Z=,
+  populates a fixture catalogue with 10 software products × 12
+  versions each).
+- [ ] Write the k6 scripts under =tools/load-test/k6/=.
+- [ ] Provision the four cloud generators (terraform module under
+  =tools/load-test/terraform/=).
+- [ ] Run L1–L4 sequentially; capture results into
+  =build/load-test/<git-sha>/=.
+- [ ] Publish the headline numbers in =docs/perf.org= (already
+  exists; populate from the L4 results).
+- [ ] Tear down the test infra (a single =terraform destroy=).
+
+** Cadence and cost
+
+- *Per release* (every minor; v1.1, v1.2, …): full L1–L5 run.
+  Estimated cost on Hetzner: 1 × AX102 (€105/month, billed
+  hourly), 4 × CPX31 (€16/month each, billed hourly), 1 ×
+  CPX21 for Grafana (€8/month).  A two-day full sweep is
+  roughly €15 in compute.
+- *Quarterly*: L6 (24 h soak).  Same infra; ≈ €30 per run.
+- *Per patch release* (v1.x.y): a smoke variant (L1 only) on
+  Docker locally — no cloud needed.
+
+** Acceptance criteria for shipping a release
+
+A release is *not* tagged until:
+
+  - L1 passes on the same hardware where the previous release
+    passed (no regression at the small-fleet end);
+  - L4 passes within 10 % of the previous release's metrics
+    (no regression at the headline-fleet end);
+  - L6 from the previous release is still passing on the
+    quarterly schedule (the soak we ship today still works).
+
+* Security testing
+
+(Distinct from SAST and from the ad-hoc security-review trigger
+above.  Both feed the catalogue at =docs/edge-cases.org= § Server
+and § Client.)
+
+** Activities
+
+- *Dependency audit* (quarterly): re-hash =vendor/= via
+  =tools/vendor-verify.sh=, compare upstream commits, check for
+  CVE advisories.  Recorded in =docs/dependencies.org= with the
+  audit date.
+- *Threat-model review* (annual): the threat model in
+  =docs/threat-model.org= (already exists) is re-walked against
+  the current code; gaps tracked as issues.
+- *Penetration test* (per-major): once before v2.0.0 (a year+
+  out at v1.1.0 cadence).  External tester; scope = the wire
+  contract + admin-token paths.
+
+** Cadence
+
+Quarterly + annual + per-major as above.
+
+* Tooling summary (everything this plan adds)
+
+| Tool                                        | Status          |
+|---------------------------------------------+-----------------|
+| =make coverage-go=                          | TODO            |
+| =make coverage-lisp=                        | TODO            |
+| =tools/check-coverage.sh=                   | TODO            |
+| 5 new fuzz targets                          | TODO            |
+| 5 new e2e shell scripts                     | TODO            |
+| =docs/edge-cases.org= catalogue (53 cases)  | TODO            |
+| =tools/perf-bench.sh= + =make perf-bench=   | TODO            |
+| =tools/load-test/= (provision + k6 + tf)    | TODO            |
+| GitLab nightly fuzz scheduled pipeline      | TODO            |
+| =.gitlab/merge_request_templates/Default.md=| TODO            |
+| All existing tests + CI                     | DONE (v1.1.0)   |
+
+* Cadence at a glance
+
+| Interval         | Activity                                                    |
+|------------------+-------------------------------------------------------------|
+| Per-PR           | Lisp + Go unit, fuzz 5 s, e2e on master / tag, vendor-verify, licence-headers, SAST, coverage gate |
+| Per-merge-master | + multi-arch container image                                |
+| Per-tag          | + dist-server tarball + GitLab Release publication          |
+| Nightly          | Fuzz 5 m, soak smoke on Docker                              |
+| Pre-release      | Fuzz 1 h, perf-bench, full e2e (incl cross-version), code-review sign-off (incl security-review when triggered) |
+| Per minor        | Hetzner load test L1–L5                                     |
+| Quarterly        | Hetzner soak L6, dependency audit, edge-case catalogue sweep, perf drift sweep |
+| Annual           | Threat-model re-walk                                        |
+| Per major        | External penetration test                                   |
+
+* Open questions for the maintainer
+
+  - Do we want a =build/coverage/= dashboard hosted somewhere
+    permanent, or is "CI artefact, valid for 30 days" enough?
+  - For load testing: is "every minor release" the right cadence
+    given the cost (≈ €15 + half a day of engineering each), or
+    do we want it only on majors + on-demand when a customer
+    asks for sizing data?
+  - Penetration test: in-house team has the skills to do an
+    initial run, or do we budget for an external firm from the
+    first major (v2.0.0)?
+  - Edge-case catalogue: org-mode is consistent with the rest of
+    =docs/=, but a CSV / JSON would let us auto-generate
+    coverage-vs-catalogue reports.  Worth the conversion?
