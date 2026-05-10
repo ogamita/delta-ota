@@ -132,23 +132,32 @@ fi
 
 blob_url="http://127.0.0.1:${OTA_PORT}/v1/blobs/${blob_sha}"
 
-# --- (3) Interrupted GET: --limit-rate + --max-time guarantees a cut
-# regardless of how fast localhost actually is.  100 KB/s × 0.5 s
-# bounds the bytes received to ~50 KB on a 4 MiB blob.
+# --- (3) Interrupted GET: pipe curl through `head -c N` so the cut
+# point is deterministic regardless of network speed.  `head -c N`
+# reads exactly N bytes from stdin and exits; the next write from
+# curl gets EPIPE and curl exits.  The .part file ends up with
+# exactly N bytes -- no timing dependency, no flakiness on fast
+# loopback.
+#
+# We previously tried `curl --limit-rate 100K --max-time 0.5`, but
+# on GitLab's fast saas runner the rate-limiter wasn't enforced
+# before the whole 4 MiB blob came down -- the test was racing
+# the network and losing.  See ADR-0008 for the resume design;
+# this is purely a test-harness fix.
+cut=$((blob_size / 2))
 part="${run_dir}/blob.part"
-echo "tests/e2e/resume: starting interrupted GET (limit-rate 100K, max-time 0.5s)..."
-set +e
-curl -s --limit-rate 100K --max-time 0.5 -o "${part}" "${blob_url}"
-curl_exit=$?
-set -e
+echo "tests/e2e/resume: starting interrupted GET (cutting at byte ${cut} of ${blob_size})..."
+# head's early-close SIGPIPEs curl; that's by design.  We use -s
+# (silent, also silences the resulting "Failure writing output"
+# stderr message) and discard the pipe-status -- the assertion
+# is on part_size, not on curl's exit code.
+set +o pipefail 2>/dev/null || true
+curl -s "${blob_url}" 2>/dev/null | head -c "${cut}" > "${part}"
+set -o pipefail 2>/dev/null || true
 part_size=$(wc -c < "${part}" | tr -d ' ')
-echo "tests/e2e/resume: interrupted at ${part_size} bytes (curl exit=${curl_exit})"
-if [ "${part_size}" -eq 0 ]; then
-    echo "tests/e2e/resume: ✗ got zero bytes — the test isn't actually exercising resume"
-    exit 1
-fi
-if [ "${part_size}" -ge "${blob_size}" ]; then
-    echo "tests/e2e/resume: ✗ download somehow finished within max-time; raise blob size"
+echo "tests/e2e/resume: interrupted at ${part_size} bytes"
+if [ "${part_size}" -ne "${cut}" ]; then
+    echo "tests/e2e/resume: ✗ expected exactly ${cut} bytes, got ${part_size}"
     exit 1
 fi
 

@@ -5,7 +5,7 @@
   :description "Ogamita Delta OTA — distribution server."
   :author "Ogamita Ltd. <support@ogamita.com>"
   :license "AGPL-3.0-or-later"
-  :version "1.4.0"
+  :version "1.4.1"
   :homepage "https://gitlab.com/ogamita/delta-ota"
   :source-control (:git "https://gitlab.com/ogamita/delta-ota.git")
   :bug-tracker "https://gitlab.com/ogamita/delta-ota/-/issues"
