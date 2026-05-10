@@ -1,0 +1,299 @@
+#+TITLE: ADR-0010 — client-software state snapshot
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.5.0.
+
+* Context
+
+Through v1.4 the GC's "is anyone still using this release?"
+question was answered by scanning the =install_events= log:
+
+#+begin_src lisp
+;; pre-v1.5 count-users-at-release
+SELECT COUNT(DISTINCT client_id)
+  FROM install_events
+ WHERE software_name = ?
+   AND release_id    = ?
+   AND status        = 'ok'
+   AND at           >= ?      ;; 180-day recency window
+#+end_src
+
+This had three structural problems:
+
+1. *Lossy by design.*  The endpoint that records events is
+   best-effort (=204= even on parse error).  Network drops between
+   transitions lose events silently.  Uninstall is unobservable
+   (the agent is gone).  So "DISTINCT client_id WHERE latest-event"
+   over-counts dead clients and under-counts ones whose patch
+   flow side-stepped the event log.
+2. *Approximate.*  The =180-day= recency window is a workaround
+   for the lossiness — older "latest events" are assumed
+   superseded.  An installation that genuinely hasn't been
+   updated in 6 months is invisible to the GC.
+3. *Never wired up.*  =POST /v1/events/install= was implemented
+   server-side from phase 4, but the agent was never updated
+   to call it (telemetry stubs landed as "no-op").  So in
+   production the table was empty and =count-users-at-release=
+   always returned 0.  The =min_user_count= threshold was
+   structurally off.
+
+* Decision
+
+Replace the lossy event-log scan with a *snapshot* table whose
+contents reflect *current* state, maintained idempotently by the
+agent on every successful transition.
+
+** Why a snapshot, not just "wire up the events"
+
+Even with the agent reliably reporting events, the structural
+lossiness remains:
+
+| Question                                 | Event-log answer        | Snapshot answer |
+|------------------------------------------+-------------------------+-----------------|
+| How many clients are on X right now?     | DISTINCT-latest, fuzzy  | =COUNT(*)= exact |
+| Who uninstalled?                         | Unobservable            | =current = NULL= |
+| Who's on a 6-month-old install?          | Outside the 180d window | Last-updated-at |
+| How many migrations from X failed?       | =WHERE kind = upgrade=  | n/a             |
+
+Two layers, two purposes:
+
+- *Snapshot* (=client_software_state=): authoritative *current
+  state*.  Source of truth for the GC's =min_user_count= check
+  and for the v1.5 admin stats catalogue.
+- *Events* (=install_events=, kept): append-only audit /
+  analytics stream.  Source of truth for adoption-curve,
+  failure-rate, recovery-event analytics.
+
+The agent reports both on every transition.  Snapshot is what GC
+reads; events is what dashboards read.  They don't have to
+agree row-by-row — events can be lossy and the snapshot still
+gives an exact picture.
+
+** Schema
+
+[[file:../../server/src/catalogue/migrations/0005_client_software_state.sql][migrations/0005_client_software_state.sql]]:
+
+#+begin_src sql
+CREATE TABLE client_software_state (
+    client_id           TEXT NOT NULL,
+    software_name       TEXT NOT NULL,
+    current_release_id  TEXT,                     -- NULL = uninstalled
+    previous_release_id TEXT,                     -- for revert UX
+    last_kind           TEXT NOT NULL,            -- install|upgrade|revert|recover|uninstall
+    last_updated_at     TEXT NOT NULL,
+    PRIMARY KEY (client_id, software_name)
+);
+
+CREATE INDEX idx_css_release  ON client_software_state(software_name, current_release_id);
+CREATE INDEX idx_css_updated  ON client_software_state(last_updated_at);
+#+end_src
+
+Key choices:
+
+- *=client_id= is the existing identity.*  Phase-4 minted UUIDs at
+  install-token exchange; v1.5 introduces no new identifier.
+- *=current_release_id = NULL= for uninstall.*  Keeps the row for
+  fleet stats while excluding it from "who is on X" counts.  An
+  operator can ask "how many uninstalls last quarter" via the
+  event log; the snapshot answers "active fleet".
+- *Two indexes match the two hot queries.*  Per-release
+  population (the GC's call) and stale-clients ("haven't heard
+  from in N days").
+
+** Server-side API
+
+[[file:../../server/src/http/server.lisp][server.lisp]]:
+
+#+begin_src
+PUT /v1/clients/me/software/<software>
+Body: { "current_release_id": "...",
+        "previous_release_id": "...",      // optional
+        "kind": "upgrade",                  // install|upgrade|revert|recover|uninstall
+        "at": "2026-05-10T..." }            // optional; server-now() otherwise
+→ 200 { "client_id": "...", "software": "...",
+        "current_release_id": "..." }
+
+GET /v1/clients/me/software
+→ 200 [ { "software": "...",
+          "current_release_id": "...",
+          "previous_release_id": "...",
+          "last_kind": "...",
+          "last_updated_at": "..." }, ... ]
+#+end_src
+
+Authenticated by the *per-client* bearer token (the phase-4
+exchange-token flow), not the admin token.  =client_id= is
+resolved server-side from the bearer.  401 on unrecognised
+bearer; 400 on missing =current_release_id= when =kind != uninstall=.
+
+** =count-users-at-release= rewrite
+
+#+begin_src lisp
+;; v1.5
+(defun count-users-at-release (catalogue software-name release-id
+                               &key (window-days nil))
+  ;; with WINDOW-DAYS:
+  ;;   COUNT(*) WHERE software=? AND current_release_id=? AND last_updated_at >= ?
+  ;; without:
+  ;;   COUNT(*) WHERE software=? AND current_release_id=?
+  ...)
+#+end_src
+
+Same signature; same callers; exact instead of approximate.
+=window-days= becomes optional (no default).  The GC path
+passes =window-days=180= so a long-abandoned install isn't
+treated as "active forever" — but the *snapshot's* 180-day
+window has a very different meaning from the v1.4 *event log's*
+window.  The snapshot window is "did the operator-installed
+agent phone home in the last 6 months?", the event log window
+was "did anything resembling an install land in the last 6
+months?".  The snapshot answer is sharper.
+
+** Client-side reporting
+
+[[file:../../client/internal/transport/transport.go][transport.go]]
+gains =ReportClientState=, called after every successful state
+transition by =libota.Install= /
+=libota.Revert= / =ota-agent doctor --recover=.  Best-effort:
+network failure is logged but does NOT roll the local install
+back.  =OTA_DISABLE_REPORTING=1= short-circuits the call.
+
+State.json gains =os= / =arch= so the agent can construct the
+canonical =release_id= (=<software>/<os>-<arch>/<version>=)
+without re-fetching a manifest.
+
+** Admin SQL statistics catalogue
+
+[[file:../../server/src/workers/stats.lisp][workers/stats.lisp]]
+ships eight curated named queries:
+
+| Name                     | Source                | Use case                                       |
+|--------------------------+-----------------------+------------------------------------------------|
+| =population-per-release= | snapshot              | "who is on X right now?"  GC sanity check.     |
+| =fleet-summary=          | snapshot              | Cross-software view; how many clients per app. |
+| =stale-clients=          | snapshot              | Candidates for "abandoned install" detection.   |
+| =gc-impact=              | snapshot + releases   | Dry-run view of GC's would-prune set.          |
+| =recent-events=          | install_events        | Time-bucketed transition rate.                 |
+| =upgrade-failure-rate=   | install_events        | Per (from, to) pair, with =HAVING attempts ≥ 5=. |
+| =adoption-curve=         | install_events + snap | Cumulative-adoption curve per release.         |
+| =recovery-events=        | install_events        | =doctor --recover= rate (network / quality).   |
+
+Two exposures: HTTP =GET /v1/admin/stats/<name>?params= and CLI
+=ota-server stats <name> [flags]=.  Admin-authenticated via the
+v1.4 =with-admin-identity= macro; rate-limited per the v1.4
+table.  Catalogue *intentionally curated*: no raw =SELECT=
+endpoint.  Operators wanting richer queries run =sqlite3(1)=
+directly against =db/ota.db= on the single-host deployment.
+
+** =patch_jobs= orphan cleanup (small piece tied to release GC)
+
+Until v1.5, =drop-release= deleted the release row and the
+patches touching it, but *left* the corresponding =patch_jobs=
+rows pointing at a release_id that no longer existed.  v1.5
+adds one call after =delete-patches-touching=:
+
+#+begin_src lisp
+(ota-server.catalogue:delete-patch-jobs-touching catalogue rid)
+#+end_src
+
+Pinned releases are protected automatically: =drop-release= is
+never called on an uncollectable release, so its rows stay.
+
+* Consequences
+
+** Positive
+
+- *GC decisions are correct.*  =min_user_count > 0= now actually
+  protects releases with clients on them.  Pre-v1.5 the threshold
+  was structurally off (event log empty).
+- *Audit-grade analytics.*  =fleet-summary= and
+  =population-per-release= answer the questions every operator
+  asks first, without an ad-hoc SQL session.
+- *Stale-clients visibility.*  =stale-clients= surfaces installs
+  that haven't reported in N days — useful for detecting agents
+  that have stopped, OS images stuck on a snapshot, etc.
+- *GC trail integrity.*  =patch_jobs= rows die with their
+  releases.  No more dangling references after GC.
+
+** Negative
+
+- *New trust boundary.*  The agent now reports per-(client,
+  software) state.  Operators worried about telemetry can flip
+  =OTA_DISABLE_REPORTING=1=; the GC then falls back to the
+  legacy threshold-=0= behaviour for those clients.  Documented
+  in the user manual.
+- *Storage cost.*  ~150 bytes/row × clients × software ≈ a few
+  MB for a typical fleet.  Negligible on the SQLite catalogue;
+  pre-budgeted for the PG migration.
+
+** Neutral
+
+- The event-log path stays.  Analytics queries that need
+  history (=upgrade-failure-rate=, =adoption-curve=,
+  =recovery-events=) read =install_events=.
+
+* Alternatives considered
+
+** A. Wire up =install_events= reporting from the agent (no snapshot)
+
+Rejected.  Even with reliable reporting, the latest-event scan
+is structurally fuzzy: it can't tell uninstall apart from
+"hasn't phoned home", and it requires a recency window that
+gives wrong answers for installs that are genuinely stable.
+
+** B. Snapshot only; drop =install_events= entirely
+
+Rejected.  Loses history.  =upgrade-failure-rate=,
+=adoption-curve=, and =recovery-events= need the event stream.
+Two narrow layers are clearer than one fat layer.
+
+** C. Push notifications when fleet state changes
+
+Rejected for v1.5.  The pull model (=count-users-at-release=
+queries the snapshot when GC runs) is simpler and sufficient.
+Push notifications are v1.7 territory (different problem:
+notifying *operators*, not querying state).
+
+** D. Server-computed snapshot from event-log replay
+
+Rejected.  Would require the agent to send *every* event
+reliably, which is the same trust assumption as direct
+reporting — but with extra server-side complexity.  Direct
+PUT is the simpler shape.
+
+* Operational notes
+
+** Bootstrapping an existing deployment
+
+When a v1.5 server is brought up against a catalogue with
+existing clients (already running pre-v1.5 agents), the
+snapshot table is empty until those clients are upgraded to
+v1.5.  In that window, =count-users-at-release= returns 0 for
+every release — exactly the pre-v1.5 fallback.  Operators
+should set =min_user_count=0= until the fleet has rolled to
+v1.5 agents; the GC's =min_age_days= and uncollectable pins
+protect releases in the meantime.
+
+** GDPR / privacy
+
+The snapshot adds one new piece of information per (client,
+software) pair: the client's =current_release_id=, which the
+server already knows because it served that release.  No PII.
+=hwinfo= remains optional and unchanged.
+
+** Disabling reporting
+
+=OTA_DISABLE_REPORTING=1= on the agent's environment short-
+circuits =ReportClientState= to a no-op.  Useful for:
+
+- Sandboxed installs that aren't permitted outbound traffic
+  beyond download.
+- Operators running their own GC policy that doesn't need
+  fleet visibility.
+- Privacy-conscious end-user opt-outs.
+
+The local install proceeds normally; only the server-side
+visibility is lost.

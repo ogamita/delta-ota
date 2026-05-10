@@ -44,7 +44,11 @@
   ;; v1.2: async patch-build worker pool (workers/pool.lisp).  NIL when
   ;; the legacy synchronous fan-in is wanted (some tests, the e2e
   ;; harness if not yet updated).
-  pool)
+  pool
+  ;; v1.7: notification worker pool (workers/notifications.lisp).
+  ;; NIL when [notifications].webhook_url isn't configured -- the
+  ;; publish handler then skips the fan-out silently.
+  notification-pool)
 
 (defparameter *app* nil)
 
@@ -232,6 +236,41 @@ closed automatically when EVENT-BUILDER returns or signals."
           (equal (nth 5 segments) "reverse"))
      (values :admin-build-reverse-patch
              (list :software (fourth segments))))
+    ;; v1.5 — client-software state snapshot (PUT/GET/DELETE).
+    ;; Per-client bearer auth (the existing exchange-token flow);
+    ;; client_id is resolved from the bearer.
+    ((and (eq method :put) (= 5 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "clients")
+          (equal (third segments) "me") (equal (fourth segments) "software"))
+     (values :client-put-state (list :software (fifth segments))))
+    ((and (eq method :get) (equal segments '("v1" "clients" "me" "software")))
+     :client-list-state)
+    ;; v1.5 — admin stats catalogue.
+    ((and (eq method :get) (equal segments '("v1" "admin" "stats")))
+     :admin-stats-index)
+    ((and (eq method :get) (= 4 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "stats"))
+     (values :admin-stats-run (list :query-name (fourth segments))))
+    ;; v1.6 — lazy upgrade-time patch build.
+    ;; GET /v1/software/<sw>/upgrade?from=A&to=T returns a patch
+    ;; ref, building on demand if the catalogue doesn't yet have one.
+    ((and (eq method :get) (= 4 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "software")
+          (equal (fourth segments) "upgrade"))
+     (values :get-upgrade-patch (list :software (third segments))))
+    ;; v1.7 — opt-in client emails.  Per-client bearer auth.
+    ((and (eq method :put) (equal segments '("v1" "clients" "me" "email")))
+     :client-put-email)
+    ((and (eq method :get) (equal segments '("v1" "clients" "me" "email")))
+     :client-list-emails)
+    ((and (eq method :delete) (equal segments '("v1" "clients" "me" "email")))
+     :client-delete-email)
+    ;; v1.7 — admin manual announce.
+    ((and (eq method :post) (= 5 (length segments))
+          (equal (first segments) "v1") (equal (second segments) "admin")
+          (equal (third segments) "software") (equal (fifth segments) "announce"))
+     (values :admin-announce (list :software (fourth segments))))
     (t nil)))
 
 (defun bearer-of (env)
@@ -948,6 +987,23 @@ EMIT is a one-arg function called with a plist per event."
           (funcall emit (list :event :manifest-resigned
                               :manifest-sha256 final-manifest-sha
                               :patches-built (length patches-in)))))
+      ;; v1.7: fan out upgrade notifications to clients on older
+      ;; versions of this software.  Best-effort: a failure here
+      ;; logs but doesn't fail the publish itself.
+      (handler-case
+          (let ((enqueued (ota-server.workers:enqueue-publish-notifications
+                           (app-state-catalogue app)
+                           :software software :release-id release-id
+                           :reason "publish")))
+            (when (plusp enqueued)
+              (when (app-state-notification-pool app)
+                (ota-server.workers:notify-notification-pool
+                 (app-state-notification-pool app)))
+              (funcall emit (list :event :notifications-enqueued
+                                  :count enqueued))))
+        (error (e)
+          (format *error-output*
+                  "publish: notification enqueue failed: ~A~%" e)))
       (funcall emit (list :event :done
                           :release-id release-id
                           :blob-sha256 sha :blob-size size
@@ -1430,9 +1486,20 @@ overwrite an existing manifest with one for a different blob."
            (json (and body (ignore-errors
                              (com.inuoe.jzon:parse
                               (sb-ext:octets-to-string body :external-format :utf-8)))))
-           (dry-run (and (hash-table-p json) (gethash "dry_run" json)))
-           (min-users (or (and (hash-table-p json) (gethash "min_user_count" json)) 0))
-           (min-age   (or (and (hash-table-p json) (gethash "min_age_days"   json)) 30))
+           (h          (and (hash-table-p json) json))
+           (dry-run    (and h (gethash "dry_run" h)))
+           (min-users  (or (and h (gethash "min_user_count" h)) 0))
+           (min-age    (or (and h (gethash "min_age_days"   h)) 30))
+           ;; v1.6 (ADR-0011): three new knobs.  Defaults preserve
+           ;; behaviour for callers that haven't been updated --
+           ;; ensure_reachability defaults TRUE so a v1.5 client
+           ;; getting v1.6 server behaviour stays safe.
+           (ensure     (cond ((null h) t)
+                             ((nth-value 1 (gethash "ensure_reachability" h))
+                              (gethash "ensure_reachability" h))
+                             (t t)))
+           (allow-blob (and h (gethash "allow_blob_fallback" h)))
+           (max-built  (or (and h (gethash "max_built_edges" h)) 50))
            (result (ota-server.workers:gc-software
                     (app-state-cas app)
                     (app-state-catalogue app)
@@ -1441,17 +1508,63 @@ overwrite an existing manifest with one for a different blob."
                     :software (getf params :software)
                     :min-user-count min-users
                     :min-age-days min-age
-                    :dry-run dry-run)))
+                    :dry-run dry-run
+                    :ensure-reachability ensure
+                    :allow-blob-fallback allow-blob
+                    :max-built-edges max-built)))
       (ota-server.catalogue:append-audit
        (app-state-catalogue app)
        :identity identity :action "gc"
        :target (getf params :software)
-       :detail (format nil "pruned=~A dry_run=~A"
-                       (length (getf result :pruned)) (getf result :dry-run)))
-      (json-response 200
-                     (obj "software" (getf params :software)
-                          "pruned"   (coerce (getf result :pruned) 'vector)
-                          "dry_run"  (if (getf result :dry-run) t nil))))))
+       :detail (format nil "pruned=~A dry_run=~A ensure_reachability=~A aborted=~A"
+                       (length (getf result :pruned))
+                       (getf result :dry-run)
+                       ensure
+                       (if (getf result :aborted) "true" "false")))
+      (cond
+        ((getf result :aborted)
+         (error-response
+          409
+          "GC aborted: reachability constraint not satisfiable"
+          (format nil "edges-to-build=~D exceeds max_built_edges=~D; ~
+                       set allow_blob_fallback=true to drop anyway"
+                  (length (getf (getf result :reachability) :edges-to-build))
+                  max-built)))
+        (t
+         (json-response 200
+                        (obj "software"     (getf params :software)
+                             "pruned"       (coerce (getf result :pruned) 'vector)
+                             "dry_run"      (if (getf result :dry-run) t nil)
+                             "reachability" (%reachability-to-obj
+                                             (getf result :reachability)))))))))
+
+(defun %reachability-to-obj (plan)
+  "Render the reachability plist as a JSON object for the GC
+response.  When PLAN is NIL (ensure-reachability=false), returns
+an empty object so the field is consistent across responses."
+  (cond
+    ((null plan) (obj))
+    (t
+     (let ((fates (getf plan :clients-by-fate)))
+       (obj "clients_by_fate"
+            (obj "unaffected"     (or (getf fates :unaffected) 0)
+                 "graceful"       (or (getf fates :graceful) 0)
+                 "blob_fallback"  (or (getf fates :blob-fallback) 0)
+                 "unreachable"    (or (getf fates :unreachable) 0))
+            "edges_built"
+            (or (getf plan :edges-built) 0)
+            "edges_to_build"
+            (coerce (mapcar (lambda (e)
+                              (obj "from" (getf e :from)
+                                   "to"   (getf e :to)
+                                   "estimated_size"
+                                   (or (getf e :estimated-size) 0)))
+                            (getf plan :edges-to-build))
+                    'vector)
+            "blocked_clients"
+            (coerce (getf plan :blocked-clients) 'vector)
+            "feasible"
+            (if (getf plan :feasible-p) t nil))))))
 
 (defun handle-admin-verify (app env)
   (with-admin-identity (identity env app)
@@ -1472,6 +1585,395 @@ overwrite an existing manifest with one for a different blob."
                                                     "expected" (third entry)))
                                              (getf r :bad))
                                      'vector))))))
+
+(defun %resolve-client-from-bearer (app env)
+  "Return the catalogue's client plist for the request's bearer
+token, or NIL when no such client is known.  Used by the v1.5
+client-state endpoints; the bearer is the per-client one minted
+at install-token exchange (phase 4), NOT the admin token."
+  (let ((tok (bearer-of env)))
+    (when (and tok
+               ;; The admin token reaches every endpoint, but admin
+               ;; doesn't have a row in the clients table -- so we
+               ;; explicitly fall through to the catalogue lookup
+               ;; without the admin-token shortcut.
+               (not (string= tok (app-state-admin-token app))))
+      (ota-server.catalogue:get-client-by-token
+       (app-state-catalogue app) tok))))
+
+(defun handle-client-put-state (app env params)
+  "Idempotent set of the calling client's snapshot row for one
+software.  Body keys (all optional except either current or
+kind=uninstall):
+
+  current_release_id   string|null
+  previous_release_id  string|null
+  kind                 install|upgrade|revert|recover|uninstall
+  at                   ISO-8601; server uses now() when absent
+
+Authenticated by the per-client bearer.  401 when the bearer
+doesn't resolve to a known client (e.g. expired or never
+exchanged)."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((body (read-request-body-bytes env))
+              (json (and body (ignore-errors
+                                (com.inuoe.jzon:parse
+                                 (sb-ext:octets-to-string body :external-format :utf-8)))))
+              (sw       (getf params :software))
+              (current  (and (hash-table-p json) (gethash "current_release_id" json)))
+              (previous (and (hash-table-p json) (gethash "previous_release_id" json)))
+              (kind     (or (and (hash-table-p json) (gethash "kind" json))
+                            "upgrade"))
+              (at       (and (hash-table-p json) (gethash "at" json))))
+         (cond
+           ((or (null kind) (zerop (length kind)))
+            (error-response 400 "missing kind"))
+           ((and (null current) (not (string= kind "uninstall")))
+            (error-response 400 "current_release_id required unless kind=uninstall"))
+           (t
+            (ota-server.catalogue:record-client-software-state
+             (app-state-catalogue app)
+             :client-id (getf client :client-id)
+             :software sw
+             :current-release-id current
+             :previous-release-id previous
+             :kind kind
+             :at at)
+            (json-response 200
+                           (obj "client_id"          (getf client :client-id)
+                                "software"           sw
+                                "current_release_id" (or current "")
+                                "kind"               kind)))))))))
+
+(defun handle-client-list-state (app env)
+  "Return the calling client's snapshot rows across all software
+they have ever reported on.  Useful for the agent's
+`show-state` subcommand and for GDPR subject-access."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((rows (ota-server.catalogue:list-client-software-states
+                     (app-state-catalogue app)
+                     :client-id (getf client :client-id))))
+         (json-response 200
+                        (coerce
+                         (mapcar (lambda (r)
+                                   (obj "software"
+                                        (getf r :software)
+                                        "current_release_id"
+                                        (or (getf r :current-release-id) "")
+                                        "previous_release_id"
+                                        (or (getf r :previous-release-id) "")
+                                        "last_kind"
+                                        (getf r :last-kind)
+                                        "last_updated_at"
+                                        (getf r :last-updated-at)))
+                                 rows)
+                         'vector)))))))
+
+(defun handle-admin-stats-index (app env)
+  "Return the catalogue of available stats queries.  Useful for
+operators discovering what they can ask, and for the CLI
+subcommand's --help."
+  (with-admin-identity (_identity env app)
+    (declare (ignore _identity))
+    (let ((rows (ota-server.workers:list-stat-queries)))
+      (json-response 200
+                     (coerce
+                      (mapcar (lambda (r)
+                                (obj "name"
+                                     (string-downcase
+                                      (string (getf r :name)))
+                                     "description"
+                                     (getf r :description)
+                                     "params"
+                                     (coerce
+                                      (mapcar (lambda (p)
+                                                (substitute #\_ #\-
+                                                            (string-downcase
+                                                             (symbol-name p))))
+                                              (getf r :params))
+                                      'vector)
+                                     "columns"
+                                     (coerce
+                                      (mapcar #'string-downcase
+                                              (mapcar #'symbol-name
+                                                      (getf r :columns)))
+                                      'vector)))
+                              rows)
+                      'vector)))))
+
+(defun handle-admin-stats-run (app env params)
+  "Run one named stats query.  Query name comes from the URL
+(:query-name path param); query parameters come from the query
+string (?software=...&since-days=30).
+
+Returns 200 with a JSON object: {\"columns\":[\"...\"], \"rows\":[[...]]}.
+A 404 names-an-unknown-query and a 400 missing-required-param
+distinguish the two failure modes."
+  (with-admin-identity (identity env app)
+    (let* ((raw-name (getf params :query-name))
+           (qname    (and raw-name
+                          (intern (string-upcase
+                                   (substitute #\- #\_ raw-name))
+                                  :keyword)))
+           (qs       (env-get env :query-string))
+           (qparams  (parse-query-string qs)))
+      (handler-case
+          (multiple-value-bind (cols rows)
+              (ota-server.workers:run-stat-query
+               (app-state-catalogue app) qname
+               :params qparams)
+            (ota-server.catalogue:append-audit
+             (app-state-catalogue app)
+             :identity identity :action "stats-run"
+             :target raw-name :detail (or qs ""))
+            (json-response
+             200
+             (obj "query"   raw-name
+                  "columns" (coerce (mapcar (lambda (c)
+                                              (string-downcase (symbol-name c)))
+                                            cols)
+                                    'vector)
+                  "rows"    (coerce
+                             (mapcar (lambda (row)
+                                       (coerce
+                                        (mapcar (lambda (v)
+                                                  ;; SQLite NULL surfaces as NIL.
+                                                  (or v ""))
+                                                row)
+                                        'vector))
+                                     rows)
+                             'vector))))
+        (ota-server.workers:stats-error (c)
+          (cond
+            ((search "unknown stats query" (princ-to-string c))
+             (error-response 404 (princ-to-string c)))
+            (t
+             (error-response 400 (princ-to-string c)))))))))
+
+;; ---------------------------------------------------------------------------
+;; v1.7: client emails + admin announce.
+;; ---------------------------------------------------------------------------
+
+(defun handle-client-put-email (app env)
+  "Register an email for the calling client.  Body: { email: ... }.
+Idempotent on (client_id, email).  Strictly opt-in: the agent
+calls this only when the user has run `ota-agent set-email`."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((body (read-request-body-bytes env))
+              (json (and body (ignore-errors
+                                (com.inuoe.jzon:parse
+                                 (sb-ext:octets-to-string body :external-format :utf-8)))))
+              (email (and (hash-table-p json) (gethash "email" json))))
+         (cond
+           ((or (null email) (zerop (length email)))
+            (error-response 400 "missing email"))
+           (t
+            (ota-server.catalogue:record-client-email
+             (app-state-catalogue app)
+             :client-id (getf client :client-id)
+             :email email)
+            (json-response 200
+                           (obj "client_id" (getf client :client-id)
+                                "email"     email
+                                "verified"  nil)))))))))
+
+(defun handle-client-list-emails (app env)
+  "List the calling client's registered addresses.  Used by the
+agent's `show-email` subcommand and by the GDPR subject-access
+path."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let ((rows (ota-server.catalogue:list-client-emails
+                    (app-state-catalogue app) (getf client :client-id))))
+         (json-response 200
+                        (coerce
+                         (mapcar (lambda (r)
+                                   (obj "email"        (getf r :email)
+                                        "verified_at"  (or (getf r :verified-at) "")
+                                        "opted_in_at"  (getf r :opted-in-at)))
+                                 rows)
+                         'vector)))))))
+
+(defun handle-client-delete-email (app env)
+  "Remove one (or all) registered addresses for the calling client.
+?address=foo@bar removes one; absent ?address removes all (the
+GDPR right-to-deletion path)."
+  (let ((client (%resolve-client-from-bearer app env)))
+    (cond
+      ((null client)
+       (error-response 401 "unauthorised; per-client bearer required"))
+      (t
+       (let* ((qs (env-get env :query-string))
+              (qparams (parse-query-string qs))
+              (addr (getf qparams :address))
+              (deleted (ota-server.catalogue:delete-client-email
+                        (app-state-catalogue app)
+                        :client-id (getf client :client-id)
+                        :email addr)))
+         (json-response 200
+                        (obj "client_id" (getf client :client-id)
+                             "deleted"   deleted)))))))
+
+(defun handle-admin-announce (app env params)
+  "Admin-triggered notification fan-out.  Iterates clients on
+SOFTWARE older than the announced release (or all clients when
+release_id isn't pinned) and enqueues outbox rows.
+
+Body:
+  { release_id: \"...\",            -- required
+    reason:     \"announce\",       -- default
+    dry_run:    false }
+
+Authenticated via with-admin-identity (cert-subject if
+configured, audit-logged)."
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (sw       (getf params :software))
+           (rid      (and (hash-table-p json) (gethash "release_id" json)))
+           (reason   (or (and (hash-table-p json) (gethash "reason" json))
+                         "announce"))
+           (dry-run  (and (hash-table-p json) (gethash "dry_run" json))))
+      (cond
+        ((or (null rid) (zerop (length rid)))
+         (error-response 400 "missing release_id"))
+        (t
+         (let* ((enqueued
+                 (cond
+                   (dry-run
+                    (length (ota-server.catalogue:list-clients-on-software
+                             (app-state-catalogue app) sw)))
+                   (t
+                    (ota-server.workers:enqueue-publish-notifications
+                     (app-state-catalogue app)
+                     :software sw :release-id rid :reason reason)))))
+           (when (and (not dry-run) (app-state-notification-pool app))
+             (ota-server.workers:notify-notification-pool
+              (app-state-notification-pool app)))
+           (ota-server.catalogue:append-audit
+            (app-state-catalogue app)
+            :identity identity :action "announce"
+            :target (format nil "~A/~A" sw rid)
+            :detail (format nil "reason=~A enqueued=~D dry_run=~A"
+                            reason enqueued (if dry-run "true" "false")))
+           (json-response 200
+                          (obj "software"  sw
+                               "release_id" rid
+                               "reason"     reason
+                               "enqueued"   enqueued
+                               "dry_run"    (if dry-run t nil)))))))))
+
+(defun handle-get-upgrade-patch (app env params)
+  "v1.6: lazy upgrade-time patch build.
+
+GET /v1/software/<sw>/upgrade?from=<version>&to=<version>
+returns a JSON object describing the patch the agent should
+download to go from `from` to `to`.  If no such patch exists in
+the catalogue (e.g. an out-of-order publish + GC left a gap, or
+a debug-version backport the original fan-in didn't cover), the
+server builds it on demand via BUILD-PATCH-FROM-BLOBS and serves
+the result.
+
+Response:
+  { \"from\": ..., \"to\": ..., \"sha256\": ..., \"size\": ...,
+    \"patcher\": \"bsdiff\", \"url\": \"/v1/patches/<sha>\",
+    \"built_on_demand\": <bool> }
+
+Authenticated by the per-client bearer; classification filtering
+applies via the existing identity resolution.  The first client
+to request a missing path pays the build time (typically a few
+seconds even for large blobs); subsequent clients hit the now-
+cached patch row."
+  (let* ((qs (env-get env :query-string))
+         (qparams (parse-query-string qs))
+         (software (getf params :software))
+         (from-version (getf qparams :from))
+         (to-version   (getf qparams :to))
+         (id (resolve-identity env app)))
+    (cond
+      ((or (null from-version) (null to-version)
+           (zerop (length from-version)) (zerop (length to-version)))
+       (error-response 400 "from and to query parameters required"))
+      (t
+       (let* ((from-rel (ota-server.catalogue:get-release
+                         (app-state-catalogue app) software from-version))
+              (to-rel   (ota-server.catalogue:get-release
+                         (app-state-catalogue app) software to-version)))
+         (cond
+           ((or (null from-rel) (null to-rel))
+            (error-response 404 "release(s) not found"))
+           ((not (visible-release-p id to-rel))
+            (error-response 404 "release not visible to caller"))
+           (t
+            (%resolve-or-build-upgrade-patch app from-rel to-rel))))))))
+
+(defun %resolve-or-build-upgrade-patch (app from-rel to-rel)
+  "Return the patch ref for from-rel → to-rel, building on demand
+when the catalogue doesn't already have one.  Identical from
+and to is a 400; identity transitions don't need a patch."
+  (let ((from-rid (getf from-rel :release-id))
+        (to-rid   (getf to-rel   :release-id)))
+    (cond
+      ((string= from-rid to-rid)
+       (error-response 400 "from and to refer to the same release"))
+      (t
+       (let ((existing (ota-server.catalogue:get-patch-by-tuple
+                       (app-state-catalogue app) from-rid to-rid)))
+         (cond
+           (existing
+            (json-response 200
+                           (obj "from"           (getf from-rel :version)
+                                "to"             (getf to-rel :version)
+                                "sha256"         (getf existing :sha256)
+                                "size"           (getf existing :size)
+                                "patcher"        (getf existing :patcher)
+                                "url"            (format nil "/v1/patches/~A"
+                                                         (getf existing :sha256))
+                                "built_on_demand" nil)))
+           (t
+            (handler-case
+                (multiple-value-bind (sha size)
+                    (ota-server.workers:build-patch-from-blobs
+                     (app-state-cas app) (app-state-catalogue app)
+                     :from-release-id from-rid
+                     :to-release-id   to-rid
+                     :from-blob-sha   (getf from-rel :blob-sha256)
+                     :to-blob-sha     (getf to-rel   :blob-sha256))
+                  (ota-server.catalogue:append-audit
+                   (app-state-catalogue app)
+                   :identity "system" :action "lazy-build-patch"
+                   :target (format nil "~A->~A" from-rid to-rid)
+                   :detail (format nil "size=~A" size))
+                  (json-response
+                   201
+                   (obj "from"            (getf from-rel :version)
+                        "to"              (getf to-rel :version)
+                        "sha256"          sha
+                        "size"            size
+                        "patcher"         "bsdiff"
+                        "url"             (format nil "/v1/patches/~A" sha)
+                        "built_on_demand" t)))
+              (error (e)
+                (format *error-output* "lazy-build: ~A~%" e)
+                (error-response 500 "patch build failed"
+                                (princ-to-string e)))))))))))
 
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
@@ -1498,6 +2000,44 @@ overwrite an existing manifest with one for a different blob."
   (cond ((listp env) (getf env key))
         ((hash-table-p env) (gethash key env))
         (t nil)))
+
+(defun parse-query-string (qs)
+  "Parse a simple application/x-www-form-urlencoded query string
+into a plist of :keyword/value pairs.  Used by the v1.5 stats
+endpoint, which takes optional parameters via the URL rather
+than via a JSON body (GET semantics).
+
+Naive: assumes one ? and one round of URL-decoding suffices.
+For our use case (stats params: integers, ASCII identifiers,
+ISO-8601 dates) that's correct."
+  (let ((acc '()))
+    (when (and qs (plusp (length qs)))
+      (dolist (pair (uiop:split-string qs :separator "&"))
+        (let* ((eq (position #\= pair))
+               (k  (if eq (subseq pair 0 eq) pair))
+               (v  (if eq (subseq pair (1+ eq)) "")))
+          (when (plusp (length k))
+            (push (%url-decode v) acc)
+            (push (intern (string-upcase (substitute #\- #\_ k)) :keyword)
+                  acc)))))
+    acc))
+
+(defun %url-decode (s)
+  "Decode %XX hex escapes; pass-through everything else.  Plus is
+NOT mapped to space here (we don't accept HTML-form bodies via
+this path)."
+  (with-output-to-string (out)
+    (loop with n = (length s) with i = 0
+          while (< i n)
+          for c = (char s i)
+          do (cond
+               ((and (char= c #\%) (< (+ i 2) n))
+                (let ((hex (subseq s (1+ i) (+ i 3))))
+                  (handler-case
+                      (write-char (code-char (parse-integer hex :radix 16)) out)
+                    (error () (write-char c out)))
+                  (incf i 3)))
+               (t (write-char c out) (incf i))))))
 
 (defun method-keyword (env)
   (let ((m (env-get env :request-method)))
@@ -1543,7 +2083,20 @@ overwrite an existing manifest with one for a different blob."
                  (:admin-mark-uncollectable     (handle-admin-mark-uncollectable state env params))
                  (:admin-build-reverse-patch    (handle-admin-build-reverse-patch state env params))
                  (:exchange-token               (handle-exchange-token state env))
-                 (:events-install               (handle-events-install state env)))
+                 (:events-install               (handle-events-install state env))
+                 ;; v1.5 — client-software state snapshot.
+                 (:client-put-state             (handle-client-put-state state env params))
+                 (:client-list-state            (handle-client-list-state state env))
+                 ;; v1.5 — admin stats catalogue.
+                 (:admin-stats-index            (handle-admin-stats-index state env))
+                 (:admin-stats-run              (handle-admin-stats-run state env params))
+                 ;; v1.6 — lazy upgrade-time patch build.
+                 (:get-upgrade-patch            (handle-get-upgrade-patch state env params))
+                 ;; v1.7 — client emails + admin announce.
+                 (:client-put-email             (handle-client-put-email state env))
+                 (:client-list-emails           (handle-client-list-emails state env))
+                 (:client-delete-email          (handle-client-delete-email state env))
+                 (:admin-announce               (handle-admin-announce state env params)))
              (error (e)
                (format *error-output* "handler error on ~A: ~A~%" path e)
                (error-response 500 "internal error" (princ-to-string e))))))))))

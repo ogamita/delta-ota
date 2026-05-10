@@ -1,0 +1,353 @@
+#+TITLE: ADR-0012 — opt-in client emails + notification webhook
+#+DATE: 2026-05-11
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.7.0.
+
+* Context
+
+After v1.5 the server knows where every client sits (snapshot
+table); after v1.6 the GC preserves their upgrade paths.  The
+piece that closes the loop is *telling clients when a new
+release is available so they actually upgrade*.
+
+The natural reach is email: every client install has a person
+behind it (the developer who set the system up; the end user
+who manages the workstation; the integrator with a fleet of
+appliances), and email is the universally-deployed
+asynchronous notification channel.
+
+The question was *how* to send the email.  Three sub-questions
+shaped the decision:
+
+1. *Where does the address come from?*  Strictly opt-in:
+   =ota-agent set-email <addr>=, run by the user.  The agent
+   does not prompt automatically and never reads system
+   address books.  Privacy-by-design; GDPR-friendly.
+
+2. *Who sends the actual SMTP traffic?*  This ADR's main
+   question.  Three options were on the table.
+
+3. *How does the catalogue stay consistent under partial
+   failure?*  Same model the patch_jobs table uses (v1.2):
+   outbox pattern, atomic claim, retry with bounded attempts,
+   restart-recovery at boot.
+
+* Decision
+
+** Mail leaves the ota-server process via a configurable HTTP webhook
+
+Operators run a small HTTP receiver that translates our JSON
+to whatever notification mechanism the organisation already
+has — SMTP relay, AWS SES, SendGrid, Mailgun, Slack, Teams,
+internal ticket system, anything that speaks HTTP.
+
+=ota-server= itself contains *no* SMTP code.
+
+** Schema
+
+Two new migrations:
+
+*** =0006_client_emails.sql=
+
+#+begin_src sql
+CREATE TABLE client_emails (
+    client_id    TEXT NOT NULL,
+    email        TEXT NOT NULL,
+    verified_at  TEXT,                       -- NULL = unverified
+    opted_in_at  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (client_id, email)
+);
+#+end_src
+
+Multiple addresses per client are allowed (admin + personal;
+team mailing list + on-call rotation).  =verified_at= is
+present for a future opt-in verification round-trip; v1.7
+never sets it.
+
+*** =0007_notifications_outbox.sql=
+
+#+begin_src sql
+CREATE TABLE notifications_outbox (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id      TEXT NOT NULL,
+    software_name  TEXT NOT NULL,
+    release_id     TEXT NOT NULL,
+    reason         TEXT NOT NULL,    -- 'publish'|'announce'|'security'
+    status         TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','running','sent','failed','skipped')),
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    enqueued_at    TEXT NOT NULL,
+    started_at     TEXT,
+    sent_at        TEXT,
+    UNIQUE (client_id, software_name, release_id, reason)
+);
+#+end_src
+
+Mirrors =patch_jobs= structurally.  The UNIQUE constraint makes
+a re-published release or a retried admin announce idempotent at
+the row level.  =reset-stale-running-notifications= at boot
+provides the same restart-recovery as the patch pool.
+
+** Worker pool
+
+[[file:../../server/src/workers/notifications.lisp][workers/notifications.lisp]]
+mirrors the v1.2 patch-build pool:
+
+- N worker threads consume the outbox.
+- Each worker: =claim-next-notification= (atomic via =BEGIN
+  IMMEDIATE=) → build payload → POST to =[notifications].
+  webhook_url= → record outcome.
+- 2xx → status =sent=.
+- 4xx → status =failed= immediately (the operator's webhook
+  said no; don't retry).
+- 5xx / network err → row stays =pending=, =attempts++=, gives
+  up after =max_attempts= (default 5).
+- Skip rows whose client has no registered emails -- mark sent
+  silently so the row doesn't clog the queue.
+
+The pool refuses to start when =webhook_url= is unset; the
+deployment then runs without the notification feature at all.
+
+** Webhook payload
+
+#+begin_src json
+{
+  "schema_version":   1,
+  "notification_id":  1234,
+  "reason":           "publish",
+  "client_id":        "c-deadbeef",
+  "emails":           ["alice@example.com"],
+  "software":         "myapp",
+  "release": {
+    "release_id":   "myapp/linux-x86_64/2.0.0",
+    "version":      "2.0.0",
+    "published_at": "2026-05-11T...",
+    "blob_size":    4194304
+  }
+}
+#+end_src
+
+When =[notifications].webhook_secret= is configured, every POST
+carries =X-Ota-Webhook-Signature: <hex>= where =<hex>= is the
+HMAC-SHA256 of the body.  Receivers SHOULD verify before
+acting.
+
+=schema_version=1= is stable for the lifetime of major version
+1; new fields are non-breaking, removals/renames force a
+=schema_version=2=.
+
+** Trigger points
+
+*** Automatic at publish time
+
+[[file:../../server/src/http/server.lisp][server.lisp]] =%publish-finalize-and-emit= now calls
+=enqueue-publish-notifications= just before emitting the
+=:done= NDJSON event.  The fan-out iterates the snapshot table
+for the published software, enqueuing one outbox row per
+client whose =current_release_id != release_id=.  Failures
+log but don't fail the publish.
+
+The NDJSON stream gains one new event:
+
+#+begin_src
+{"event":"notifications-enqueued","count":N}
+#+end_src
+
+just before =:done=, so =ota-admin= can show the count.
+
+*** Manual via admin endpoint
+
+=POST /v1/admin/software/<sw>/announce= lets an operator force
+a fan-out without an actual publish (e.g. "2.0 ships next
+Monday" pre-announcement):
+
+#+begin_src
+Body: {
+  "release_id":  "myapp/linux-x86_64/2.0.0",   -- required
+  "reason":      "announce",                    -- default
+  "dry_run":     false
+}
+#+end_src
+
+Authed via =with-admin-identity= (v1.4 cert-subject path);
+audit-logged.
+
+** Agent integration
+
+[[file:../../client/internal/transport/transport.go][transport.go]]
+gains =SetClientEmail= / =ListClientEmails= /
+=DeleteClientEmail= (with per-client bearer auth, same as the
+v1.5 state-report path).
+
+[[file:../../client/agent/main.go][agent/main.go]] exposes the
+matching subcommands:
+
+#+begin_src
+ota-agent set-email   <name> <address>
+ota-agent unset-email <name> [<address>]   # without addr: remove all
+ota-agent show-email  <name>
+#+end_src
+
+The agent does NOT prompt for email on install.  Users invoke
+the subcommand explicitly.  Operators who want a prompt add it
+to their installer / packaging layer; that bridge isn't ours
+to design.
+
+** Sample receivers
+
+[[file:../../tools/notifications/README.org][tools/notifications/README.org]]
+documents the payload + the receiver contract.  We ship:
+
+- =smtp-relay.py= — ~120-line Python receiver using stdlib
+  =smtplib= + =email.mime=, configured via env vars.
+- =slack-webhook.sh= — ~70-line shell receiver that POSTs to a
+  Slack incoming-webhook URL.
+
+Additional backends (SES, SendGrid, Teams, Discord) are 30-50
+lines each; operators fork the samples.
+
+* Consequences
+
+** Positive
+
+- *Mail-attack surface lives outside ota-server.*  Header
+  injection, MIME edge cases, SMTP wire format, TLS to the MTA:
+  all in the receiver's lap.  Our process never sees them.
+- *Vendoring policy preserved* (ADR-0003).  No LGPL libraries
+  pulled in.  The only new transitive dependency is =dexador=,
+  which we already used for the admin test client + the v1.4
+  webhook MAC of one direction.
+- *Operators integrate with what they have.*  A 50-line script
+  bridges any backend.  Quiet hours, dedupe windows, on-call
+  fan-out, multi-channel routing — all live in the receiver,
+  iterable without redeploying =ota-server=.
+- *Outbox pattern guarantees at-least-once delivery.*  Boot-
+  recovery + atomic claim + retry + max_attempts is exactly the
+  shape patch_jobs uses.  Two-server deployments share the
+  outbox cleanly.
+- *Opt-in is the default.*  Agent never auto-prompts.  GDPR
+  subject-access is =GET /v1/clients/me/email=; right-to-
+  deletion is =DELETE /v1/clients/me/email=.
+
+** Negative
+
+- *Operators have to deploy something.*  A receiver, however
+  small.  Mitigated by the ready-to-run samples; for a
+  single-host evaluation install =python3 smtp-relay.py= is the
+  whole setup.
+- *Outbox table grows.*  At ~150 bytes/row × per-publish ×
+  fleet-size this is a few MB/year for a normal deployment.
+  v1.8 will add an outbox GC pass (=DELETE WHERE status IN
+  ('sent', 'failed') AND sent_at < ?=).  For v1.7 operators
+  prune manually via =sqlite3=.
+- *Notification storm under heavy fleets.*  Publishing into a
+  10 000-client fleet enqueues 10 000 rows.  At pool size 2 and
+  10 s webhook timeout each, drain time = 14 h worst case.
+  Mitigated by raising =[notifications].worker_count=;
+  documented in operations.org.
+
+** Neutral
+
+- The =verified_at= column is present but unused.  v1.8 can
+  add a verification round-trip without a migration.
+- The agent's "no-auto-prompt" stance is opinionated; an
+  operator who *does* want auto-prompting wraps the agent in
+  their installer's UX layer.
+
+* Alternatives considered
+
+** A. Direct SMTP via vendored =cl-smtp=
+
+Rejected.  =cl-smtp= is LLGPL; vendoring policy (ADR-0003)
+prohibits.  Switching to AGPL'ing the whole server isn't on
+the table — it's already AGPL.  The issue is for the
+*commercial* license tier: vendoring LGPL forces downstream
+into LGPL, which the commercial offering can't accept.
+
+** B. Hand-roll SMTP over =usocket= + =cl+ssl=
+
+Rejected.  Introduces:
+
+- A wire-format attack surface (HEADER injection in user-
+  supplied subject / body interpolation, MIME boundary
+  escaping, RFC 5322 quoted-printable edge cases).
+- TLS configuration: cert pinning, name validation, cipher
+  policy, all things we'd have to keep current as the security
+  landscape moves.
+- A "is this SMTP server actually reachable from inside our
+  k8s cluster" debugging surface that's a constant operator
+  burden.
+
+The webhook escape hatch shifts every one of these into the
+receiver, where the operator can iterate without us in the
+loop.
+
+** C. Shell out to =sendmail= / =msmtp= / =mailx=
+
+Rejected.  Violates the self-containment rule (CLAUDE.md "no
+system tools at runtime").  Most server installs don't have a
+configured MTA anyway; tools/notifications/smtp-relay.py is
+the right shape.
+
+** D. Push notifications (APNs / FCM / WebPush)
+
+Rejected for v1.7.  Different problem; different opt-in flow;
+device-identity layer we don't have.  Re-walk if a customer
+deploys to mobile.
+
+** E. Per-client preferences (=notify-on-minor / notify-on-major=)
+
+Rejected for v1.7.  The right shape is to fan-out everything to
+the receiver and let *it* filter — the receiver is the policy
+layer (quiet hours, on-call rotation, etc.).  Layered onto the
+basic mechanism in a later release if a customer asks.
+
+* Operational notes
+
+** Configuration
+
+#+begin_src toml
+[notifications]
+webhook_url     = "http://127.0.0.1:9090/notify"   # required
+webhook_timeout = 10                                # seconds
+webhook_secret  = "...random hex..."                # optional HMAC
+worker_count    = 2
+max_attempts    = 5
+#+end_src
+
+** Auditing
+
+Every =POST /v1/admin/software/<sw>/announce= is recorded in
+the audit log with the resolved cert subject (when v1.4 mTLS
+is configured).  Per-row dispatch outcomes live in the
+=notifications_outbox= table itself (=status=, =last_error=,
+=attempts=, =sent_at=).
+
+** Operator inspection queries
+
+#+begin_src
+sqlite3 db/ota.db 'SELECT status, COUNT(*) FROM notifications_outbox GROUP BY status'
+sqlite3 db/ota.db 'SELECT * FROM notifications_outbox WHERE status = "failed"'
+#+end_src
+
+Future v1.8 stats query: =notification-status= in the v1.5
+catalogue.
+
+** Disabling
+
+Leave =[notifications].webhook_url= unset.  The pool is not
+started; the publish handler's enqueue call is a no-op.
+Existing =client_emails= rows are kept (operators may use the
+data via SQL even without the dispatch path).
+
+** Storm protection
+
+For first-Monday upgrade waves into a large fleet, raise
+=worker_count= proportionally.  Pool size 8 @ 10 s timeout
+drains a 10 000-client fan-out in ~3.5 h.  The agent receiver
+should also rate-limit on its end (queue, batch, etc.).

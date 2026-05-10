@@ -112,6 +112,18 @@ harness)."
     (let ((pool (ota-server.workers:start-patch-pool
                  cas db :size patch-worker-count)))
       (setf (ota-server.http::app-state-pool state) pool))
+    ;; v1.7: notification worker pool.  Skipped silently when no
+    ;; webhook URL is configured -- the deployment doesn't care
+    ;; about upgrade notifications.
+    (ota-server.catalogue:reset-stale-running-notifications db)
+    (let ((npool (ota-server.workers:start-notification-pool
+                  db
+                  :webhook-url (getf cfg :notifications-webhook-url)
+                  :webhook-timeout (or (getf cfg :notifications-webhook-timeout) 10)
+                  :webhook-secret (getf cfg :notifications-webhook-secret)
+                  :max-attempts (or (getf cfg :notifications-max-attempts) 5)
+                  :size (or (getf cfg :notifications-worker-count) 2))))
+      (setf (ota-server.http::app-state-notification-pool state) npool))
     (format t "ota-server ~A~%~
                listening on ~A:~A (~A http worker thread~:P, ~A patch worker~:P)~%~
                data_dir=~A~%~
@@ -136,6 +148,8 @@ harness)."
              (#+sbcl sb-sys:interactive-interrupt #-sbcl t () nil))
         (ota-server.workers:stop-patch-pool
          (ota-server.http::app-state-pool state))
+        (ota-server.workers:stop-notification-pool
+         (ota-server.http::app-state-notification-pool state))
         (ota-server.http:stop-server handler)))
     0))
 
@@ -151,15 +165,24 @@ harness)."
     (force-output)
     0))
 
-(defun run-gc (&key config software (min-user-count 0) (min-age-days 30) dry-run)
+(defun run-gc (&key config software (min-user-count 0) (min-age-days 30)
+                    dry-run (ensure-reachability t) (allow-blob-fallback nil)
+                    (max-built-edges 50))
   "Run garbage collection for SOFTWARE and exit.  Mirrors the
-HTTP `POST /v1/admin/software/<sw>/gc` handler so cron and
-systemd timers can invoke GC without going through the API.
+HTTP `POST /v1/admin/software/<sw>/gc` handler.
 
 Required: :software.  Optional: :min-user-count (default 0),
-:min-age-days (default 30), :dry-run.  Exit code 0 on success,
-2 on missing :software, non-zero from the toplevel handler on
-any uncaught error."
+:min-age-days (default 30), :dry-run, :ensure-reachability
+(default T; v1.6 reachability-aware GC), :allow-blob-fallback
+(default NIL; accept full-blob fallback for affected clients
+instead of pre-building edges), :max-built-edges (default 50;
+ceiling on the patches the plan may pre-build).
+
+Exit codes:
+  0  success (drops applied OR dry-run completed)
+  2  missing required arg
+  3  GC aborted (reachability infeasible without
+                 --allow-blob-fallback)"
   (unless software
     (format *error-output* "ota-server gc: --software=NAME required~%")
     (return-from run-gc 2))
@@ -172,37 +195,120 @@ any uncaught error."
                (merge-pathnames "etc/keys/" root)))
          (manifests-dir (merge-pathnames "manifests/" root)))
     (unwind-protect
-         (let ((result (ota-server.workers:gc-software
-                        cas db kp manifests-dir
-                        :software software
-                        :min-user-count min-user-count
-                        :min-age-days   min-age-days
-                        :dry-run        dry-run)))
-           (format t "ota-server gc: software=~A pruned=~D dry-run=~A min-user-count=~A min-age-days=~A~%"
-                   software
-                   (length (getf result :pruned))
-                   (if (getf result :dry-run) "true" "false")
-                   min-user-count min-age-days)
-           (dolist (rid (getf result :pruned))
-             (format t "  ~A  ~A~%"
-                     (if dry-run "would prune" "pruned     ")
-                     rid))
-           (force-output)
-           (ota-server.catalogue:append-audit
-            db
-            :identity "cli"
-            :action "gc"
-            :target software
-            :detail (format nil "pruned=~D dry_run=~A min_user_count=~A min_age_days=~A"
-                            (length (getf result :pruned))
-                            (getf result :dry-run)
-                            min-user-count min-age-days)))
+         (let* ((result (ota-server.workers:gc-software
+                         cas db kp manifests-dir
+                         :software software
+                         :min-user-count min-user-count
+                         :min-age-days   min-age-days
+                         :dry-run        dry-run
+                         :ensure-reachability ensure-reachability
+                         :allow-blob-fallback allow-blob-fallback
+                         :max-built-edges max-built-edges))
+                (reach (getf result :reachability))
+                (aborted (getf result :aborted)))
+           (cond
+             (aborted
+              (format *error-output*
+                      "ota-server gc: aborted -- ~D edges-to-build exceed max-built-edges=~D; ~
+re-run with --allow-blob-fallback to drop anyway~%"
+                      (length (getf reach :edges-to-build))
+                      max-built-edges)
+              (return-from run-gc 3))
+             (t
+              (format t "ota-server gc: software=~A pruned=~D dry-run=~A ~
+min-user-count=~A min-age-days=~A~%"
+                      software
+                      (length (getf result :pruned))
+                      (if (getf result :dry-run) "true" "false")
+                      min-user-count min-age-days)
+              (when reach
+                (let ((fates (getf reach :clients-by-fate)))
+                  (format t "  reachability: unaffected=~D graceful=~D blob-fallback=~D unreachable=~D ~
+edges-built=~D~%"
+                          (or (getf fates :unaffected) 0)
+                          (or (getf fates :graceful) 0)
+                          (or (getf fates :blob-fallback) 0)
+                          (or (getf fates :unreachable) 0)
+                          (or (getf reach :edges-built) 0))))
+              (dolist (rid (getf result :pruned))
+                (format t "  ~A  ~A~%"
+                        (if dry-run "would prune" "pruned     ")
+                        rid))
+              (force-output)
+              (ota-server.catalogue:append-audit
+               db
+               :identity "cli"
+               :action "gc"
+               :target software
+               :detail (format nil "pruned=~D dry_run=~A ensure_reachability=~A"
+                               (length (getf result :pruned))
+                               (getf result :dry-run)
+                               ensure-reachability)))))
       (ota-server.catalogue:close-catalogue db))
     0))
 
 ;; ---------------------------------------------------------------------------
 ;; Usage
 ;; ---------------------------------------------------------------------------
+
+(defun run-stats (&key config query-name params)
+  "Run one named stats query from the catalogue and print the
+result as an ASCII table.  Mirrors the HTTP
+`GET /v1/admin/stats/<query-name>` so cron / systemd timers
+can collect stats without going through the API.
+
+Required: :query-name (a keyword).  Optional: :params, a plist
+of :keyword/string-or-integer values matching the catalogue
+entry's :params list.  Exit code 0 on success, 2 on missing
+:query-name, 3 on unknown query / missing required param."
+  (unless query-name
+    (format *error-output* "ota-server stats: <query-name> required~%")
+    (return-from run-stats 2))
+  (let* ((cfg (%resolve config))
+         (root (uiop:ensure-directory-pathname (getf cfg :data-dir)))
+         (db  (ota-server.catalogue:open-catalogue
+               (merge-pathnames "db/ota.db" root))))
+    (unwind-protect
+         (handler-case
+             (multiple-value-bind (cols rows)
+                 (ota-server.workers:run-stat-query db query-name :params params)
+               (%print-stats-table cols rows)
+               (force-output)
+               0)
+           (ota-server.workers:stats-error (c)
+             (format *error-output* "ota-server stats: ~A~%" c)
+             3))
+      (ota-server.catalogue:close-catalogue db))))
+
+(defun %print-stats-table (cols rows)
+  "Render (COLS ROWS) as a left-aligned ASCII table on
+*standard-output*.  Computes per-column widths from the data so
+the output is friendly to grep / awk pipelines without being
+ugly when read by a human."
+  (let* ((widths (mapcar (lambda (col)
+                           (max (length (symbol-name col))
+                                (reduce
+                                 #'max
+                                 (mapcar (lambda (row)
+                                           (length (princ-to-string
+                                                    (or (nth (position col cols) row) ""))))
+                                         rows)
+                                 :initial-value 0)))
+                         cols)))
+    ;; Header.
+    (loop for col in cols for w in widths
+          do (format t "~vA  " w (symbol-name col)))
+    (terpri)
+    (loop for w in widths
+          do (format t "~v,,,'-A  " w ""))
+    (terpri)
+    ;; Body.
+    (dolist (row rows)
+      (loop for col in cols for w in widths
+            for v in row
+            do (format t "~vA  " w (or v "")))
+      (terpri))
+    (format t "~%~D row~:P~%" (length rows))))
 
 (defun %usage (&optional (stream *error-output*))
   (format stream
@@ -213,7 +319,12 @@ Usage:
   ota-server migrate [--config=PATH]    apply catalogue migrations and exit
   ota-server gc      [--config=PATH] --software=NAME [--min-user-count=N]
                      [--min-age-days=N] [--dry-run]
+                     [--no-ensure-reachability] [--allow-blob-fallback]
+                     [--max-built-edges=N]
                                         run garbage collection on SOFTWARE and exit
+  ota-server stats   [--config=PATH] <query-name> [--<param>=<value> ...]
+                                        run an admin stats query; --help-stats
+                                        lists available queries
   ota-server shell                      drop into an SBCL REPL (debug only)
   ota-server version                    print version and exit
   ota-server help                       print this message and exit
@@ -262,13 +373,42 @@ Environment variables (override file values):
              (dry-run        (or (member "--dry-run" rest :test #'string=)
                                  (let ((v (%get-flag rest "dry-run")))
                                    (and v (not (string= v "false"))
-                                        (not (string= v "0")))))))
+                                        (not (string= v "0"))))))
+             ;; v1.6 reachability knobs.  --no-ensure-reachability
+             ;; disables the new layer; default is on.
+             (no-ensure      (member "--no-ensure-reachability" rest :test #'string=))
+             (allow-blob     (or (member "--allow-blob-fallback" rest :test #'string=)
+                                 (let ((v (%get-flag rest "allow-blob-fallback")))
+                                   (and v (not (string= v "false"))
+                                        (not (string= v "0"))))))
+             (max-built      (alexandria:if-let ((v (%get-flag rest "max-built-edges")))
+                               (parse-integer v) 50)))
          (or (run-gc :config config
                      :software software
                      :min-user-count min-user-count
                      :min-age-days min-age-days
-                     :dry-run (and dry-run t))
+                     :dry-run (and dry-run t)
+                     :ensure-reachability (not no-ensure)
+                     :allow-blob-fallback (and allow-blob t)
+                     :max-built-edges max-built)
              0)))
+      ((string= cmd "stats")
+       (cond
+         ((member "--help-stats" rest :test #'string=)
+          (%list-stats *standard-output*)
+          0)
+         (t
+          (let* ((positional (%positional rest))
+                 (qname-str (second positional))
+                 (qname (and qname-str
+                             (intern (string-upcase
+                                      (substitute #\- #\_ qname-str))
+                                     :keyword)))
+                 (params (%stats-params-from-flags rest)))
+            (or (run-stats :config config
+                           :query-name qname
+                           :params params)
+                0)))))
       ((string= cmd "shell")
        #+sbcl (sb-impl::toplevel-init)
        0)
@@ -276,6 +416,41 @@ Environment variables (override file values):
        (format *error-output* "ota-server: unknown subcommand: ~A~%~%" cmd)
        (%usage)
        2))))
+
+(defun %stats-params-from-flags (argv)
+  "Walk ARGV and collect every --KEY=VALUE flag (except --config
+and the like) into a plist of :KEY/value.  Used by the stats
+subcommand: any flag the user passes that isn't a known
+infrastructure flag is treated as a stats query parameter."
+  (let ((reserved '("config" "help" "help-stats"))
+        (acc '()))
+    (dolist (a argv)
+      (when (and (>= (length a) 3)
+                 (string= "--" a :end2 2))
+        (let* ((eq (position #\= a))
+               (k  (if eq (subseq a 2 eq) (subseq a 2)))
+               (v  (if eq (subseq a (1+ eq)) "")))
+          (unless (member k reserved :test #'string=)
+            (push v acc)
+            (push (intern (string-upcase k) :keyword) acc)))))
+    acc))
+
+(defun %list-stats (stream)
+  "Print the catalogue of available stats queries to STREAM."
+  (let ((rows (ota-server.workers:list-stat-queries)))
+    (format stream "Available stats queries:~%~%")
+    (dolist (r rows)
+      (format stream "  ~A~%" (string-downcase
+                               (symbol-name (getf r :name))))
+      (format stream "    ~A~%" (getf r :description))
+      (let ((ps (getf r :params)))
+        (when ps
+          (format stream "    params: ~{--~A~^ ~}~%"
+                  (mapcar (lambda (p)
+                            (substitute #\- #\_
+                                        (string-downcase (symbol-name p))))
+                          ps))))
+      (terpri stream))))
 
 (defun main (&rest argv)
   "Top-level entry point.  Two calling conventions:

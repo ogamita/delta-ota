@@ -62,6 +62,12 @@ type State struct {
 	ServerPubKeyHX string    `json:"server_pubkey_hex,omitempty"`
 	ClientID       string    `json:"client_id,omitempty"`
 	BearerToken    string    `json:"bearer_token,omitempty"`
+	// OS / Arch captured from the manifest at install time so the
+	// v1.5 client-state report can construct the canonical
+	// release_id (`<software>/<os>-<arch>/<version>`) without
+	// needing to re-fetch the manifest on every transition.
+	OS   string `json:"os,omitempty"`
+	Arch string `json:"arch,omitempty"`
 }
 
 func (l *Layout) Load() (*State, error) {

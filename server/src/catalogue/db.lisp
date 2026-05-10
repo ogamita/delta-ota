@@ -70,7 +70,10 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
     (dolist (mig '("src/catalogue/migrations/0001_init.sql"
                    "src/catalogue/migrations/0002_patches.sql"
                    "src/catalogue/migrations/0003_auth.sql"
-                   "src/catalogue/migrations/0004_patch_jobs.sql"))
+                   "src/catalogue/migrations/0004_patch_jobs.sql"
+                   "src/catalogue/migrations/0005_client_software_state.sql"
+                   "src/catalogue/migrations/0006_client_emails.sql"
+                   "src/catalogue/migrations/0007_notifications_outbox.sql"))
       (dolist (stmt (split-statements (read-migration-file mig)))
         (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) stmt)))
           (when (plusp (length trimmed))
@@ -546,24 +549,135 @@ purely catalogue-side."
 
 ;; ---------------- Phase-5 operations ----------------
 
-(defun count-users-at-release (catalogue software-name release-id &key (window-days 180))
-  "Number of distinct clients whose latest successful install_event
-   for SOFTWARE-NAME points at RELEASE-ID and is within the recency
-   window. Approximate by design (uninstalls aren't reported)."
+(defun count-users-at-release (catalogue software-name release-id &key (window-days nil))
+  "Exact count of clients whose current_release_id equals RELEASE-ID
+for SOFTWARE-NAME, drawn from the v1.5 client_software_state
+snapshot.
+
+When WINDOW-DAYS is supplied, the count is further restricted to
+clients whose last_updated_at falls within the recency window --
+useful so a long-abandoned install (agent never reported in
+6 months) isn't treated as 'still active' by the GC.  NIL window
+means 'no recency filter; trust the snapshot'.
+
+Returns 0 when no client_software_state rows exist (e.g. a brand-
+new deployment with no clients reporting yet), matching the v1.0-
+v1.4 fallback semantics that callers already handle."
   (with-catalogue (db catalogue)
-    (let* ((cutoff-univ (- (get-universal-time)
-                           (* window-days 86400)))
-           (cutoff-iso (universal-to-iso8601 cutoff-univ))
-           (rows (sqlite:execute-to-list
+    (let ((rows
+            (cond
+              (window-days
+               (let* ((cutoff-iso (universal-to-iso8601
+                                   (- (get-universal-time)
+                                      (* window-days 86400)))))
+                 (sqlite:execute-to-list
                   db
-                  "SELECT COUNT(DISTINCT client_id)
-                     FROM install_events
-                    WHERE software_name = ?
-                      AND release_id    = ?
-                      AND status        = 'ok'
-                      AND at           >= ?"
+                  "SELECT COUNT(*) FROM client_software_state
+                    WHERE software_name      = ?
+                      AND current_release_id = ?
+                      AND last_updated_at   >= ?"
                   software-name release-id cutoff-iso)))
+              (t
+               (sqlite:execute-to-list
+                db
+                "SELECT COUNT(*) FROM client_software_state
+                  WHERE software_name      = ?
+                    AND current_release_id = ?"
+                software-name release-id)))))
       (or (caar rows) 0))))
+
+;; ---------------- v1.5: client-software state snapshot ----------------
+;;
+;; Maintained by ota-agent via PUT /v1/clients/me/software/<sw>;
+;; authoritative for the question "who is on X right now".  See
+;; ADR-0010 and docs/release-1.5-plan.org for the design rationale.
+;; install_events stays around as an append-only audit/analytics
+;; stream; that's the historical record, this is the current state.
+
+(defun record-client-software-state (catalogue
+                                     &key client-id software
+                                          current-release-id
+                                          previous-release-id
+                                          (kind "upgrade")
+                                          (at nil))
+  "Set (or update) the snapshot row for (CLIENT-ID, SOFTWARE).
+Idempotent on the primary key; a re-PUT of the same state is a
+no-op at the value level.  AT defaults to the server's current
+wall-clock; clients may pass their own ISO-8601 string when they
+need to record an out-of-band transition (e.g. a recover from a
+network-disconnected install).
+
+KIND is one of install / upgrade / revert / recover / uninstall;
+checked by the schema CHECK constraint.  Uninstall is recorded
+with CURRENT-RELEASE-ID = NIL (preserved in SQL as NULL), keeping
+the row for stats while excluding it from \"who is on X\" counts."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "INSERT INTO client_software_state
+        (client_id, software_name, current_release_id, previous_release_id,
+         last_kind, last_updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(client_id, software_name) DO UPDATE SET
+         current_release_id  = excluded.current_release_id,
+         previous_release_id = excluded.previous_release_id,
+         last_kind           = excluded.last_kind,
+         last_updated_at     = excluded.last_updated_at"
+     client-id
+     software
+     current-release-id
+     previous-release-id
+     (string-downcase (string kind))
+     (or at (universal-to-iso8601 (get-universal-time))))))
+
+(defun get-client-software-state (catalogue client-id software)
+  "Return the snapshot row plist or NIL when the client has never
+reported for this software.  Used by the agent-side state-show
+subcommand and by the admin stats queries."
+  (with-catalogue (db catalogue)
+    (let ((rows (sqlite:execute-to-list
+                 db
+                 "SELECT current_release_id, previous_release_id,
+                         last_kind, last_updated_at
+                    FROM client_software_state
+                   WHERE client_id = ? AND software_name = ?"
+                 client-id software)))
+      (when rows
+        (destructuring-bind (current previous kind updated) (first rows)
+          (list :current-release-id current
+                :previous-release-id previous
+                :last-kind kind
+                :last-updated-at updated))))))
+
+(defun list-client-software-states (catalogue
+                                    &key client-id software
+                                         current-release-id)
+  "Filterable scan over the snapshot table.  Any combination of
+filters may be NIL to widen the match.  Used by the admin stats
+catalogue (workers/stats.lisp); rate-limited at the HTTP layer
+because a no-filter scan can return the whole fleet."
+  (with-catalogue (db catalogue)
+    (let ((sql "SELECT client_id, software_name, current_release_id, previous_release_id, last_kind, last_updated_at FROM client_software_state WHERE 1=1")
+          (args '()))
+      (when client-id
+        (setf sql (concatenate 'string sql " AND client_id = ?"))
+        (push client-id args))
+      (when software
+        (setf sql (concatenate 'string sql " AND software_name = ?"))
+        (push software args))
+      (when current-release-id
+        (setf sql (concatenate 'string sql " AND current_release_id = ?"))
+        (push current-release-id args))
+      (setf sql (concatenate 'string sql " ORDER BY last_updated_at DESC"))
+      (mapcar (lambda (row)
+                (destructuring-bind (cid sw curr prev kind updated) row
+                  (list :client-id cid
+                        :software sw
+                        :current-release-id curr
+                        :previous-release-id prev
+                        :last-kind kind
+                        :last-updated-at updated)))
+              (apply #'sqlite:execute-to-list db sql (nreverse args))))))
 
 (defun count-releases-using-blob (catalogue blob-sha256)
   "How many releases reference this blob hash."
@@ -571,6 +685,46 @@ purely catalogue-side."
     (caar (sqlite:execute-to-list
            db "SELECT COUNT(*) FROM releases WHERE blob_sha256 = ?"
            blob-sha256))))
+
+(defun get-patch-by-tuple (catalogue from-release-id to-release-id
+                           &key (patcher "bsdiff"))
+  "Look up an existing patch by (from, to, patcher).  Returns the
+patch plist or NIL.  Used by the v1.6 lazy-upgrade endpoint to
+decide whether to build on demand."
+  (with-catalogue (db catalogue)
+    (let ((rows (sqlite:execute-to-list
+                 db
+                 "SELECT sha256, from_release_id, to_release_id, patcher, size, built_at FROM patches WHERE from_release_id = ? AND to_release_id = ? AND patcher = ?"
+                 from-release-id to-release-id patcher)))
+      (when rows
+        (destructuring-bind (sha from to p size built-at) (first rows)
+          (list :sha256 sha :from-release-id from :to-release-id to
+                :patcher p :size size :built-at built-at))))))
+
+(defun list-patches-for-software (catalogue software-name)
+  "Return every patch row whose endpoints belong to releases of
+SOFTWARE-NAME.  Used by the v1.6 reachability-aware GC to build
+the patches graph in one query rather than N round-trips through
+LIST-PATCHES-BY-FROM-OR-TO.  Result rows are
+plists :SHA256 :FROM-RELEASE-ID :TO-RELEASE-ID :PATCHER :SIZE.
+
+The join restricts to patches whose `to_release_id` belongs to
+the software; since the fan-in is forward-only and bidirectional
+patches don't exist outside of `admin-build-reverse-patch`, this
+captures every edge in the software's upgrade graph."
+  (with-catalogue (db catalogue)
+    (mapcar (lambda (row)
+              (destructuring-bind (sha from-id to-id patcher size) row
+                (list :sha256 sha :from-release-id from-id
+                      :to-release-id to-id :patcher patcher :size size)))
+            (sqlite:execute-to-list
+             db
+             "SELECT DISTINCT p.sha256, p.from_release_id, p.to_release_id,
+                              p.patcher, p.size
+                FROM patches p
+                JOIN releases r ON r.release_id = p.to_release_id
+               WHERE r.software_name = ?"
+             software-name))))
 
 (defun list-patches-by-from-or-to (catalogue release-id)
   (with-catalogue (db catalogue)
@@ -736,6 +890,20 @@ Either filter may be NIL.  Returns an integer."
       (or (caar (apply #'sqlite:execute-to-list db sql (nreverse args)))
           0))))
 
+(defun delete-patch-jobs-touching (catalogue release-id)
+  "Drop every patch_jobs row whose from or to release equals
+RELEASE-ID.  Called from drop-release after the patches table
+itself has been cleaned up -- so a release GC takes its
+corresponding patch-build audit trail with it.
+
+Pinned releases are protected automatically: drop-release is
+never called for an uncollectable release, so its rows survive."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "DELETE FROM patch_jobs WHERE from_release_id = ? OR to_release_id = ?"
+     release-id release-id)))
+
 (defun reset-stale-running-jobs (catalogue)
   "Boot-time recovery: any job left in 'running' (because a worker or
 the whole server died mid-bsdiff) is reset to 'pending' so the pool
@@ -750,6 +918,182 @@ idempotent.  Returns the number of rows reset."
        db
        "UPDATE patch_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
       before)))
+
+;; ---------------- v1.7: client emails ----------------
+;;
+;; Opt-in only.  Agent calls PUT /v1/clients/me/email to register
+;; an address; DELETE to revoke.  Multiple addresses per client are
+;; allowed (admin + personal); the notification worker pool fans
+;; one webhook POST per registered address.
+
+(defun record-client-email (catalogue &key client-id email)
+  "Register an email for a client.  Idempotent: a re-PUT of the
+same (client_id, email) pair is a no-op (the existing
+opted_in_at / created_at are preserved)."
+  (with-catalogue (db catalogue)
+    (let ((now (universal-to-iso8601 (get-universal-time))))
+      (sqlite:execute-non-query
+       db
+       "INSERT OR IGNORE INTO client_emails (client_id, email, opted_in_at, created_at) VALUES (?, ?, ?, ?)"
+       client-id email now now))))
+
+(defun list-client-emails (catalogue client-id)
+  "Return all registered addresses for CLIENT-ID as plists."
+  (with-catalogue (db catalogue)
+    (mapcar (lambda (row)
+              (destructuring-bind (email verified opted-in created) row
+                (list :email email
+                      :verified-at verified
+                      :opted-in-at opted-in
+                      :created-at created)))
+            (sqlite:execute-to-list
+             db
+             "SELECT email, verified_at, opted_in_at, created_at FROM client_emails WHERE client_id = ? ORDER BY opted_in_at ASC"
+             client-id))))
+
+(defun delete-client-email (catalogue &key client-id email)
+  "Remove one address for a client.  When EMAIL is NIL, removes
+all addresses for the client (the GDPR right-to-deletion path).
+Returns the number of rows deleted."
+  (with-catalogue (db catalogue)
+    (cond
+      (email
+       (sqlite:execute-non-query
+        db
+        "DELETE FROM client_emails WHERE client_id = ? AND email = ?"
+        client-id email))
+      (t
+       (sqlite:execute-non-query
+        db
+        "DELETE FROM client_emails WHERE client_id = ?"
+        client-id)))
+    (or (caar (sqlite:execute-to-list db "SELECT changes()")) 0)))
+
+;; ---------------- v1.7: notifications outbox ----------------
+
+(defparameter *notification-columns*
+  "id, client_id, software_name, release_id, reason, status, attempts, last_error, enqueued_at, started_at, sent_at")
+
+(defun row-to-notification (row)
+  (destructuring-bind (id cid sw rid reason status attempts err
+                       enqueued started sent) row
+    (list :id id :client-id cid :software sw :release-id rid
+          :reason reason :status status :attempts attempts
+          :last-error err
+          :enqueued-at enqueued :started-at started :sent-at sent)))
+
+(defun enqueue-notification (catalogue &key client-id software release-id
+                                            (reason "publish"))
+  "Insert one outbox row.  Idempotent on (client, software,
+release, reason) -- a duplicate enqueue silently no-ops.  Returns
+(values :enqueued JOB-ID) or (values :existing JOB-ID).
+
+The UNIQUE constraint ensures a re-published release or a
+retried admin announce can't fan out twice to the same client."
+  (with-catalogue (db catalogue)
+    (let ((now (universal-to-iso8601 (get-universal-time))))
+      (sqlite:execute-non-query
+       db
+       "INSERT OR IGNORE INTO notifications_outbox (client_id, software_name, release_id, reason, status, enqueued_at) VALUES (?, ?, ?, ?, 'pending', ?)"
+       client-id software release-id reason now)
+      (let* ((changed (or (caar (sqlite:execute-to-list db "SELECT changes()")) 0))
+             (id (caar (sqlite:execute-to-list
+                        db
+                        "SELECT id FROM notifications_outbox WHERE client_id = ? AND software_name = ? AND release_id = ? AND reason = ?"
+                        client-id software release-id reason))))
+        (values (if (plusp changed) :enqueued :existing) id)))))
+
+(defun claim-next-notification (catalogue)
+  "Atomically claim the oldest pending row.  Returns the plist or
+NIL when none.  BEGIN IMMEDIATE wraps the SELECT+UPDATE so two
+workers don't claim the same row."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query db "BEGIN IMMEDIATE")
+    (handler-case
+        (let* ((rows (sqlite:execute-to-list
+                      db
+                      (format nil "SELECT ~A FROM notifications_outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+                              *notification-columns*)))
+               (job (and rows (row-to-notification (first rows)))))
+          (cond
+            ((null job)
+             (sqlite:execute-non-query db "COMMIT")
+             nil)
+            (t
+             (sqlite:execute-non-query
+              db
+              "UPDATE notifications_outbox SET status = 'running', started_at = ?, attempts = attempts + 1 WHERE id = ?"
+              (universal-to-iso8601 (get-universal-time)) (getf job :id))
+             (sqlite:execute-non-query db "COMMIT")
+             (setf (getf job :status) "running")
+             (incf (getf job :attempts))
+             job)))
+      (error (c)
+        (handler-case (sqlite:execute-non-query db "ROLLBACK")
+          (error () nil))
+        (error c)))))
+
+(defun mark-notification-sent (catalogue id)
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "UPDATE notifications_outbox SET status = 'sent', sent_at = ?, last_error = NULL WHERE id = ?"
+     (universal-to-iso8601 (get-universal-time)) id)))
+
+(defun mark-notification-failed (catalogue id error-msg
+                                 &key (give-up nil))
+  "Record a failure.  When GIVE-UP is T (operator-defined max
+attempts reached, or a 4xx response from the webhook), the row
+is moved to status='failed'; otherwise it stays 'pending' for the
+next pool tick."
+  (with-catalogue (db catalogue)
+    (cond
+      (give-up
+       (sqlite:execute-non-query
+        db
+        "UPDATE notifications_outbox SET status = 'failed', sent_at = ?, last_error = ? WHERE id = ?"
+        (universal-to-iso8601 (get-universal-time))
+        (or error-msg "") id))
+      (t
+       (sqlite:execute-non-query
+        db
+        "UPDATE notifications_outbox SET status = 'pending', last_error = ? WHERE id = ?"
+        (or error-msg "") id)))))
+
+(defun reset-stale-running-notifications (catalogue)
+  "Boot-time recovery: any row left in 'running' is reset to
+'pending'.  Same pattern as reset-stale-running-jobs."
+  (with-catalogue (db catalogue)
+    (let ((before (or (caar (sqlite:execute-to-list
+                             db "SELECT COUNT(*) FROM notifications_outbox WHERE status = 'running'"))
+                      0)))
+      (sqlite:execute-non-query
+       db
+       "UPDATE notifications_outbox SET status = 'pending', started_at = NULL WHERE status = 'running'")
+      before)))
+
+(defun count-notifications (catalogue &key status)
+  (with-catalogue (db catalogue)
+    (or (caar (cond
+                (status
+                 (sqlite:execute-to-list
+                  db "SELECT COUNT(*) FROM notifications_outbox WHERE status = ?"
+                  status))
+                (t
+                 (sqlite:execute-to-list
+                  db "SELECT COUNT(*) FROM notifications_outbox"))))
+        0)))
+
+(defun list-clients-on-software (catalogue software-name)
+  "Distinct client_ids currently tracking SOFTWARE-NAME (snapshot
+has a current_release_id != NULL).  Used by the publish handler
+to fan out notifications to clients on older versions."
+  (with-catalogue (db catalogue)
+    (mapcar #'car
+            (sqlite:execute-to-list
+             db
+             "SELECT DISTINCT client_id FROM client_software_state WHERE software_name = ? AND current_release_id IS NOT NULL"
+             software-name))))
 
 (defun list-audit (catalogue &optional (limit 100))
   (with-catalogue (db catalogue)

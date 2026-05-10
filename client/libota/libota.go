@@ -52,6 +52,13 @@ type Config struct {
 	// recognise the workstation in the audit log.  Free-form short
 	// string (hostname is fine).
 	Hwinfo string
+
+	// Kind is the value reported to the server's v1.5 client-state
+	// snapshot.  When empty, Install infers "install" or "upgrade"
+	// from the prior state; callers that need to signal a specific
+	// transition (e.g. doctor --recover) set this explicitly.
+	// Recognised values: install | upgrade | revert | recover.
+	Kind string
 }
 
 func (c Config) fallbackRatio() float64 {
@@ -214,11 +221,40 @@ func Install(ctx context.Context, cfg Config, software, version string) (string,
 	}
 	st.ServerURL = cfg.ServerURL
 	st.ServerPubKeyHX = pubHex
+	st.OS = m.OS
+	st.Arch = m.Arch
 	if err := layout.Save(st); err != nil {
 		return "", err
 	}
 	pruneOldArtefacts(layout, st, prev)
+
+	// v1.5: report the new state to the server (best-effort).  Local
+	// install state is already committed above; a reporting failure
+	// is logged but not propagated.
+	kind := cfg.Kind
+	if kind == "" {
+		if prev == "" {
+			kind = "install"
+		} else {
+			kind = "upgrade"
+		}
+	}
+	curRID := releaseID(m.Software, m.OS, m.Arch, version)
+	prevRID := ""
+	if prev != "" {
+		prevRID = releaseID(m.Software, m.OS, m.Arch, prev)
+	}
+	if err := tr.ReportClientState(ctx, software, curRID, prevRID, kind); err != nil {
+		fmt.Fprintf(os.Stderr, "libota: state report failed (non-fatal): %v\n", err)
+	}
 	return version, nil
+}
+
+// releaseID composes the catalogue's canonical release_id from its
+// four-part form `<software>/<os>-<arch>/<version>`, matching what
+// handle-admin-publish-release produces server-side.
+func releaseID(software, os, arch, version string) string {
+	return fmt.Sprintf("%s/%s-%s/%s", software, os, arch, version)
 }
 
 // pickPatch picks the cheapest patch from `from` to the new release
@@ -317,6 +353,9 @@ func Revert(cfg Config, software string) error {
 	}
 	prev := st.Previous
 	cur := st.Current
+	// Note: prev/cur captured for the v1.5 state report after the
+	// swap below; the local revert succeeds either way.
+	_ = cur
 	// Just call FlipCurrent on the previous version's distribution.
 	// FlipCurrent moves what's at current → previous, then points
 	// current to the new target.
@@ -325,9 +364,92 @@ func Revert(cfg Config, software string) error {
 	}
 	st.Current = prev
 	st.Previous = cur
-	return layout.Save(st)
+	if err := layout.Save(st); err != nil {
+		return err
+	}
+
+	// v1.5: report the new state.  No network on the revert local
+	// path itself; this is a best-effort PUT.  Skip if we have no
+	// server context (offline revert is legitimate).  When the CLI
+	// didn't pass --server, fall back to the URL persisted from the
+	// original install in state.json so a plain `ota-agent revert`
+	// invocation still reports.
+	server := cfg.ServerURL
+	if server == "" {
+		server = st.ServerURL
+	}
+	if server != "" && st.BearerToken != "" && st.OS != "" && st.Arch != "" {
+		tr := transport.New(server)
+		if cfg.Timeout > 0 {
+			tr.HTTP.Timeout = cfg.Timeout
+		}
+		tr.Auth = transport.BearerAuth(st.BearerToken)
+		curRID := releaseID(software, st.OS, st.Arch, prev)
+		prevRID := releaseID(software, st.OS, st.Arch, cur)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tr.ReportClientState(ctx, software, curRID, prevRID, "revert"); err != nil {
+			fmt.Fprintf(os.Stderr, "libota: revert state report failed (non-fatal): %v\n", err)
+		}
+	}
+	return nil
 }
 
 // Drain is a tiny utility to copy a stream to /dev/null counting
 // bytes (used by tests).
 func Drain(r io.Reader) (int64, error) { return io.Copy(io.Discard, r) }
+
+// ---------------------------------------------------------------------------
+// v1.7: email subcommands
+// ---------------------------------------------------------------------------
+
+// EmailClient bundles a transport.Client authenticated by the
+// per-client bearer recorded in state.json.  The agent's
+// set-email / unset-email / show-email subcommands all share
+// this boilerplate -- loading state, attaching auth, hitting the
+// per-software server URL persisted from the original install.
+type EmailClient struct {
+	tr      *transport.Client
+	state   *state.State
+	server  string
+}
+
+// NewEmailClient loads the per-software state.json for SOFTWARE
+// under OTAHOME and wires up a transport.Client with the
+// persisted ServerURL + BearerToken.  Returns an error when no
+// state exists (the user hasn't installed SOFTWARE yet) or when
+// the state is missing the bearer (the agent was never linked
+// to a server -- nothing to talk to).
+func NewEmailClient(otaHome, software string) (*EmailClient, error) {
+	layout := state.New(otaHome, software)
+	st, err := layout.Load()
+	if err != nil {
+		return nil, err
+	}
+	if st.BearerToken == "" {
+		return nil, errors.New("email: no bearer token; install the software first")
+	}
+	if st.ServerURL == "" {
+		return nil, errors.New("email: no server URL in state.json")
+	}
+	tr := transport.New(st.ServerURL)
+	tr.Auth = transport.BearerAuth(st.BearerToken)
+	return &EmailClient{tr: tr, state: st, server: st.ServerURL}, nil
+}
+
+// Set registers an address with the server.
+func (c *EmailClient) Set(ctx context.Context, address string) error {
+	_, err := c.tr.SetClientEmail(ctx, address)
+	return err
+}
+
+// Unset removes one (or all, when ADDRESS is empty) addresses.
+// Returns the count deleted.
+func (c *EmailClient) Unset(ctx context.Context, address string) (int, error) {
+	return c.tr.DeleteClientEmail(ctx, address)
+}
+
+// Show lists registered addresses.
+func (c *EmailClient) Show(ctx context.Context) ([]transport.ClientEmail, error) {
+	return c.tr.ListClientEmails(ctx)
+}

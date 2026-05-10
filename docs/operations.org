@@ -758,6 +758,242 @@ v1.  An =s3-cas= variant using =zs3= or shell-out to =aws s3= is
 straightforward to add.  Ship target: a sub-phase, driven by the
 first customer who needs it.
 
+* Upgrade notifications (since v1.7)
+
+=ota-server= can notify users by email (or any other channel)
+when a release lands.  *No SMTP runs in =ota-server=.*  Mail
+leaves the process via an HTTP webhook to an operator-managed
+receiver, which translates our JSON to whatever the
+organisation actually uses.
+
+ADR-0012 has the full design; this section is the operator
+quick-reference.
+
+** Configuration
+
+#+begin_src toml
+[notifications]
+webhook_url     = "http://127.0.0.1:9090/notify"   # required; pool refuses to start when unset
+webhook_timeout = 10                                # seconds (default 10)
+webhook_secret  = "...random hex..."                # optional HMAC-SHA256 over body
+worker_count    = 2                                 # default 2
+max_attempts    = 5                                 # default 5
+#+end_src
+
+** Trigger points
+
+- *Automatic at publish time*: every successful publish enqueues
+  one outbox row per client whose snapshot points at a different
+  release.
+- *Manual announce*: =POST /v1/admin/software/<sw>/announce=
+  with body =({release_id, reason="announce", dry_run})=
+  forces a fan-out outside of publish.
+
+** Sample receivers
+
+=tools/notifications/= ships ready-to-run reference receivers:
+
+- =smtp-relay.py= — Python stdlib, ~120 lines.  Use it when
+  you have your own MTA / Postfix / Exim relay.
+- =slack-webhook.sh= — shell + curl + socat, ~70 lines.  Use
+  it when notifications go to a Slack channel.
+
+Forking either to add SES / SendGrid / Mailgun / Teams /
+Discord support is short work; the payload shape is documented
+in =tools/notifications/README.org=.
+
+** Agent opt-in
+
+Strictly opt-in.  Users / operators register an address via:
+
+#+begin_src
+$ ota-agent set-email   <software> <address>
+$ ota-agent show-email  <software>
+$ ota-agent unset-email <software> [<address>]
+#+end_src
+
+The agent does NOT prompt automatically.
+
+** Outbox inspection
+
+The =notifications_outbox= table records every dispatch
+attempt.
+
+#+begin_src bash
+sqlite3 /var/lib/ota/db/ota.db \
+    'SELECT status, COUNT(*) FROM notifications_outbox GROUP BY status'
+#+end_src
+
+A future v1.8 admin stats query (=notification-status=) will
+expose this through the v1.5 catalogue.  For v1.7, operators
+query directly.
+
+** Disabling
+
+Leave =[notifications].webhook_url= unset.  The pool is not
+started; the publish handler skips the fan-out silently.
+Existing =client_emails= rows are kept; operators can still
+read them via SQL if needed.
+
+* Reachability-aware GC (since v1.6)
+
+=POST /v1/admin/software/<sw>/gc= now consults the v1.5
+client-software snapshot to make sure dropping a release doesn't
+strand any active client on a no-patch upgrade path.  For each
+client, Dijkstra over the patches graph computes the cheapest
+path to the highest-semver visible release; the simulated drop
+set partitions clients into four fates:
+
+| Fate              | Meaning                                                 |
+|-------------------+---------------------------------------------------------|
+| =unaffected=      | Cheapest path doesn't touch the drop set.               |
+| =graceful=        | Path changed but stays under the fallback-ratio cap.    |
+| =blob-fallback=   | No path under the cap; would download the full blob.    |
+| =unreachable=     | Client's =current= release is also in the drop set.     |
+
+For =blob-fallback= clients, the GC pre-builds the minimum set
+of direct =current → target= patches before dropping anything.
+ADR-0011 has the full design.
+
+** New GC flags
+
+| Body / CLI                | Default | Effect                                                  |
+|---------------------------+---------+---------------------------------------------------------|
+| =ensure_reachability=     | =true=  | Run the reachability layer.  =false= = v1.5 behaviour. |
+| =allow_blob_fallback=     | =false= | Proceed with drops even if pre-built edge count exceeds the cap; affected clients full-blob. |
+| =max_built_edges=         | =50=    | Refuse the GC entirely when more edges would be needed. |
+
+** Dry-run output
+
+=ota-server gc --software=myapp --dry-run= prints (in addition
+to the candidate drop list) a one-line reachability summary:
+
+#+begin_example
+ota-server gc: software=myapp pruned=4 dry-run=true min-user-count=0 min-age-days=30
+  reachability: unaffected=2847 graceful=42 blob-fallback=5 unreachable=0 edges-built=0
+  would prune  myapp/linux-x86_64/1.0.0
+  would prune  myapp/linux-x86_64/1.1.0
+  ...
+#+end_example
+
+When the plan needs more edges than =max-built-edges=, the GC
+aborts (exit code 3) with a message naming the count.  Re-run
+with =--max-built-edges=N= or =--allow-blob-fallback=.
+
+* Lazy upgrade-time patch build (since v1.6)
+
+=GET /v1/software/<sw>/upgrade?from=A&to=T= returns the patch ref
+for the A → T transition.  When the catalogue doesn't already
+have one (out-of-order publishes — a debug version inserted into
+an older release stream — leave gaps the original fan-in didn't
+cover), the server *builds the patch on demand* and serves it.
+
+Response:
+
+#+begin_src json
+{ "from": "1.2.1",  "to": "1.3",
+  "sha256": "...",  "size": 161,  "patcher": "bsdiff",
+  "url": "/v1/patches/...",
+  "built_on_demand": true }
+#+end_src
+
+=built_on_demand= tells the caller whether they paid for the
+build.  Subsequent callers see =false= (cached).  The first
+caller pays the bsdiff time — typically a few seconds for blobs
+up to 100 MB; tens of seconds for multi-GB blobs.
+
+** Operator pre-warming
+
+For deployments that publish out-of-order intentionally (debug
+versions inserted into a long-tail), operators can pre-warm the
+catalogue *before* the first client hits the gap, via the v1.0
+=POST /v1/admin/software/<sw>/patches/reverse= endpoint or by
+calling the lazy-upgrade endpoint with an admin bearer.  The
+audit log records every lazy build under =identity=system=,
+=action=lazy-build-patch=, so an operator can see which paths
+clients are exercising organically.
+
+* Fleet statistics (since v1.5)
+
+The =client_software_state= snapshot table tells the server who
+is on what release right now (per (client, software)).  =ota-
+agent= reports the snapshot after every successful install /
+upgrade / revert / recover / uninstall, so the GC's "is anyone
+still using this release?" check is exact instead of approximate.
+ADR-0010 has the full design.
+
+Operationally this means:
+
+- =POST /v1/admin/software/<sw>/gc=  with =min_user_count > 0=
+  now actually protects in-use releases.  Pre-v1.5 the threshold
+  was structurally off because no agent ever reported.
+- =GET /v1/admin/stats/...= exposes a curated catalogue of
+  queries against the snapshot + the event log.
+- =ota-server stats <name> [flags]= is the cron-friendly mirror
+  of the HTTP surface.
+
+** The query catalogue
+
+| Name                     | Required params      | Optional        | Returns                          |
+|--------------------------+----------------------+-----------------+----------------------------------|
+| =population-per-release= | =software=           | -               | (release_id, clients)            |
+| =fleet-summary=          | -                    | -               | (software, clients, distinct_releases, most_recent_update) |
+| =stale-clients=          | =software=           | =since-days=30= | (client_id, current_release_id, last_updated_at) |
+| =gc-impact=              | =software=           | -               | (release_id, version, published_at, uncollectable, clients) |
+| =recent-events=          | =software=           | =since-days=30= | (day, kind, status, n)           |
+| =upgrade-failure-rate=   | =software=           | =since-days=30= | (from_release_id, to_release_id, failures, attempts, failure_pct) |
+| =adoption-curve=         | =software=, =release-id= | -           | (day, adopted_today, total)      |
+| =recovery-events=        | =software=           | =since-days=30= | (day, from_release_id, to_release_id, status, n) |
+
+=GET /v1/admin/stats= (no path component) lists every available
+query with its parameters and result schema — useful when an
+admin tool wants to render a dynamic UI.
+
+Per-row result cap: 1000.  Operators wanting fuller dumps run
+=sqlite3 db/ota.db= directly (single-host deployment) or the
+PostgreSQL CLI (when that backend ships).
+
+** Example: pre-GC sanity check
+
+#+begin_example
+$ curl -sS -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+       "https://ota.example.com/v1/admin/stats/gc-impact?software=myapp" \
+  | jq -r '.rows[] | @tsv'
+myapp/linux-x86_64/2.0.0   2.0.0   2026-05-08...   0   2847
+myapp/linux-x86_64/1.9.3   1.9.3   2026-04-15...   1     0   ← pinned, GC will keep
+myapp/linux-x86_64/1.9.2   1.9.2   2026-03-10...   0     5   ← protected by min_user_count if > 5
+myapp/linux-x86_64/1.8.0   1.8.0   2025-12-01...   0     0   ← prunable
+#+end_example
+
+** Example: stale clients
+
+#+begin_example
+$ ota-server stats stale-clients --software=myapp --since-days=60
+client_id      current_release_id           last_updated_at
+c-1a2b3c4d     myapp/linux-x86_64/1.4.2    2026-02-11T08:14:33Z
+c-5e6f7g8h     myapp/linux-x86_64/1.4.2    2026-02-13T19:02:18Z
+...
+12 rows
+#+end_example
+
+** Audit trail
+
+Every stats query is logged with =action = "stats-run"=,
+=target = <query-name>=, =detail = <query-string>= in the v1.4
+admin audit log.  Operators can prove who looked at fleet data
+and when.
+
+** Agent-side opt-out
+
+A deployment that doesn't want the server to know which release
+each install is running can set =OTA_DISABLE_REPORTING=1= in
+the agent's environment.  The local install proceeds normally;
+only the server-side snapshot row is suppressed.  =count-
+users-at-release= then returns 0 for that client's release, so
+the GC's =min_user_count= protection is structurally off for
+opted-out clients — operators should pair this with
+=uncollectable= pins on releases they want to keep.
+
 * Resumable downloads (since v1.3)
 
 The server honours =Range: bytes=N-[M]= on =/v1/blobs/<sha>= and
@@ -802,3 +1038,5 @@ Operational implications:
 | Admin call returns 403 "subject not authorised"  | Operator's cert DN not in =[tls].admin_subjects= | Add the DN to the allowlist (or remove =admin_subjects= entirely to disable enforcement) |
 | Admin call returns 403 "client cert required"    | =[tls].require_mtls = true= but no cert reached the server | Verify the reverse proxy is requesting + verifying client certs AND injecting the configured header |
 | Admin operations hit 429 unexpectedly             | Per-endpoint cap is tighter than the workload   | Set =[rate_limits].<endpoint> = "C/R"= to raise the cap; see ADR-0009 |
+| GC skips releases that have no real users         | Snapshot empty (pre-v1.5 agents still in fleet) | Set =min_user_count=0= until the fleet finishes upgrading to v1.5 agents |
+| =count-users-at-release= reports 0 for known-active release | =OTA_DISABLE_REPORTING=1= on that client's agent | Pin the release as =uncollectable= or accept that opted-out clients don't count toward the threshold |

@@ -1,0 +1,266 @@
+#+TITLE: ADR-0011 — reachability-aware GC + lazy upgrade-time builds
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Status
+
+Accepted at v1.6.0.
+
+* Context
+
+Through v1.5 the GC dropped a release when (it wasn't pinned, it
+wasn't the latest, it was old enough, and =count-users-at-release
+≤ min_user_count=).  The check looked at clients *on* the release;
+it did not look at clients whose upgrade path *passed through* it.
+
+That gap was inert in practice as long as the catalogue's forward-
+only fan-in built every prior→new patch at publish time.  In
+chronological-publish order the GC could drop intermediates safely
+because the post-drop graph still had direct edges between every
+pair of surviving releases.
+
+Two failure modes were on the horizon:
+
+1. *Out-of-order publishes* (debug-version backports —
+   =1.2 → 1.3 → 1.2.1 → 1.1.1 → 1.4=).  Each new publish builds
+   patches FROM the priors TO itself, but never the reverse.  So
+   when 1.2.1 is published *after* 1.3, no =1.2.1 → 1.3= patch
+   gets built.  If 1.2 (which had =1.2 → 1.3=) is later GC'd, a
+   client at 1.2.1 wanting to upgrade to 1.3 has no path.
+
+2. *Large fleets on long-tail releases*.  Even in chronological
+   publish order, dropping intermediate releases removes the
+   patches involving them — costing clients whose blob-fallback
+   would now exceed the =fallback_ratio= threshold.
+
+v1.5 made the snapshot table available (exact "who is where").
+v1.6 spends that data on a smarter GC + closes the
+out-of-order-publish gap.
+
+* Decision
+
+** Reachability-aware GC
+
+[[file:../../server/src/workers/reachability.lisp][workers/reachability.lisp]]
+adds three building blocks:
+
+1. =SHORTEST-PATCH-PATH= : Dijkstra over the patches graph,
+   weight = patch size.  Optional EXCLUDED-RELEASE-IDS hashset
+   simulates removing nodes (= the drop set).  Optional
+   FALLBACK-CAP bounds the cheapest-path cost; cost >cap returns
+   NIL (= client would prefer full-blob).
+
+2. =COMPUTE-REACHABILITY-PLAN= (pure): given (drop-set,
+   client-positions, software), partitions clients into four
+   fates:
+
+   - *=unaffected=* — cheapest path doesn't touch the drop set.
+   - *=graceful=* — path changed but still under fallback-ratio.
+   - *=blob-fallback=* — no acceptable path; would download full
+     blob.  Triggers a candidate =edge-to-build=.
+   - *=unreachable=* — client's current release is also in the
+     drop set; no edge build can fix it.
+
+3. =EXECUTE-REACHABILITY-BUILDS= : invokes
+   =BUILD-PATCH-FROM-BLOBS= (the same path the v1.2 pool worker
+   calls) for every edge in =edges-to-build=.  Synchronous;
+   any failure aborts.
+
+** Refactored =gc-software=
+
+[[file:../../server/src/workers/operations.lisp][operations.lisp]]
+=gc-software= grows four keyword args:
+
+| Keyword                | Default | Meaning                                           |
+|------------------------+---------+---------------------------------------------------|
+| =ensure-reachability=  | T       | run the new layer.  NIL = v1.5 behaviour exactly. |
+| =allow-blob-fallback=  | NIL     | proceed with drops even when builds would exceed the cap; affected clients full-blob. |
+| =max-built-edges=      | 50      | refuse the GC entirely when more edges are needed. |
+| =fallback-ratio=       | 0.7     | passed to =shortest-patch-path= as the cap on the cheapest path. |
+
+The flow:
+
+1. Collect candidate drops by the v1.5 rules.
+2. If =ensure-reachability=:
+   a. Compute the plan against current client positions.
+   b. If plan is infeasible (= more than =max-built-edges= would
+      need building) AND =allow-blob-fallback= is NIL → return
+      with =:aborted T=, dropping nothing.
+   c. If feasible and not =dry-run= and not =allow-blob-fallback=
+      → run =execute-reachability-builds=; abort the whole GC on
+      any single failure.
+3. Drop the candidates.
+
+** HTTP + CLI surface
+
+=POST /v1/admin/software/<sw>/gc= grows three new body fields:
+=ensure_reachability=, =allow_blob_fallback=, =max_built_edges=.
+Response gains a =reachability= block with
+=clients_by_fate / edges_built / edges_to_build /
+blocked_clients / feasible=.
+
+=ota-server gc= CLI gains the matching =--no-ensure-reachability=
+/ =--allow-blob-fallback= / =--max-built-edges= flags and prints
+the per-fate counts in its summary.  Exit code 3 on aborted
+infeasible plans.
+
+** Lazy upgrade-time patch build
+
+[[file:../../server/src/http/server.lisp][server.lisp]]
+=GET /v1/software/<sw>/upgrade?from=A&to=T= returns the patch
+ref for A → T.  If the catalogue doesn't already have one, the
+server *builds it synchronously* and stores it before
+responding.  Response includes =built_on_demand= so clients can
+tell whether they paid the build cost.
+
+This closes the out-of-order-publish gap *naturally* — the
+*first* client to want a missing path pays the build (typically
+a few seconds for a 100 MB blob); subsequent clients hit the
+now-cached row at zero extra cost.
+
+The endpoint is client-bearer-auth + classification-filtered,
+identical to the existing manifest / blob / patch read paths.
+
+* Consequences
+
+** Positive
+
+- *GC stays delta-friendly.*  Drops that would have stranded
+  clients on blob-fallback are caught and either fixed (pre-
+  built bypass edges) or explicitly opted into
+  (=allow_blob_fallback=).
+- *Out-of-order publishes work*: the lazy endpoint fills the
+  fan-in's forward-only gap on demand, without requiring an
+  always-on bidirectional build at publish time (which would
+  double the publish-time CPU cost forever for an edge case).
+- *Dry-run reports everything.*  Operators see the plan, the
+  edges-to-build, and the per-fate counts before committing.
+- *Backwards-compatible.*  =ensure-reachability= defaults to T,
+  but with an empty catalogue or with no clients reporting, the
+  plan is a no-op.  =allow_blob_fallback= preserves v1.5
+  behaviour exactly when set.
+
+** Negative
+
+- *GC takes longer.*  Pre-build cost is paid before any drop.
+  For a 4 GB software with 10 clients on 10 different versions,
+  this can add minutes.  GC is offline / cron-scheduled, so the
+  user-facing impact is zero.  Documented in operations.org.
+- *First lazy-build pays the cost.*  A user hitting the lazy
+  endpoint for a missing path waits for bsdiff.  Cached
+  thereafter.  Worst-case: 30 s on a 2 GB blob on commodity
+  hardware.  Documented in the user manual.
+- *Plan computation is O(C × N²)*: C clients × N²-ish Dijkstra.
+  For realistic fleets (10 000 clients, 30 releases) this is
+  ~9 M operations — fast enough on SBCL.  Bounded; not a hot
+  path.
+
+** Neutral
+
+- The v1.2 worker pool isn't used for reachability builds
+  (=execute-reachability-builds= calls =BUILD-PATCH-FROM-BLOBS=
+  directly).  A future iteration could enqueue through the
+  pool for two-server-deployment coordination; v1.6 keeps it
+  simple because GC is already single-process / offline.
+
+* Algorithm details
+
+** Path-finding
+
+Dijkstra with a hash-map priority queue (the implementation is
+a linear scan; graphs are small enough that the asymptotic win
+of a real heap doesn't matter).  EXCLUDED-RELEASE-IDS is
+checked at edge insertion time, so the entire algorithm sees a
+post-drop graph.
+
+The FALLBACK-CAP is applied early: as soon as the popped node's
+cumulative cost exceeds the cap, the search terminates with no
+path.  This bounds runtime when the graph is unfavourable.
+
+** Classification
+
+Each client is classified independently:
+
+1. =current ∈ drop-set= → =:unreachable= (no edge build helps).
+2. =current = target= → =:unaffected= (no upgrade needed).
+3. Cheapest pre-drop path doesn't touch the drop set →
+   =:unaffected=.
+4. Cheapest post-drop path exists and stays under
+   =fallback-ratio × blob-size= → =:graceful=.
+5. Else → =:blob-fallback=, with a candidate edge
+   =(current → target)= proposed.
+
+The proposed edges are de-duped on =(current, target)= — if 50
+clients all sit on 1.2.5 wanting 2.0.0, we build that one edge.
+
+* Alternatives considered
+
+** A. Bidirectional fan-in at publish time
+
+Rejected.  Doubles the publish-time CPU cost forever to defend
+against a rare edge.  100-prior-releases publish would take
+twice the bsdiff time.
+
+** B. Always build A → T at publish, ignoring fan-in
+
+Rejected.  Same as A.
+
+** C. Refuse to drop intermediates unless explicitly allowed
+
+Rejected.  Too rigid.  A long-running deployment will collect
+hundreds of releases; operators must be able to GC them.
+
+** D. Move lazy build through the v1.2 worker pool
+
+Considered.  The pool already has the infrastructure (job table,
+worker threads, restart-safety).  Adding "synchronous wait until
+this job completes" to the pool API is straightforward.  Why
+defer:
+
+- Lazy-build is one job at a time, blocking the HTTP handler.
+  The pool's strength is *parallel* dequeuing across publish
+  fan-ins; for one-shot lazy build the direct
+  =build-patch-from-blobs= call is simpler.
+- Two-server-deployment coordination (one operator triggers GC
+  on server A, simultaneously a client hits the lazy endpoint
+  on server B) is interesting but speculative.  Re-walk if a
+  real deployment hits the case.
+
+** E. Pre-compute reachability at publish time, store it
+
+Rejected.  The graph changes on every publish AND every GC.
+Caching the plan adds invalidation complexity for no
+operational win — Dijkstra over hundreds of nodes is sub-
+millisecond.
+
+* Operational notes
+
+** Default policy
+
+=ensure_reachability=true= by default.  Operators who want the
+v1.5 behaviour pass =allow_blob_fallback=true= (or
+=--allow-blob-fallback= on the CLI) per call.
+
+** Bounding cost
+
+=max_built_edges=50= is conservative.  In a fleet with a few
+hundred clients spread across distinct versions, the plan may
+need ~unique-positions edges.  Raise this for one-off large
+drops; revert to 50 for the cron.
+
+** Lazy-build cost surfacing
+
+The =built_on_demand=true= field in the response tells the
+client whether it paid for the build.  Future agent versions
+could log a metric (=ota_lazy_build_seconds=) and surface a
+"this upgrade took longer because the patch had to be built"
+hint to end users.
+
+** Audit trail
+
+Each lazy build is logged with =identity = "system"=,
+=action = "lazy-build-patch"=, =target = "FROM->TO"=, =detail =
+"size=N"= in the audit log.  Useful for spotting when
+out-of-order publishes have created paths the operator should
+pre-warm manually via the existing =admin-build-reverse-patch=
+endpoint.

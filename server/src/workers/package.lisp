@@ -16,6 +16,23 @@
            #:start-patch-pool
            #:stop-patch-pool
            #:notify-patch-pool
-           #:enqueue-patches-for-release))
+           #:enqueue-patches-for-release
+           ;; v1.5: admin stats catalogue
+           #:list-stat-queries
+           #:run-stat-query
+           #:stats-error
+           #:*stats-catalogue*
+           ;; v1.6: reachability-aware GC
+           #:shortest-patch-path
+           #:compute-reachability-plan
+           #:reachability-plan-feasible-p
+           #:execute-reachability-builds
+           ;; v1.7: notification worker pool
+           #:notification-pool
+           #:make-notification-pool
+           #:start-notification-pool
+           #:stop-notification-pool
+           #:notify-notification-pool
+           #:enqueue-publish-notifications))
 
 (in-package #:ota-server.workers)

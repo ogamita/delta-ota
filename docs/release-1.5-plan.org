@@ -1,0 +1,604 @@
+#+TITLE: Release 1.5 plan — client-software state tracking + statistics
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Scope
+
+The foundation slice of the "exact refcount" line of work:
+
+1. *Snapshot table* of which release every client is on, per software,
+   maintained by the agent.
+2. *Agent reporting* on every successful state transition.
+3. *Exact* =count-users-at-release= reading the snapshot instead of
+   the lossy event-log approximation.
+4. =patch_jobs= orphan cleanup tied to release GC (the small piece
+   we already discussed in passing).
+5. *Admin SQL statistics surface* (new step on this plan) — a
+   small catalogue of vetted queries the operator can run against
+   the snapshot + event log to answer the questions a deployment
+   actually has.
+
+Out of scope for v1.5 (queued for later releases):
+
+- *v1.6:* GC reachability invariant — refuse to drop a release `R`
+  whenever any client's only path forward goes through `R`'s
+  patches; lazily build the missing successor patches before
+  dropping.
+- *v1.7+:* analytics dashboards, =(client_id → email)= linkage for
+  upgrade-available notifications.
+
+* Background
+
+** What's already in the catalogue (v1.0+)
+
+The =install_events= table records install / upgrade / revert /
+recover events.  =count-users-at-release= scans it for a 180-day
+window of distinct clients whose latest successful event for
+software points at the release.  The GC reads this via the
+=min_user_count= threshold (default 0, configurable per call) and
+refuses to drop a release whose count exceeds the threshold.
+
+The =POST /v1/events/install= endpoint exists server-side and is
+wired into the catalogue.  *The agent never calls it.*  Telemetry
+stubs were "wired but no-op" in the phase-1 plan and never came
+back.  So in production:
+
+- =install_events= is permanently empty.
+- =count-users-at-release= always returns 0.
+- The =min_user_count= threshold is structurally off — only
+  =min_age_days= and =uncollectable= pins protect releases from
+  GC.
+
+** Why a snapshot table, not (just) finishing the event log
+
+Even with the agent reporting, =install_events= is structurally
+lossy for the "how many clients are on `X` *right now*" question:
+
+- Uninstall isn't observable (the agent is gone).
+- A blob-fallback download (no usable patch path) bypasses the
+  =upgrade= flow and can miss the transition event.
+- The events endpoint is best-effort (=204= even on parse error,
+  per [[file:../server/src/http/server.lisp][server.lisp]]); network drops between transitions lose
+  events silently.
+- Out-of-order publishes (debug version inserts, e.g.
+  =1.1 1.2 1.3 1.2.1 1.1.1= …) plus skip-patches leave gaps in
+  the chain that have to be reconstructed.
+
+Querying "WHERE release_id = ? AND latest event per client" is
+approximate by construction.  Acceptable for fuzzy stats; not
+acceptable as the gate for =DROP TABLE-equivalent= GC decisions.
+
+A snapshot table records the *current* state directly:
+
+#+begin_src sql
+(client_id, software_name) -> (current_release_id, previous_release_id, last_updated_at)
+#+end_src
+
+Maintained idempotently by the agent on every state change.
+Exact, queryable in one =COUNT(*)= per release.
+
+** Why keep =install_events= too
+
+The snapshot tells you "who is on X *now*"; the event log tells
+you "how did 25 % of users get to X".  Different questions:
+
+| Question                                       | Source     |
+|------------------------------------------------+------------|
+| How many clients are on release `X` right now? | Snapshot   |
+| What fraction of clients have adopted `X`?     | Snapshot   |
+| How long after publish do 50 % adopt `X`?      | Events     |
+| What's the failure rate of upgrade `A → B`?    | Events     |
+| How often do clients revert from `B → A`?      | Events     |
+| Which clients are stale (no update in N days)? | Snapshot   |
+| Which release path is most-used for upgrades?  | Events     |
+
+Snapshot becomes the authoritative current-state for GC.  Events
+stay append-only for analytics.  The agent reports both
+(PUT snapshot + POST event) on every transition.
+
+* Schema
+
+** Migration =0005_client_software_state.sql=
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS client_software_state (
+    client_id           TEXT NOT NULL,
+    software_name       TEXT NOT NULL,
+    current_release_id  TEXT,                     -- NULL = uninstalled
+    previous_release_id TEXT,                     -- for revert UX & audit
+    last_kind           TEXT NOT NULL,            -- install|upgrade|revert|recover|uninstall
+    last_updated_at     TEXT NOT NULL,
+    PRIMARY KEY (client_id, software_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_css_release
+    ON client_software_state(software_name, current_release_id);
+
+CREATE INDEX IF NOT EXISTS idx_css_updated
+    ON client_software_state(last_updated_at);
+
+INSERT OR IGNORE INTO schema_migrations (name, applied_at)
+VALUES ('0005_client_software_state', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+#+end_src
+
+Reasoning:
+
+- =client_id= is the existing identity from =clients= (phase 4).
+  No new identifier; agent is already authenticated by bearer
+  token bound to that =client_id=.
+- =current_release_id NULL= models uninstall cleanly: row stays
+  for stats, count queries filter on =NOT NULL=.
+- =previous_release_id= mirrors what =ota-agent= keeps locally
+  (=Current= / =Previous= in =state.json=).  Lets the server
+  display "v1.3.2 (was on v1.3.1 until 2026-04-12)" to admins.
+- Index on =(software, current_release_id)= makes the
+  per-release count an O(log N) lookup.
+- Index on =last_updated_at= supports the "stale clients" query.
+
+* Server-side API
+
+** =PUT /v1/clients/me/software/<software>=
+
+Idempotent set-or-update of the client's state for one software.
+Authenticated by the per-client bearer token (phase-4 mechanism);
+=client_id= is resolved from the token via the existing
+=get-client-by-token= helper, so the agent doesn't have to know
+or send its own ID.
+
+Body:
+
+#+begin_src json
+{
+  "current_release_id":  "myapp/linux-x86_64/1.4.2",   // null on uninstall
+  "previous_release_id": "myapp/linux-x86_64/1.4.1",   // optional
+  "kind":                "upgrade",                     // install|upgrade|revert|recover|uninstall
+  "at":                  "2026-05-10T19:42:00Z"        // optional; server uses now() when absent
+}
+#+end_src
+
+Response:
+
+#+begin_src json
+{
+  "client_id":            "c-deadbeef",
+  "software":             "myapp",
+  "current_release_id":   "myapp/linux-x86_64/1.4.2"
+}
+#+end_src
+
+Errors:
+
+- =401= when the bearer doesn't resolve to a client.
+- =400= when the body is missing =current_release_id= AND =kind=
+  isn't =uninstall=.
+
+Per-endpoint rate limit (v1.4 mechanism): something generous,
+since a fleet of 10 000 agents will all hit this on first-Monday
+upgrade waves.  Suggestion: =(capacity 60, refill 10/sec)= per
+client_id × route.
+
+** =count-users-at-release= rewrite
+
+#+begin_src lisp
+(defun count-users-at-release (catalogue software-name release-id
+                               &key (window-days nil))
+  "Number of clients whose current_release_id equals RELEASE-ID
+for SOFTWARE-NAME.  When WINDOW-DAYS is supplied, also requires
+last_updated_at within that recency window — so we don't count
+clients we haven't heard from in months as 'still on X'."
+  ...)
+#+end_src
+
+Same external signature.  =window-days= becomes optional (default
+NIL = no recency cutoff) — the snapshot is authoritative.  The
+GC path passes =window-days= so a long-abandoned install isn't
+treated as "active" forever.
+
+* Client-side reporting
+
+** When to call
+
+Agent calls =PUT /v1/clients/me/software/<sw>= after every
+successful state transition:
+
+- =ota-agent install= → on success
+- =ota-agent upgrade= → on success
+- =ota-agent revert= → on success
+- =ota-agent doctor --recover= → on success
+- =ota-agent uninstall= (a new subcommand, scoped here) → on
+  success, with =current_release_id: null=
+
+NOT called on failures (preserves "I don't know what state I'm
+in" as silence — better than reporting a transition that never
+happened).
+
+** Non-blocking, idempotent
+
+- A reporting failure does NOT fail the install/upgrade itself —
+  the local distribution is already in place, the report is
+  bookkeeping.
+- Logged at WARNING when it fails.
+- Idempotent: a re-report of the same =(current, previous)=
+  state is a no-op at the SQL level (INSERT OR REPLACE).
+- Per-call timeout: 5s.  No retry queue in v1.5; agent retries
+  on the next transition.
+
+** Privacy footnote
+
+The =client_id= is the same UUID minted at install-token
+exchange.  Nothing new is collected.  The body adds one piece of
+information per transition: =current_release_id=, which the
+server already knows we're serving to that client.  No PII.
+
+Document in operations.org and the user manual.
+
+* =patch_jobs= orphan cleanup (tied to release GC)
+
+The piece we already agreed on:
+
+** New catalogue function
+
+#+begin_src lisp
+(defun delete-patch-jobs-touching (catalogue release-id)
+  "Drop every patch_jobs row whose from or to release equals
+RELEASE-ID.  Called from drop-release in workers/operations.lisp
+after the patches table has been cleaned up."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query
+     db
+     "DELETE FROM patch_jobs WHERE from_release_id = ? OR to_release_id = ?"
+     release-id release-id)))
+#+end_src
+
+** One-line addition to =drop-release=
+
+After =delete-patches-touching=:
+
+#+begin_src lisp
+(ota-server.catalogue:delete-patch-jobs-touching catalogue rid)
+#+end_src
+
+** Pinned protection is automatic
+
+A pinned release is never dropped, so its =patch_jobs= rows
+persist with it.  No separate "uncollectable" check needed in
+this code path.
+
+** Tests
+
+- Pin two endpoints around a non-pinned middle release.  GC the
+  middle.  Assert: rows touching the middle are gone; rows
+  touching pinned endpoints survive.
+- Orphan-cleanup contract: drop a release, query
+  =patch_jobs WHERE to_release_id = <gone>= → empty.
+
+* Admin SQL statistics surface (new step)
+
+The snapshot table is interesting only if operators can ask
+useful questions of it.  Catalogue a vetted set, expose two ways
+to run them:
+
+** =GET /v1/admin/stats/<query-name>?software=...= (HTTP)
+
+Returns JSON.  Admin-authenticated.  Per-endpoint rate-limited
+(v1.4 mechanism); a couple of these scan the full snapshot, so
+the cap is low (e.g. =6/min=).
+
+** =ota-server stats <query-name> --software=...= (CLI)
+
+For cron / one-shot use.  Same logic, formatted as plain text.
+
+** Query catalogue (v1)
+
+Each query lives as a SQL string + a result schema + a handler
+in =workers/stats.lisp= (new file).  Query names are stable; the
+underlying SQL can be tuned without breaking consumers.
+
+*** =population-per-release=
+
+How many clients are currently on each release of `<software>`?
+The bread-and-butter query: GC sanity check, deployment status
+dashboard, release-adoption visualisation.
+
+#+begin_src sql
+SELECT current_release_id, COUNT(*) AS clients
+  FROM client_software_state
+ WHERE software_name = ?
+   AND current_release_id IS NOT NULL
+GROUP BY current_release_id
+ORDER BY clients DESC;
+#+end_src
+
+Output:
+
+#+begin_src text
+release_id                          clients
+myapp/linux-x86_64/1.4.2             2847
+myapp/linux-x86_64/1.4.1              312
+myapp/linux-x86_64/1.3.0               48
+myapp/linux-x86_64/1.2.5                3   ← candidate for GC
+#+end_src
+
+*** =fleet-summary=
+
+How many clients per software?  Cross-software view.
+
+#+begin_src sql
+SELECT software_name,
+       COUNT(*) AS clients,
+       COUNT(DISTINCT current_release_id) AS distinct_releases,
+       MAX(last_updated_at) AS most_recent_update
+  FROM client_software_state
+ WHERE current_release_id IS NOT NULL
+GROUP BY software_name
+ORDER BY clients DESC;
+#+end_src
+
+*** =stale-clients=
+
+Clients we haven't heard from in N days for `<software>` —
+candidates for "did the install get abandoned?".
+
+#+begin_src sql
+SELECT client_id, current_release_id, last_updated_at
+  FROM client_software_state
+ WHERE software_name = ?
+   AND last_updated_at < ?
+   AND current_release_id IS NOT NULL
+ORDER BY last_updated_at ASC
+LIMIT ?;
+#+end_src
+
+Parameters: software, cutoff date (server-computed from
+=N=30=), result cap.
+
+*** =gc-impact=
+
+Before running GC, show what would be culled and how many
+clients each pruned release still has.  Combines the existing
+GC rule with population counts.
+
+#+begin_src sql
+SELECT r.release_id,
+       r.version,
+       r.published_at,
+       r.uncollectable,
+       COALESCE(p.clients, 0) AS clients
+  FROM releases r
+  LEFT JOIN (
+    SELECT current_release_id, COUNT(*) AS clients
+      FROM client_software_state
+     WHERE software_name = ?
+     GROUP BY current_release_id
+  ) p ON p.current_release_id = r.release_id
+ WHERE r.software_name = ?
+ ORDER BY r.published_at DESC;
+#+end_src
+
+Renders as a table with columns ~release_id | version | age_days
+| pinned | clients | would_be_pruned~.
+
+*** =recent-events=
+
+Time-bucketed event-log summary — needs =install_events= (which
+v1.5 finally populates because the agent now reports).
+
+#+begin_src sql
+SELECT date(at) AS day,
+       kind,
+       status,
+       COUNT(*) AS n
+  FROM install_events
+ WHERE software_name = ?
+   AND at >= ?
+GROUP BY day, kind, status
+ORDER BY day DESC, kind, status;
+#+end_src
+
+For "are upgrades succeeding?" / "is the recovery tool getting
+used?" / "spike of revert events after release X dropped?"
+
+*** =upgrade-failure-rate=
+
+Per-transition failure rate from the event log.  Useful when a
+newly-published release has a quality problem.
+
+#+begin_src sql
+SELECT from_release_id,
+       release_id      AS to_release_id,
+       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures,
+       COUNT(*)                                            AS attempts,
+       ROUND(100.0 * SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+             / COUNT(*), 1) AS failure_pct
+  FROM install_events
+ WHERE software_name = ?
+   AND kind = 'upgrade'
+   AND at >= ?
+GROUP BY from_release_id, release_id
+HAVING attempts >= 5
+ORDER BY failure_pct DESC, attempts DESC;
+#+end_src
+
+Threshold-of-five on attempts prevents one-off failures from
+dominating the leaderboard.
+
+*** =adoption-curve=
+
+For a target release, what fraction of clients had adopted it at
+each day since publish?
+
+#+begin_src sql
+WITH first_seen AS (
+  SELECT client_id, MIN(at) AS first_at
+    FROM install_events
+   WHERE software_name   = ?
+     AND release_id      = ?
+     AND status          = 'ok'
+   GROUP BY client_id
+),
+fleet AS (
+  SELECT COUNT(*) AS total FROM client_software_state WHERE software_name = ?
+)
+SELECT date(first_seen.first_at) AS day,
+       COUNT(*) AS adopted_today,
+       (SELECT total FROM fleet) AS total
+  FROM first_seen
+GROUP BY day
+ORDER BY day ASC;
+#+end_src
+
+Caller post-processes into a cumulative curve.
+
+*** =recovery-events=
+
+How often do clients hit =doctor --recover=?  High counts =
+quality regression OR network issues, both worth investigating.
+
+#+begin_src sql
+SELECT date(at) AS day,
+       from_release_id,
+       release_id AS to_release_id,
+       status,
+       COUNT(*) AS n
+  FROM install_events
+ WHERE software_name = ?
+   AND kind          = 'recover'
+   AND at           >= ?
+GROUP BY day, from_release_id, release_id, status
+ORDER BY day DESC, n DESC;
+#+end_src
+
+** Query authorisation
+
+All stats queries are admin-only (=with-admin-identity= macro).
+The audit log records each invocation with the resolved cert
+subject (v1.4 mechanism) — operators can prove who looked at
+the fleet data and when.
+
+** Privacy
+
+=population-per-release= and similar aggregate queries are
+identity-free (counts, not enumerations).  =stale-clients=
+returns =client_id= values — UUID-shaped strings with no PII
+unless an operator has populated =clients.hwinfo= with hostname
+or similar.
+
+The query catalogue is intentionally curated.  *No* raw
+=SELECT * FROM client_software_state= endpoint — operators who
+need richer queries can use SQLite's CLI directly against the
+DB file (single-host deployment) or use the future PostgreSQL
+backend's standard tooling.
+
+* Documentation
+
+** New ADR-0010
+
+"Client-software state snapshot table".  Records the design
+decision: snapshot vs continued event-log-only; choice of
+schema; idempotency model; relationship to event log.
+
+** =operations.org= section
+
+"Fleet statistics" — what each query name means, when to use it,
+example output, how the GC's =min_user_count= relates to
+=population-per-release=.
+
+** User-manual / agent docs
+
+Document the agent's reporting: what gets sent, when, how to
+disable it (=OTA_DISABLE_REPORTING=1=, opt-out for paranoid
+deployments).
+
+* Test plan
+
+** Lisp unit tests
+
+- =record-client-state= round-trips for install / upgrade /
+  revert / recover / uninstall.
+- Idempotent re-PUT of the same state is a no-op.
+- =count-users-at-release= returns exact counts, including 0
+  for unknown release.
+- =count-users-at-release :window-days=N= correctly excludes
+  stale entries.
+- GC: pin two ends, GC middle, =delete-patch-jobs-touching=
+  fires; pinned rows survive.
+- Each stats query returns the expected shape on a seeded
+  catalogue.
+
+** Go client tests
+
+- =reportClientState= shape and authentication header.
+- =install= / =upgrade= / =revert= / =doctor --recover= all
+  call =reportClientState= on success.
+- Network failure in the report does NOT fail the install
+  itself; logged at WARNING.
+
+** E2E
+
+- =tests/e2e/client-state.sh=: boot server, install software on
+  a fake-agent, upgrade, revert, verify =GET
+  /v1/admin/stats/population-per-release= returns the expected
+  counts at each step.
+- =tests/e2e/stats.sh=: seed a small fleet (5 clients on three
+  releases), run every query, eyeball the output shape.
+
+** Plus the existing patch_jobs orphan-cleanup test in the
+   patch-pool test suite (cheap, slots into an existing file).
+
+* Out-of-scope reminders
+
+- *v1.6 reachability-aware GC*: lazy =build-patch-from-blobs=
+  for missing successors at GC time, refusing to drop releases
+  whose patches are on active upgrade paths.  Tracked as
+  follow-up.
+- *v1.7+ user-person link*: =(client_id → email)= table for
+  upgrade-available notifications.  Operator-facing UX; depends
+  on a settled position on opt-in / opt-out.
+- *Out-of-order publishes*: the snapshot table doesn't change
+  the fan-in policy.  Reachability is preserved automatically
+  *as long as the catalogue isn't GC'd through* the right
+  versions — that's v1.6's job.
+
+* Scope estimate
+
+| Piece                                            | Days   |
+|--------------------------------------------------+--------|
+| Migration + catalogue functions + tests          | 0.5    |
+| =PUT= endpoint + with-admin-identity threading   | 0.5    |
+| Agent reporting + retries + tests                | 1      |
+| =count-users-at-release= rewrite + tests         | 0.25   |
+| =patch_jobs= orphan cleanup + tests              | 0.25   |
+| Stats query catalogue (7 queries + handlers)     | 1.5    |
+| Stats CLI subcommand                             | 0.5    |
+| E2E shell scripts (2)                            | 0.5    |
+| ADR-0010 + operations.org section + user manual  | 1      |
+| Buffer                                           | 0.5    |
+|--------------------------------------------------+--------|
+| *Total*                                          | *6.5*  |
+
+So a ~1.5-week release at full focus, ~2 weeks calendar.  Most
+of the time is in the stats query catalogue and its
+documentation — the core data path (snapshot table + agent
+report + exact count) is half the work.
+
+* Open questions to settle before coding
+
+1. *Uninstall reporting:* delete the row, or keep it with
+   =current_release_id = NULL=?  Choice: keep for analytics
+   ("how many clients uninstalled in 2026-Q2?").
+2. *Stats window default:* =stale-clients=, =recent-events=,
+   =upgrade-failure-rate= all need a default time window.  30
+   days fits the GC's =min-age-days= default.  Make it
+   configurable per call.
+3. *Agent reporting opt-out:* env var or a TOML file?
+   =OTA_DISABLE_REPORTING=1= is consistent with our other env
+   knobs.  Default = report (the data is needed for GC to work).
+4. *Reporting failure logging:* WARNING is right when one fails;
+   ERROR if N consecutive fail (suggests misconfigured server
+   URL or expired token).  TBD: pick N.
+5. *Stats endpoint result cap:* =stale-clients= could legitimately
+   return thousands of rows.  Cap at 1000 with =LIMIT=, document
+   that operators wanting more should query the DB directly.
+
+These are tractable design choices, not blockers.  Decide while
+implementing.

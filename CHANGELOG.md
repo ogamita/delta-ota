@@ -19,6 +19,131 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **Opt-in client-person link + upgrade notifications via webhook.**
+  Two new tables: `client_emails` (multiple addresses per client,
+  opt-in by design) and `notifications_outbox` (mirrors
+  `patch_jobs` structurally for atomicity + restart-safety +
+  retry). Agent gains `ota-agent set-email <addr>` /
+  `unset-email` / `show-email`. Admin gains
+  `POST /v1/admin/software/<sw>/announce`. Publish handler
+  automatically enqueues "new release" notifications for clients
+  on older versions of the same software within matching
+  channels. A new notification worker pool drains the outbox and
+  POSTs JSON to a configurable webhook URL — operators run a
+  small HTTP receiver that translates to whatever their org
+  uses (SMTP, SES, Slack, Teams, internal ticket system); we
+  ship sample receivers in `tools/notifications/`. No built-in
+  SMTP — vendoring policy (ADR-0003) prohibits LGPL libraries
+  and hand-rolling SMTP would add attack surface. GDPR-friendly:
+  opt-in only, deletion via one HTTP call, configurable
+  `OTA_DISABLE_REPORTING=1` short-circuit. See
+  [docs/adr/0012-notification-webhook.org](docs/adr/0012-notification-webhook.org).
+
+## [1.6.0] - 2026-05-10
+
+### Added
+- **Reachability-aware GC.** The GC now consults the v1.5
+  client-software snapshot before dropping any release: for
+  every active client position, Dijkstra over the patches
+  graph computes the cheapest path to that client's target
+  release (highest visible semver). When the would-be-drop
+  set breaks a client's only path, the operator can either
+  let `ota-server` pre-build the minimum set of missing edges
+  via the v1.2 patch-build pool (the default) or accept full-
+  blob fallback for affected clients (`allow_blob_fallback`).
+  All-or-nothing: any build failure aborts the entire GC
+  before any release is dropped. See
+  [docs/adr/0011-reachability-aware-gc.org](docs/adr/0011-reachability-aware-gc.org).
+- **Lazy upgrade-time patch build.** When a client requests
+  `GET /v1/software/<sw>/upgrade?from=A&to=T` and no usable
+  patch exists in the catalogue (out-of-order publish + GC
+  through an intermediate, or a debug-version backport that
+  the original fan-in didn't cover), the server now builds
+  `A → T` on demand via the worker pool and serves it. First
+  client at A→T pays the build time; subsequent clients hit
+  the now-cached patch.
+
+### Changed
+- `POST /v1/admin/software/<sw>/gc` accepts three new flags —
+  `ensure_reachability` (default `true`), `allow_blob_fallback`
+  (default `false`), `max_built_edges` (default 50). Response
+  gains a `reachability` block detailing how many clients land
+  in each fate bucket (unaffected / graceful / blob-fallback /
+  unreachable) and how many edges were built.
+- `ota-server gc` CLI mirrors the new flags.
+
+## [1.5.0] - 2026-05-10
+
+### Added
+- **Client-software state snapshot (v1.5 foundation).** New
+  `client_software_state` catalogue table records `(client_id,
+  software_name) → (current_release_id, previous_release_id,
+  last_kind, last_updated_at)`. Maintained idempotently by
+  `ota-agent` via `PUT /v1/clients/me/software/<sw>` on every
+  successful install / upgrade / revert / recover / uninstall.
+  Replaces the lossy event-log scan in `count-users-at-release`
+  with an exact `COUNT(*)`; the GC's `min_user_count` threshold
+  now actually protects in-use releases (it was structurally off
+  pre-v1.5 because no agent reported events). `install_events`
+  stays around for analytics. Opt-out via `OTA_DISABLE_REPORTING=1`.
+  See [docs/adr/0010-client-software-state-snapshot.org](docs/adr/0010-client-software-state-snapshot.org).
+- **Admin SQL statistics catalogue.** Eight curated named queries
+  exposed via `GET /v1/admin/stats[/<name>]` and the
+  `ota-server stats <name>` CLI subcommand: `population-per-release`,
+  `fleet-summary`, `stale-clients`, `gc-impact`, `recent-events`,
+  `upgrade-failure-rate`, `adoption-curve`, `recovery-events`.
+  Curated, not generic — operators wanting richer queries run
+  `sqlite3 db/ota.db` directly. Admin-authenticated (v1.4
+  cert-subject identity), audit-logged, rate-limited.
+- **`patch_jobs` orphan cleanup.** `drop-release` (the release GC
+  path) now also deletes the `patch_jobs` rows touching the
+  dropped release, so the audit-trail table doesn't accumulate
+  references to release_ids that no longer exist. Pinned
+  releases inherit protection automatically (`drop-release` is
+  never called on them).
+
+### Changed
+- `count-users-at-release` now reads `client_software_state`
+  instead of scanning `install_events`. Same signature; same
+  callers; exact instead of approximate. `window-days` becomes
+  optional (no default).
+- Agent's `state.json` gains `os` / `arch` fields so the v1.5
+  state report can construct the canonical release_id
+  (`<software>/<os>-<arch>/<version>`) without re-fetching the
+  manifest on every transition.
+
+### Planning
+- **Release-1.5 plan landed.** Foundation slice for client-software
+  state tracking (snapshot table) + exact `count-users-at-release`
+  + `patch_jobs` orphan cleanup tied to release GC + an admin SQL
+  statistics surface (population-per-release, fleet-summary,
+  stale-clients, gc-impact, recent-events, upgrade-failure-rate,
+  adoption-curve, recovery-events). See
+  [docs/release-1.5-plan.org](docs/release-1.5-plan.org) for the
+  schema, agent reporting contract, query catalogue, test plan,
+  and open questions. Code lands in subsequent commits on this
+  branch.
+- **Release-1.6 plan landed.** Reachability-aware GC: Dijkstra over
+  the patches graph + the v1.5 snapshot to compute, before any
+  drop, whether each client's cheapest upgrade path survives.
+  Pre-builds the minimum set of missing edges via the v1.2
+  worker pool (atomic with the drop); operators get an
+  `allow_blob_fallback` escape hatch. Lazy upgrade-time patch
+  build closes the out-of-order-publish gap naturally. See
+  [docs/release-1.6-plan.org](docs/release-1.6-plan.org).
+- **Release-1.7 plan landed.** Opt-in client-person link
+  (`client_emails` table) + upgrade-notification dispatch via a
+  configurable webhook (no built-in SMTP — vendoring policy +
+  attack-surface arguments). Outbox pattern mirrors `patch_jobs`
+  for atomicity + restart-safety + retry. Sample webhook
+  receivers (smtp, ses, slack, teams) ship under
+  `tools/notifications/`. GDPR posture: opt-in, plain-text
+  storage, deletion via one HTTP call. See
+  [docs/release-1.7-plan.org](docs/release-1.7-plan.org).
+
+## [1.4.2] - 2026-05-10
+
 ### Fixed
 - **`tests/e2e/resume-download.sh` still broken on CI after 1.4.1.**
   1.4.1's `curl | head -c N` pipe tripped on `set -o pipefail`

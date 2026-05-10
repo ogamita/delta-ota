@@ -1,0 +1,408 @@
+#+TITLE: Release 1.6 plan — reachability-aware GC
+#+DATE: 2026-05-10
+#+AUTHOR: Pascal Bourguignon
+
+* Scope
+
+The "smart GC" follow-up to v1.5.  Once the catalogue knows
+exactly where every client is (=client_software_state= from
+v1.5), the GC can be much smarter about which releases it is
+allowed to drop.
+
+The thesis: *don't drop a release whose patches are still on a
+client's only viable upgrade path; if the only path goes through
+it, build the necessary bypass patch first.*
+
+** What v1.5 leaves on the table
+
+After v1.5 the GC will know:
+
+- Exact =count-users-at-release= from the snapshot.
+- The =min_user_count= threshold (existing) gates whether a
+  release can be dropped based on how many users are *on* it.
+
+But it does *not* yet know whether dropping that release would
+strand other clients whose forward upgrade path *passes through*
+it.  Concrete example, from your debug-release workflow:
+
+#+begin_example
+Publish order: 1.2  1.3  1.2.1  1.1.1
+Fan-in builds:    1.2→1.3
+                  1.2→1.2.1, 1.3→1.2.1            (at 1.2.1 publish)
+                  1.2→1.1.1, 1.3→1.1.1, 1.2.1→1.1.1 (at 1.1.1 publish)
+#+end_example
+
+Now suppose 1.2 is GC'd because no client is *on* 1.2 (v1.5
+check passes).  Patches =1.2→*= and =*→1.2= go with it.  Then
+1.3 is GC'd for the same reason.  A client *at* 1.2.1 wanting
+to upgrade now has no patch to anything newer (1.1.1 isn't a
+"newer" version anyway, and there's no 1.2.1→1.4 path because
+1.4 doesn't yet exist in this fragment).  The next time 1.4 is
+published, the fan-in builds =1.2.1→1.4= — but only if 1.2.1's
+blob is still around.  Which, after this much GC, it might not
+be.
+
+v1.6 closes this gap by treating the upgrade graph as a
+first-class invariant of the catalogue.
+
+** Out of scope
+
+- *v1.7+:* email / notification layer — orthogonal.
+- *Multi-software dependency tracking* (e.g. "myapp 1.4 requires
+  myplugin >= 2.0").  No customer is asking; would be a much
+  bigger design.
+
+* Background — the upgrade graph
+
+** Nodes and edges
+
+- *Nodes* = releases in =releases= table for one
+  =(software, os, arch)= tuple.
+- *Edges* = entries in =patches= table whose
+  =(from_release_id, to_release_id)= sit between two nodes.
+  Each edge has a size (=patches.size=); shortest-path by sum
+  of sizes is the cheapest upgrade.
+
+** Why "reachability" not "shortest path"
+
+The client doesn't always take the *shortest* patch path — it
+takes the *cheapest viable* one, where "viable" is bounded by
+=cfg.FallbackRatio= (default 0.7).  If the cheapest path's
+cumulative patch size exceeds =0.7 × blob_size= of the target,
+the client falls back to a full-blob download.
+
+So the GC's job is *not* to preserve every patch.  It's to
+preserve enough patches that *some* upgrade path stays under
+the fallback-ratio threshold, OR to accept the cost of a full
+blob download for some clients.  Reachability + cost
+optimisation, not reachability alone.
+
+But: a full-blob download for a 2 GB application is exactly
+what delta-OTA was created to avoid.  So in practice "preserve
+some path" is the right rule — the operator opts out per-GC if
+they want to accept blob fallbacks (e.g. when a release is
+sufficiently old that full re-installs are reasonable).
+
+** Why now (after v1.5, before v1.7)
+
+v1.5 gives us exact client positions.  v1.6 uses them.  v1.7's
+notification layer is orthogonal — could ship before or after.
+
+The right order is *5 → 6 → 7* because each layer needs the
+previous data, but v1.7's email layer would benefit from v1.6's
+"hey, your update path is broken, full blob coming" diagnostic
+to surface to the user.
+
+* Algorithm
+
+Given:
+- =D= = candidate-drop set (releases the v1.5 GC has decided are
+  prunable: not pinned, age threshold met, count ≤ threshold).
+- =C= = active client positions =(software, current_release_id)=
+  from =client_software_state=.
+- =R= = all release nodes.
+- =P= = current patch edges.
+- =target(c)= = the highest-semver release visible to client =c=
+  (using the v1.1.0 latest-semantics + classifications filter).
+
+For each =c ∈ C=:
+  1. Find cheapest path =current(c) → target(c)= in =P=.
+     (Dijkstra over edges, weight = patch size.  Bounded
+     subgraph; runtime is fine for a 30-release fleet.)
+  2. Compute the same path in =P − {edges touching D}=
+     (i.e. simulate the drop).
+  3. If no path exists OR cost > =fallback_ratio × blob_size=,
+     this client would lose its delta-upgrade path.
+
+Result: a partition of clients into:
+- *unaffected* — cheapest path doesn't touch =D=.
+- *graceful* — would lose patches but stays under fallback
+  ratio with the remaining graph.
+- *blob-fallback* — no path under fallback ratio; would
+  download the full blob.
+- *unreachable* — no path at all (e.g. their =current= is
+  also in =D=).
+
+Two operator policies:
+
+- **=ensure_reachability=:** for each =blob-fallback= /
+  =unreachable= client, identify the minimum set of edges to
+  *build* (via the v1.2 worker pool) that would restore a
+  viable path.  Build them, then drop =D=.
+- **=allow_blob_fallback=:** accept that some clients will
+  full-blob.  Report the count in the GC summary; drop =D= as
+  before.
+
+Default: =ensure_reachability= on.
+
+** Picking which edges to build
+
+A "missing edge" is any =(A, T)= where A is a client position
+and T is its target, and the dropped subgraph contains the only
+path.
+
+Naïve: build =(A, T)= directly for every affected client.
+
+Smarter: many clients share the same A.  Dedupe by
+=current_release_id=; build one =(A, T)= per A.
+
+Smartest: cluster clients by =(current, target)= pairs; if 50
+clients all want =1.1.2 → 1.4.0=, build that one edge.
+
+v1.6 will start naïve (dedupe by =(current, target)= pair) and
+let the smarter clustering wait until profiling shows it
+matters.
+
+** Bounding cost
+
+A pathological GC could build hundreds of patches.  Cap with:
+
+- =--max-built-edges=N= (default 50): refuse to proceed if the
+  plan requires more than =N= new patches; operator must
+  re-run with a smaller =D= or accept blob fallback.
+
+** Building before dropping
+
+The worker pool (v1.2) is the natural executor.  GC enqueues
+the missing-edge build jobs and *waits* on them before
+proceeding with the drops.  If any build fails, abort the GC
+entirely (don't drop anything) and report.
+
+This is the same atomicity story as v1.0.4's idempotent
+publish: either the whole plan succeeds (build then drop) or
+nothing changes.
+
+* Schema
+
+No new tables.  The reachability check is computed from
+existing =releases=, =patches=, and =client_software_state=
+(v1.5).
+
+* Server-side surface
+
+** Existing endpoint, two new flags
+
+#+begin_src
+POST /v1/admin/software/<sw>/gc
+Body: {
+  "dry_run":              false,           # existing
+  "min_user_count":       0,                # existing
+  "min_age_days":         30,               # existing
+  "ensure_reachability":  true,             # v1.6 NEW (default true)
+  "allow_blob_fallback":  false,            # v1.6 NEW (override)
+  "max_built_edges":      50                # v1.6 NEW
+}
+#+end_src
+
+Response shape extends:
+
+#+begin_src json
+{
+  "software":       "...",
+  "pruned":         ["...", "..."],
+  "dry_run":        false,
+  "reachability": {                          // v1.6 NEW
+    "clients_unaffected":     2847,
+    "clients_graceful":         42,           // patches changed, still under fallback ratio
+    "clients_blob_fallback":     5,           // no patch path; would download blob
+    "clients_unreachable":       0,           // current is also being dropped
+    "edges_built":              12,
+    "edges_built_total_bytes": 4194304
+  }
+}
+#+end_src
+
+The =reachability= block doubles as a diagnostic: an operator
+running with =dry_run=true= sees exactly what would happen
+before committing.
+
+** Existing CLI subcommand inherits the flags
+
+#+begin_src
+ota-server gc --software=myapp [--ensure-reachability] [--allow-blob-fallback]
+              [--max-built-edges=50]
+#+end_src
+
+* New worker function
+
+[[file:../server/src/workers/operations.lisp][workers/operations.lisp]]:
+
+#+begin_src lisp
+(defun compute-gc-plan (cas catalogue
+                        &key software (min-user-count 0) (min-age-days 30)
+                             (ensure-reachability t) (allow-blob-fallback nil)
+                             (max-built-edges 50) (fallback-ratio 0.7))
+  "Pure: compute what GC would do without side effects.
+Returns plist:
+  :drops        (list of release-id to drop)
+  :edges-to-build (list of (from to estimated-size))
+  :clients-by-fate (plist :unaffected :graceful :blob-fallback :unreachable)
+  :feasible-p   (T when within max-built-edges)
+  :errors       (list of human-readable issues)")
+
+(defun execute-gc-plan (cas catalogue keypair manifests-dir plan)
+  "Build the edges, wait for them, drop the releases.  Atomic --
+on any build failure, neither drops nor builds.")
+#+end_src
+
+The split between =compute-gc-plan= and =execute-gc-plan= lets
+the =dry_run= path report without doing anything, and lets the
+HTTP handler always show the plan first.
+
+* New catalogue helper
+
+A single shortest-path query over the patches table for one
+software.  SQLite is fine for the small graphs we have
+(hundreds of nodes, low thousands of edges).  Implementation in
+Lisp on top of =list-patches-by-from-or-to= and
+=list-releases=:
+
+#+begin_src lisp
+(defun shortest-patch-path (catalogue software-name from-release-id
+                            to-release-id &key excluding-edges fallback-ratio)
+  "Dijkstra over patches.  Returns (values path total-cost) or NIL
+when no path exists / cost exceeds fallback-ratio.")
+#+end_src
+
+This is a pure helper; no schema change.
+
+* Lazy build during normal upgrade (a tangential improvement)
+
+The v1.6 worker pool is also the right place to add: *when a
+client requests an upgrade A → T and no path exists*, the
+server can build =A → T= on demand and serve it.
+
+This catches the out-of-order-publish case naturally without
+waiting for the next GC pass.  When 1.2.1 is published in
+order 1.2 → 1.3 → 1.2.1, no =1.2.1 → 1.3= patch exists (1.3
+was published first); the *next* client at 1.2.1 wanting to go
+to 1.3 triggers an on-demand build via the pool.  Subsequent
+clients use the now-existing patch.
+
+Implementation:
+- =/v1/software/<sw>/upgrade?from=A&to=T= returns 202 + a
+  job_id when the patch doesn't exist; client polls (or
+  streams via NDJSON, reusing the v1.1.1 mechanism) until ready.
+
+This is a small addition once the worker pool is being used for
+reachability-ensuring builds anyway.  Document as part of v1.6.
+
+* Test plan
+
+** Lisp unit tests
+
+- =shortest-patch-path= on hand-built graphs:
+  - Linear chain =A → B → C → D=.
+  - Diamond =A → B/C → D=, B cheaper than C.
+  - No path: returns NIL.
+  - Excluded edges: confirm exclusion works.
+  - Fallback-ratio: returns NIL when cheapest exceeds threshold.
+
+- =compute-gc-plan= on synthetic catalogues:
+  - All clients on latest: drop everything except the pinned
+    anchor + latest; edges-built=0.
+  - One client stranded in the middle: plan includes a built
+    edge from their current → target.
+  - max-built-edges exceeded: plan reports infeasible.
+
+** E2E
+
+- =tests/e2e/reachability-gc.sh=: seed 3 clients on 3 different
+  releases, drop intermediates, verify reachability is preserved
+  (or rebuilt) for each client.
+
+- =tests/e2e/lazy-upgrade.sh=: publish 1.2 → 1.3 → 1.2.1 (out of
+  order); a fake client at 1.2.1 requests upgrade to 1.3; server
+  builds the missing patch lazily and serves it; second client
+  at 1.2.1 hits the now-cached patch.
+
+* Documentation
+
+** ADR-0011
+
+"Reachability-aware GC".  Records:
+- The drop-induces-orphaning problem.
+- The "minimum-edges-to-preserve-reachability" algorithm.
+- The atomicity story (build before drop, all-or-nothing).
+- The =allow_blob_fallback= escape hatch and when an operator
+  should use it.
+- Alternatives rejected (e.g. building ALL pairwise patches at
+  publish time; bidirectional fan-in).
+
+** operations.org
+
+Section "Reachability-aware GC" with example dry-run output,
+how to interpret the reachability block, when to use
+=allow_blob_fallback=, max-built-edges tuning.
+
+** User-manual (developer audience)
+
+When publishing out-of-order debug versions, document that the
+server will lazily build missing patches but the *first* client
+to request the missing path pays the build time.  For a 2 GB
+blob this is non-trivial (~30 seconds on the reference host);
+operators may want to pre-warm via the existing
+=admin-build-reverse-patch= endpoint.
+
+* Scope estimate
+
+| Piece                                                | Days |
+|------------------------------------------------------+------|
+| =shortest-patch-path= + tests                        | 1    |
+| =compute-gc-plan= + tests                            | 1    |
+| =execute-gc-plan= (with pool-build integration)      | 1    |
+| HTTP/CLI flags + response shape                      | 0.5  |
+| Lazy-upgrade build path in upgrade handler           | 1    |
+| E2E shell scripts (reachability + lazy-upgrade)      | 1    |
+| ADR-0011 + operations.org + user-manual              | 0.5  |
+| Buffer                                               | 0.5  |
+|------------------------------------------------------+------|
+| *Total*                                              | *6.5* |
+
+Roughly the same envelope as v1.5.  Most of the time is in the
+test surface (synthetic graphs + e2e); the algorithm itself is
+classic Dijkstra.
+
+* Open questions to settle before coding
+
+1. *Default policy:* =ensure_reachability=true= or false?  Lean
+   true — operators who want the v1.0–v1.5 behaviour pass
+   =allow_blob_fallback=true=.
+
+2. *Target selection:* "highest-semver visible release" is v1.1.0
+   policy.  Could be looser ("any release in same channel newer
+   than current") or stricter ("the exact release named in some
+   per-client policy").  Start with v1.1.0 policy; revisit if a
+   customer needs per-client targets.
+
+3. *Lazy-build timeout:* on-demand =A → T= build takes ~bsdiff
+   time of the source blob.  Should the client poll or block?
+   NDJSON streaming (v1.1.1) is the natural fit — same
+   mechanism the publish handler uses.
+
+4. *Build-failure semantics:* if a single edge-build fails
+   during GC, abort the whole plan?  Lean yes — partial
+   atomicity invites confusion.
+
+5. *Multi-software:* should one GC call ever consider multiple
+   software lines together?  Today no, and v1.6 doesn't change
+   that.  Multi-software dep tracking is a separate big feature.
+
+* Risk
+
+The shortest-path computation is small and well-understood.
+The risk is in the *integration*:
+
+- Build-then-drop atomicity must not leak partial state to the
+  catalogue (need =BEGIN IMMEDIATE= around the drop set, same
+  as v1.1.1's two-process publish).
+- Pool queue interactions: GC-time builds compete with publish-
+  time builds for the same worker pool.  GC is offline /
+  scheduled; can run at low priority.  Worth a sentence in the
+  ADR.
+- A misconfigured =max_built_edges= could either thwart a
+  legitimate GC (too low) or eat the worker pool for hours
+  (too high).  Document a sensible default (50) and a
+  worked example for picking it.
+
+None of these are show-stoppers.

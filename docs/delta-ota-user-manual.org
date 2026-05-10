@@ -97,7 +97,11 @@ Inbound :
   blob downloads.
 - *TCP/443 admin path* :: separate admin endpoints under
   =/v1/admin/...= require an admin bearer token.  Restrict at the
-  proxy layer to known admin networks.
+  proxy layer to known admin networks.  Since v1.4, the proxy can
+  also forward a verified client certificate's Subject DN via a
+  configurable header; pair with =[tls].admin_subjects= for a
+  strict allowlist and =[tls].require_mtls= for the strictest
+  bearer-AND-cert mode.  ADR-0009 has the design + nginx snippet.
 
 Outbound :
 
@@ -105,10 +109,14 @@ Outbound :
 - *Container registry* :: pulling the server image
   (=registry.gitlab.com/ogamita/...=).  No outbound dependency at
   runtime once the image is on disk.
+- *Notification webhook* :: when =[notifications].webhook_url= is
+  configured (v1.7+), the server POSTs upgrade-notification
+  payloads to an operator-managed receiver.  See ADR-0012 +
+  =tools/notifications/=.
 
-The server makes *no* outbound calls during normal operation:
-publishing happens via inbound POST, builds happen synchronously,
-and clients pull.
+The server makes *no other* outbound calls during normal
+operation: publishing happens via inbound POST, builds happen
+in-process, and clients pull.
 
 ** Capacity planning
 
@@ -167,6 +175,80 @@ curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN"        \
 #+end_src
 
 Idempotent.  Run weekly from cron / systemd timer.
+
+Since v1.6 the GC is /reachability-aware/: it consults the
+client-software snapshot (v1.5) to make sure dropping a release
+doesn't strand any client on a no-patch upgrade path.  For each
+client whose only upgrade path would be broken, the GC pre-builds
+the minimum set of direct =current → target= patches before the
+drop.  Three new body keys control this layer:
+
+| Key                       | Default | Effect                                                  |
+|---------------------------+---------+---------------------------------------------------------|
+| =ensure_reachability=     | =true=  | Run the reachability layer.  =false= = pre-v1.6 behaviour. |
+| =allow_blob_fallback=     | =false= | Accept full-blob fallback for affected clients instead of pre-building. |
+| =max_built_edges=         | =50=    | Refuse the GC entirely when more edges would be needed. |
+
+When the plan needs more edges than =max_built_edges=, the GC
+returns =409= and drops nothing.  Re-run with =--max-built-edges=N=
+to raise the cap, or =--allow-blob-fallback= to accept the
+fallback for the affected clients.  ADR-0011 has the full design.
+
+The CLI mirror is =ota-server gc --software=NAME= with the
+matching =--no-ensure-reachability= / =--allow-blob-fallback=
+/ =--max-built-edges= flags.
+
+*** Inspect the fleet (v1.5+)
+
+The admin stats catalogue exposes a small, curated set of named
+SQL queries against the client-software snapshot and the event
+log.  Two equivalent entry points:
+
+#+begin_src sh
+# HTTP: returns JSON.
+curl -H "Authorization: Bearer $OTA_ADMIN_TOKEN" \
+     "https://ota.example.com/v1/admin/stats/population-per-release?software=schms"
+
+# CLI: returns an ASCII table.
+ota-server stats population-per-release --software=schms
+ota-server stats --help-stats                       # lists the catalogue
+#+end_src
+
+Available queries (each documented at =GET /v1/admin/stats=):
+
+| Name                     | Use case                                       |
+|--------------------------+------------------------------------------------|
+| =population-per-release= | who is on X right now (the bread-and-butter)   |
+| =fleet-summary=          | cross-software view                            |
+| =stale-clients=          | clients that haven't reported in N days        |
+| =gc-impact=              | dry-run view of which releases the GC would prune |
+| =recent-events=          | time-bucketed transition rate                  |
+| =upgrade-failure-rate=   | per (from, to) pair (HAVING attempts ≥ 5)      |
+| =adoption-curve=         | cumulative-adoption curve per release          |
+| =recovery-events=        | =doctor --recover= rate (quality / network)    |
+
+Per-row result cap: 1000.  Operators wanting fuller dumps run
+=sqlite3 db/ota.db= directly.  ADR-0010 covers the design.
+
+*** Send an upgrade announcement (v1.7+)
+
+When =[notifications].webhook_url= is configured in =ota.toml=,
+every publish automatically fans out an upgrade notification to
+clients on an older version of the same software.  Operators
+can also trigger a fan-out manually:
+
+#+begin_src sh
+curl -X POST -H "Authorization: Bearer $OTA_ADMIN_TOKEN"        \
+     -H "Content-Type: application/json"                        \
+     -d '{"release_id":"schms/linux-x86_64/3.4.1","reason":"announce"}' \
+     https://ota.example.com/v1/admin/software/schms/announce
+#+end_src
+
+=ota-server= ships *no* SMTP code; mail leaves the process via
+an HTTP webhook.  Operators run a small receiver (samples in
+=tools/notifications/=: SMTP, Slack) that translates our JSON
+to the channel their organisation uses.  ADR-0012 covers the
+payload schema + HMAC signature + retry semantics.
 
 *** Verify storage integrity
 
@@ -256,8 +338,58 @@ The agent installs into =$OTA_HOME/<software>/= (default
 Windows non-admin/non-developer-mode installs, a =current.path=
 text file holding the absolute path.
 
+Since v1.3 the agent keeps its =<dst>.part= file across attempts:
+if a 2 GB initial install drops at 1.9 GB, the next =install=
+invocation reuses the partial bytes (after scanning the trailing-
+zero tail and trimming back to the last committed byte), asks
+the server for =Range: bytes=N-=, and resumes.  ADR-0008 has the
+trailing-zero rationale (no per-chunk =fsync(2)= cost).  No
+agent-side configuration is needed; resume is always on.
+
 Your application launcher reads =$OTA_HOME/<software>/current=
 and execs the binary inside.  See [[*Launcher patterns]].
+
+*** Client-side state reporting (v1.5+)
+
+After every successful =install= / =upgrade= / =revert= /
+=doctor --recover=, the agent PUTs the per-(client, software)
+state to =/v1/clients/me/software/<sw>=.  The server uses this
+snapshot for an *exact* "who is on X right now" count -- which
+the GC's =min_user_count= threshold now actually consults
+(pre-v1.5 the check was structurally off because no agent
+reported).
+
+Reporting is best-effort: a network failure logs at warning
+level but does NOT roll the local install back.  The local
+state in =$OTA_HOME/<software>/state.json= is always the
+authoritative record from the agent's perspective.
+
+To opt out (sandboxed installs, privacy-conscious deployments),
+set =OTA_DISABLE_REPORTING=1= in the agent's environment.  The
+local install proceeds normally; only the server-side snapshot
+is suppressed.  Note that opted-out clients don't count toward
+the GC's =min_user_count= threshold -- operators should pair the
+opt-out with =uncollectable= pins on releases they want to keep.
+
+*** Notifications: registering an email (v1.7+)
+
+Users can opt in to receive upgrade notifications:
+
+#+begin_src sh
+ota-agent set-email   my-software alice@example.com
+ota-agent show-email  my-software
+ota-agent unset-email my-software [alice@example.com]    # without addr, removes all
+#+end_src
+
+The agent does *not* prompt for email on install -- users invoke
+=set-email= explicitly.  Address storage is plain-text in the
+server's catalogue; deletion is one HTTP call via the
+=unset-email= subcommand or =DELETE /v1/clients/me/email=
+(GDPR right-to-deletion).
+
+The actual mail dispatch happens in an operator-managed webhook
+receiver, not in =ota-server=.  See ADR-0012 for the payload
+schema and the sample receivers in =tools/notifications/=.
 
 ** Option 2 — link =libota= via the C ABI
 
@@ -367,16 +499,25 @@ patch.
 | GET    | =/v1/software/{sw}/releases/latest=                   | bearer (filtered)     |
 | GET    | =/v1/software/{sw}/releases/{v}=                      | bearer (filtered)     |
 | GET    | =/v1/software/{sw}/releases/{v}/manifest=             | bearer (filtered)     |
-| GET    | =/v1/blobs/{sha}=                                     | bearer                |
-| GET    | =/v1/patches/{sha}=                                   | bearer                |
+| GET    | =/v1/software/{sw}/upgrade?from=A&to=T= /v1.6/        | bearer (filtered)     |
+| GET    | =/v1/blobs/{sha}=  (=Range:= /v1.3/)                  | bearer                |
+| GET    | =/v1/patches/{sha}= (=Range:= /v1.3/)                 | bearer                |
 | POST   | =/v1/exchange-token=                                  | install-token (body)  |
 | POST   | =/v1/events/install=                                  | bearer (best-effort)  |
+| PUT    | =/v1/clients/me/software/{sw}= /v1.5/                 | per-client bearer     |
+| GET    | =/v1/clients/me/software= /v1.5/                      | per-client bearer     |
+| PUT    | =/v1/clients/me/email= /v1.7/                         | per-client bearer     |
+| GET    | =/v1/clients/me/email= /v1.7/                         | per-client bearer     |
+| DELETE | =/v1/clients/me/email[?address=...]= /v1.7/           | per-client bearer     |
 | POST   | =/v1/admin/software=                                  | admin                 |
 | POST   | =/v1/admin/software/{sw}/releases=                    | admin                 |
 | POST   | =/v1/admin/software/{sw}/gc=                          | admin                 |
+| POST   | =/v1/admin/software/{sw}/announce= /v1.7/             | admin                 |
 | POST   | =/v1/admin/install-tokens=                            | admin                 |
 | POST   | =/v1/admin/verify=                                    | admin                 |
 | GET    | =/v1/admin/audit=                                     | admin                 |
+| GET    | =/v1/admin/stats= /v1.5/                              | admin                 |
+| GET    | =/v1/admin/stats/{query-name}= /v1.5/                 | admin                 |
 
 The full machine-readable description lives at
 [[file:../schemas/api.openapi.yaml][schemas/api.openapi.yaml]].
@@ -398,6 +539,8 @@ JSON Schema at [[file:../schemas/manifest.schema.json][schemas/manifest.schema.j
 | =server_pubkey_hex= | string    | trust-on-first-use pin                   |
 | =client_id=       | string      | server-issued                            |
 | =bearer_token=    | string      | per-workstation, persisted               |
+| =os=              | string      | manifest's OS string, captured on install (v1.5+) |
+| =arch=            | string      | manifest's arch string, captured on install (v1.5+) |
 | =updated_at=      | timestamp   | UTC                                      |
 
 ** Exit codes (=ota-agent=)
@@ -408,15 +551,25 @@ JSON Schema at [[file:../schemas/manifest.schema.json][schemas/manifest.schema.j
 |    1 | Operational failure (network, signature, hash, …) |
 |    2 | Usage error (missing args)                       |
 
+** Exit codes (=ota-server=)
+
+| Code | Meaning                                                              |
+|------+----------------------------------------------------------------------|
+|    0 | Success                                                              |
+|    2 | Usage / missing required argument                                    |
+|    3 | =gc= aborted because the reachability plan needs more edges than =--max-built-edges= (v1.6+); re-run with =--allow-blob-fallback= or raise the cap |
+|    3 | =stats= named query not found or required parameter missing (v1.5+)  |
+
 ** Environment variables
 
-| Variable              | Purpose                                       |
-|-----------------------+-----------------------------------------------|
-| =OTA_HOME=            | base directory for installs (default =~/.ota=) |
-| =OTA_SERVER=          | default =--server= URL                        |
-| =OTA_INSTALL_TOKEN=   | default =--install-token= value               |
-| =OTA_TRUSTED_PUBKEYS= | comma-separated hex pubkey list (server)      |
-| =OTA_ADMIN_TOKEN=     | (admin) bearer for =ota-admin= and curl       |
+| Variable                | Purpose                                                                   |
+|-------------------------+---------------------------------------------------------------------------|
+| =OTA_HOME=              | base directory for installs (default =~/.ota=)                            |
+| =OTA_SERVER=            | default =--server= URL                                                    |
+| =OTA_INSTALL_TOKEN=     | default =--install-token= value                                           |
+| =OTA_TRUSTED_PUBKEYS=   | comma-separated hex pubkey list (server)                                  |
+| =OTA_ADMIN_TOKEN=       | (admin) bearer for =ota-admin= and curl                                   |
+| =OTA_DISABLE_REPORTING= | set to =1= to suppress the v1.5 per-(client, software) state PUT          |
 
 * Support
 

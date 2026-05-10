@@ -236,6 +236,165 @@ func (c *Client) ListSoftware(ctx context.Context) ([]Software, error) {
 	return out, nil
 }
 
+// SetClientEmail registers an email for the calling client at the
+// server (v1.7).  Used by `ota-agent set-email`.  Strictly opt-in:
+// the agent only calls this when the user explicitly asks.
+//
+// Authenticated by the per-client bearer.  Returns the parsed
+// response { client_id, email, verified } on success.
+type SetEmailResult struct {
+	ClientID string `json:"client_id"`
+	Email    string `json:"email"`
+	Verified bool   `json:"verified"`
+}
+
+func (c *Client) SetClientEmail(ctx context.Context, email string) (*SetEmailResult, error) {
+	body, _ := json.Marshal(map[string]string{"email": email})
+	url := c.BaseURL + "/v1/clients/me/email"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("set-email: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("set-email: %s", resp.Status)
+	}
+	var out SetEmailResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("set-email parse: %w", err)
+	}
+	return &out, nil
+}
+
+// ListClientEmails returns the addresses registered for the calling
+// client (v1.7).  Used by `ota-agent show-email`.
+type ClientEmail struct {
+	Email      string `json:"email"`
+	VerifiedAt string `json:"verified_at"`
+	OptedInAt  string `json:"opted_in_at"`
+}
+
+func (c *Client) ListClientEmails(ctx context.Context) ([]ClientEmail, error) {
+	url := c.BaseURL + "/v1/clients/me/email"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list-emails: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("list-emails: %s", resp.Status)
+	}
+	var out []ClientEmail
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list-emails parse: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteClientEmail removes one (or all) registered addresses for
+// the calling client (v1.7).  When `address` is empty, removes all
+// -- the GDPR right-to-deletion path.
+func (c *Client) DeleteClientEmail(ctx context.Context, address string) (int, error) {
+	url := c.BaseURL + "/v1/clients/me/email"
+	if address != "" {
+		url = url + "?address=" + address
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("delete-email: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return 0, fmt.Errorf("delete-email: %s", resp.Status)
+	}
+	var out struct {
+		Deleted int `json:"deleted"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, fmt.Errorf("delete-email parse: %w", err)
+	}
+	return out.Deleted, nil
+}
+
+// ReportClientState PUTs the agent's current snapshot for one
+// software to /v1/clients/me/software/<sw> (v1.5).  The server
+// updates client_software_state, used by the GC's exact
+// count-users-at-release and by the admin stats catalogue.
+//
+// Authenticated by the per-client bearer.  Should be called
+// after every successful install / upgrade / revert / recover /
+// uninstall.  Idempotent on the server side: re-PUT the same
+// state is a no-op at the value level.
+//
+// Best-effort: callers SHOULD log the error and continue.  The
+// local install state is already committed before this is
+// called; a reporting failure does not roll the install back.
+//
+// Honours OTA_DISABLE_REPORTING=1 by short-circuiting to nil
+// without making any network call.  Deployments that don't want
+// the server to know their snapshot can flip this.
+func (c *Client) ReportClientState(ctx context.Context,
+	software, currentReleaseID, previousReleaseID, kind string) error {
+	if os.Getenv("OTA_DISABLE_REPORTING") == "1" {
+		return nil
+	}
+	body := map[string]any{
+		"kind": kind,
+	}
+	if currentReleaseID != "" {
+		body["current_release_id"] = currentReleaseID
+	} else {
+		body["current_release_id"] = nil
+	}
+	if previousReleaseID != "" {
+		body["previous_release_id"] = previousReleaseID
+	}
+	enc, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("report-state: encode: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/clients/me/software/%s", c.BaseURL, software)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(enc))
+	if err != nil {
+		return err
+	}
+	if c.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+string(c.Auth))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("report-state: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("report-state: %s", resp.Status)
+	}
+	return nil
+}
+
 // DownloadPatch is like DownloadBlob but for /v1/patches/<sha>.
 func (c *Client) DownloadPatch(ctx context.Context, sha256Hex, dstPath string, progress func(written int64)) (int64, error) {
 	return c.downloadHashed(ctx, fmt.Sprintf("%s/v1/patches/%s", c.BaseURL, sha256Hex), sha256Hex, dstPath, progress)

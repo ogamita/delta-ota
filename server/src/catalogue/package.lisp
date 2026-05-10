@@ -35,6 +35,8 @@
            #:delete-patches-touching
            #:list-patches-by-from-or-to
            #:count-releases-using-blob
+           #:list-patches-for-software
+           #:get-patch-by-tuple
            ;; phase-6
            #:mark-uncollectable
            ;; v1.2 — async patch-build worker pool
@@ -44,6 +46,23 @@
            #:fail-patch-job
            #:list-patch-jobs-for-release
            #:count-patch-jobs
-           #:reset-stale-running-jobs))
+           #:reset-stale-running-jobs
+           #:delete-patch-jobs-touching
+           ;; v1.5 — client-software state snapshot
+           #:record-client-software-state
+           #:get-client-software-state
+           #:list-client-software-states
+           ;; v1.7 — opt-in client emails
+           #:record-client-email
+           #:list-client-emails
+           #:delete-client-email
+           ;; v1.7 — notifications outbox
+           #:enqueue-notification
+           #:claim-next-notification
+           #:mark-notification-sent
+           #:mark-notification-failed
+           #:reset-stale-running-notifications
+           #:count-notifications
+           #:list-clients-on-software))
 
 (in-package #:ota-server.catalogue)

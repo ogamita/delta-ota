@@ -33,6 +33,9 @@ Usage:
   ota-agent prune     <name> [--archive-depth=N]
   ota-agent watch     <name> [--interval=24h]
   ota-agent doctor    [<name> --recover]
+  ota-agent set-email   <name> <address>      register an email for upgrade notifications
+  ota-agent unset-email <name> [<address>]    remove one address (or all)
+  ota-agent show-email  <name>                list registered addresses
   ota-agent licenses
   ota-agent version
 
@@ -73,6 +76,12 @@ func main() {
 		verifyCmd(flag.Args()[1:])
 	case "prune":
 		pruneCmd(flag.Args()[1:])
+	case "set-email":
+		setEmailCmd(flag.Args()[1:])
+	case "unset-email":
+		unsetEmailCmd(flag.Args()[1:])
+	case "show-email":
+		showEmailCmd(flag.Args()[1:])
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -300,6 +309,9 @@ func doctorCmd(args []string) {
 			OTAHome:        ota_home,
 			TrustedPubKeys: parsePubKeys(os.Getenv("OTA_TRUSTED_PUBKEYS")),
 			Timeout:        2 * time.Minute,
+			// v1.5: doctor --recover is a distinct transition kind in
+			// the audit log and the snapshot table.
+			Kind: "recover",
 		}
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel2()
@@ -323,6 +335,94 @@ func revertCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("reverted %s\n", args[0])
+}
+
+// ---------------------------------------------------------------------------
+// v1.7 email subcommands
+// ---------------------------------------------------------------------------
+
+func emailClientFor(software string) (*libota.EmailClient, error) {
+	ota_home := os.Getenv("OTA_HOME")
+	if ota_home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			ota_home = filepath.Join(h, ".ota")
+		}
+	}
+	return libota.NewEmailClient(ota_home, software)
+}
+
+func setEmailCmd(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "set-email: usage: ota-agent set-email <name> <address>")
+		os.Exit(2)
+	}
+	c, err := emailClientFor(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "set-email: %v\n", err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Set(ctx, args[1]); err != nil {
+		fmt.Fprintf(os.Stderr, "set-email: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("registered %s for %s\n", args[1], args[0])
+}
+
+func unsetEmailCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "unset-email: usage: ota-agent unset-email <name> [<address>]")
+		os.Exit(2)
+	}
+	c, err := emailClientFor(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unset-email: %v\n", err)
+		os.Exit(1)
+	}
+	addr := ""
+	if len(args) >= 2 {
+		addr = args[1]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	deleted, err := c.Unset(ctx, addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unset-email: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("removed %d address(es) for %s\n", deleted, args[0])
+}
+
+func showEmailCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "show-email: usage: ota-agent show-email <name>")
+		os.Exit(2)
+	}
+	c, err := emailClientFor(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "show-email: %v\n", err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := c.Show(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "show-email: %v\n", err)
+		os.Exit(1)
+	}
+	if len(rows) == 0 {
+		fmt.Printf("no emails registered for %s\n", args[0])
+		return
+	}
+	fmt.Printf("registered emails for %s:\n", args[0])
+	for _, r := range rows {
+		verified := "unverified"
+		if r.VerifiedAt != "" {
+			verified = "verified"
+		}
+		fmt.Printf("  %-40s opted-in=%s (%s)\n", r.Email, r.OptedInAt, verified)
+	}
 }
 
 func parsePubKeys(s string) []string {
