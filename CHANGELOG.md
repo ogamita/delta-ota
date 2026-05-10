@@ -19,6 +19,22 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Fixed
+- **`tests/e2e/resume-download.sh` flaky on fast CI runners.** The
+  interrupt was implemented with `curl --limit-rate 100K
+  --max-time 0.5s`, which assumed the rate-limiter would kick in
+  before 4 MiB came down. On GitLab's saas runners it didn't —
+  the whole blob transferred in under 500 ms and the test
+  reported "download somehow finished within max-time". Replaced
+  the timing-based cut with a `curl | head -c N` pipe: `head`
+  reads exactly N bytes and exits, curl gets EPIPE on the next
+  write, the `.part` file has exactly N bytes regardless of
+  network speed. No production-code change; resume itself was
+  never broken — ADR-0008's design works fine, the test
+  harness was wrong.
+
+## [1.4.0] - 2026-05-10
+
 ### Added
 - **Cert-subject identity for admin endpoints + mandatory-mTLS mode.**
   Operators terminating TLS at a reverse proxy (the recommended
