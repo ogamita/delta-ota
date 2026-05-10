@@ -10,6 +10,7 @@
            #:list-software
            #:get-software
            #:insert-release
+           #:insert-release-if-new
            #:list-releases
            #:get-release
            #:get-release-by-tuple

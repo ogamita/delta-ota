@@ -19,6 +19,51 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Fixed
+- **Publish handler is now atomic across multiple ota-server
+  processes** sharing one data directory. Two narrow races were
+  documented and closed:
+
+  - *Same `(software, os, arch, version)`*: the lookup-then-insert
+    sequence in the handler used to let two processes both pass
+    the existence check, with the loser then propagating
+    `SQLITE_CONSTRAINT` as a 500. Now wrapped in `BEGIN
+    IMMEDIATE` via the new
+    `ota-server.catalogue:insert-release-if-new` — exactly one
+    caller wins (`:inserted`), the rest see the existing row
+    (`:existing`) and dispatch normally on the v1.0.4
+    idempotent-vs-conflict logic.
+
+  - *Different versions of the same software within one
+    wall-clock second*: the v1.1.0 strict-monotonic
+    `published_at` rule was previously per-process only; now
+    `next-published-at`'s `SELECT MAX` runs inside the same
+    `BEGIN IMMEDIATE` transaction, so the guarantee holds
+    across processes too.
+
+- **Manifest disk writes only happen on `:inserted`** — the
+  pre-v1.1.1 handler wrote `manifests/<sw>/<version>.json` and
+  `.sig` *before* inserting the row. In a 409-conflict race (B's
+  blob differs from A's), B used to overwrite the on-disk
+  manifest with one for B's blob even though B's row was
+  rejected; subsequent `GET /manifest` would have served B's
+  signed manifest while the catalogue pointed at A's blob. Fix:
+  compute manifest fully in memory, dispatch on `insert-release-
+  if-new`, write to disk only on the `:inserted` branch.
+
+  Full analysis in [docs/adr/0006-multi-process-catalogue-access.org](docs/adr/0006-multi-process-catalogue-access.org).
+
+### Added
+- **`ota-server.catalogue:insert-release-if-new`** — atomic
+  lookup-and-insert returning `(values :inserted nil)` or
+  `(values :existing existing-row)`. 9 new unit tests
+  covering the single-call paths AND an 8-thread barrier-
+  synchronised race that proves exactly one thread wins.
+- **ADR-0006: Multi-process access to one catalogue** — per-layer
+  analysis (SQLite WAL, CAS, manifests, key) + the two races
+  + the design choice + open items (SQLITE_BUSY handling,
+  audit row for re-publishes, real two-process e2e).
+
 ### Added
 - **Real-time publish progress over HTTP (chunked NDJSON).** When
   `ota-admin publish` opts in via `Accept: application/x-ndjson`

@@ -538,51 +538,23 @@ incrementally — typically a small fraction of the full payload.</small></p>
             :identity "admin" :action "create-software" :target name :detail nil)
            (json-response 201 (obj "name" name "display_name" (or display name)))))))
 
-(defun %publish-build-and-emit (app emit &key software os arch version release-id
-                                              osversions sha size headers notes)
-  "Common work between sync and streaming publish: build manifest,
-sign, write to disk, insert release, append audit, build patches
-(emitting per-patch progress via EMIT's :on-progress hook), re-sign
-manifest with patches_in, and emit a final {:event :done …}.
+(defun %publish-finalize-and-emit (app emit &key software os arch version release-id
+                                                 osversions sha size manifest-bytes
+                                                 manifest-sha sig notes)
+  "Post-INSERT-RELEASE-IF-NEW work: write manifest to disk, append
+audit, run patch fan-in (emitting per-patch progress via EMIT's
+:on-progress hook), re-sign manifest with patches_in, and emit
+the final {:event :done …}.  Called only when the row was newly
+inserted (the :inserted branch of the publish handler) -- so we
+never touch disk for an idempotent re-publish or a 409 conflict.
 
-EMIT is a one-arg function called with a plist per event:
-  (:event :stored            :release-id ID :blob-sha256 SHA :blob-size N :manifest-sha256 SHA)
-  (:event :patches-started   :total M)                 ; from patcher
-  (:event :patch-built       :i I :total M :from V :sha SHA :size N)
-  (:event :patches-done      :built M)
-  (:event :manifest-resigned :manifest-sha256 SHA :patches-built M)
-  (:event :done              :release-id ID :blob-sha256 SHA :blob-size N
-                             :manifest-sha256 SHA :patches-built M)"
-  (let* ((manifest-plist
-           (ota-server.manifest:build-manifest-plist
-            :software software :os os :arch arch
-            :os-versions osversions :version version
-            :blob-sha256 sha :blob-size size
-            :blob-url (format nil "/v1/blobs/~A" sha)
-            :notes notes))
-         (manifest-bytes (ota-server.manifest:manifest-to-json-bytes manifest-plist))
-         (manifest-sha (ota-server.storage:sha256-hex-of-bytes manifest-bytes))
-         (sig (ota-server.manifest:sign-bytes
-               manifest-bytes
-               (ota-server.manifest:keypair-private (app-state-keypair app))
-               (ota-server.manifest:keypair-public  (app-state-keypair app))))
-         (mdir (app-state-manifests-dir app)))
+EMIT is a one-arg function called with a plist per event."
+  (let ((mdir (app-state-manifests-dir app)))
     (ensure-directories-exist (merge-pathnames (format nil "~A/" software) mdir))
     (write-bytes (merge-pathnames (format nil "~A/~A.json" software version) mdir)
                  manifest-bytes)
     (write-bytes (merge-pathnames (format nil "~A/~A.sig"  software version) mdir)
                  sig)
-    (ota-server.catalogue:insert-release
-     (app-state-catalogue app)
-     :release-id release-id
-     :software software :os os :arch arch
-     :os-versions osversions
-     :version version
-     :blob-sha256 sha :blob-size size
-     :manifest-sha256 manifest-sha
-     :classifications (parse-csv (or (header-of headers "x-ota-classifications") ""))
-     :channels        (parse-csv (or (header-of headers "x-ota-channels") ""))
-     :notes notes)
     (ota-server.catalogue:append-audit
      (app-state-catalogue app)
      :identity "admin" :action "publish-release"
@@ -649,7 +621,16 @@ For new releases, the response is either:
 
 The final NDJSON line is {:event :done …} carrying the same
 payload as the legacy 201 body, so simple consumers can ignore
-the intermediate events and parse only the last line."
+the intermediate events and parse only the last line.
+
+v1.1.1 hardening (see ADR-0006): the lookup-and-insert decision
+runs through INSERT-RELEASE-IF-NEW which wraps a `BEGIN
+IMMEDIATE` transaction around both, so two ota-server processes
+attempting the same publish concurrently see one win and the
+other hit the :existing branch deterministically -- no
+SQLITE_CONSTRAINT 500 races.  Manifest .json/.sig only land on
+disk for the :inserted branch; idempotent + conflict cases never
+overwrite an existing manifest with one for a different blob."
   (unless (authorised-admin-p env app)
     (return-from handle-admin-publish-release (error-response 401 "unauthorised")))
   (let* ((software (getf params :software))
@@ -667,60 +648,93 @@ the intermediate events and parse only the last line."
     (let* ((tmp-path (write-body-to-tmp env (app-state-cas app))))
       (multiple-value-bind (sha size)
           (ota-server.storage:put-blob-from-file (app-state-cas app) tmp-path)
-        (let* ((release-id (format nil "~A/~A-~A/~A" software os arch version))
-               (osversions (parse-csv osvers))
-               (existing (ota-server.catalogue:get-release-by-tuple
-                          (app-state-catalogue app) software os arch version)))
-          ;; Pre-streaming gates: idempotency + conflict.
-          (when existing
-            (cond
-              ((string= (getf existing :blob-sha256) sha)
-               (let ((patches-in (ota-server.catalogue:list-patches-to
-                                  (app-state-catalogue app)
-                                  (getf existing :release-id))))
-                 (return-from handle-admin-publish-release
-                   (json-response 200
-                                  (obj "release_id"      (getf existing :release-id)
-                                       "blob_sha256"     (getf existing :blob-sha256)
-                                       "blob_size"       (getf existing :blob-size)
-                                       "manifest_sha256" (getf existing :manifest-sha256)
-                                       "patches_built"   (length patches-in)
-                                       "idempotent"      t)))))
-              (t
-               (return-from handle-admin-publish-release
-                 (error-response 409
-                                 "release already exists with different content"
-                                 (format nil
-                                         "version ~A of ~A/~A-~A is published with blob ~A; ~
-                                          the upload's blob is ~A. Bump the version, or delete the existing release first."
-                                         version software os arch
-                                         (getf existing :blob-sha256) sha))))))
-          ;; New release.  Sync vs. streaming dispatch.
-          (let ((work
-                  (lambda (emit)
-                    (%publish-build-and-emit
-                     app emit
-                     :software software :os os :arch arch
-                     :version version :release-id release-id
-                     :osversions osversions
-                     :sha sha :size size
-                     :headers headers :notes notes))))
-            (cond
-              ((client-accepts-ndjson-p env)
-               (streaming-ndjson-response work))
-              (t
-               ;; Sync path: capture only the final :done event,
-               ;; render its payload as the legacy 201 body.
-               (let (final)
-                 (funcall work (lambda (e)
-                                 (when (eq (getf e :event) :done)
-                                   (setf final e))))
-                 (json-response 201
-                                (obj "release_id"      (getf final :release-id)
-                                     "blob_sha256"     (getf final :blob-sha256)
-                                     "blob_size"       (getf final :blob-size)
-                                     "manifest_sha256" (getf final :manifest-sha256)
-                                     "patches_built"   (getf final :patches-built))))))))))))
+        (let* ((release-id     (format nil "~A/~A-~A/~A" software os arch version))
+               (osversions     (parse-csv osvers))
+               (classifications (parse-csv (or (header-of headers "x-ota-classifications") "")))
+               (channels        (parse-csv (or (header-of headers "x-ota-channels") "")))
+               ;; Build the manifest fully in memory before talking
+               ;; to the catalogue.  We need its SHA to insert; we
+               ;; only commit it to disk on :inserted (so a 409
+               ;; conflict NEVER overwrites the existing manifest
+               ;; for a different blob).
+               (manifest-plist
+                 (ota-server.manifest:build-manifest-plist
+                  :software software :os os :arch arch
+                  :os-versions osversions :version version
+                  :blob-sha256 sha :blob-size size
+                  :blob-url (format nil "/v1/blobs/~A" sha)
+                  :notes notes))
+               (manifest-bytes (ota-server.manifest:manifest-to-json-bytes manifest-plist))
+               (manifest-sha   (ota-server.storage:sha256-hex-of-bytes manifest-bytes))
+               (sig (ota-server.manifest:sign-bytes
+                     manifest-bytes
+                     (ota-server.manifest:keypair-private (app-state-keypair app))
+                     (ota-server.manifest:keypair-public  (app-state-keypair app)))))
+          (multiple-value-bind (status existing)
+              (ota-server.catalogue:insert-release-if-new
+               (app-state-catalogue app)
+               :release-id release-id
+               :software software :os os :arch arch
+               :os-versions osversions
+               :version version
+               :blob-sha256 sha :blob-size size
+               :manifest-sha256 manifest-sha
+               :classifications classifications
+               :channels        channels
+               :notes notes)
+            (case status
+              (:existing
+               (cond
+                 ;; Same blob → idempotent re-publish.
+                 ((string= (getf existing :blob-sha256) sha)
+                  (let ((patches-in (ota-server.catalogue:list-patches-to
+                                     (app-state-catalogue app)
+                                     (getf existing :release-id))))
+                    (json-response 200
+                                   (obj "release_id"      (getf existing :release-id)
+                                        "blob_sha256"     (getf existing :blob-sha256)
+                                        "blob_size"       (getf existing :blob-size)
+                                        "manifest_sha256" (getf existing :manifest-sha256)
+                                        "patches_built"   (length patches-in)
+                                        "idempotent"      t))))
+                 ;; Different blob, same version → conflict.
+                 (t
+                  (error-response 409
+                                  "release already exists with different content"
+                                  (format nil
+                                          "version ~A of ~A/~A-~A is published with blob ~A; ~
+                                           the upload's blob is ~A. Bump the version, or delete the existing release first."
+                                          version software os arch
+                                          (getf existing :blob-sha256) sha)))))
+              (:inserted
+               ;; New release.  Now (and only now) write the
+               ;; manifest to disk + audit + run patch fan-in.
+               (let ((work
+                       (lambda (emit)
+                         (%publish-finalize-and-emit
+                          app emit
+                          :software software :os os :arch arch
+                          :version version :release-id release-id
+                          :osversions osversions
+                          :sha sha :size size
+                          :manifest-bytes manifest-bytes
+                          :manifest-sha manifest-sha
+                          :sig sig
+                          :notes notes))))
+                 (cond
+                   ((client-accepts-ndjson-p env)
+                    (streaming-ndjson-response work))
+                   (t
+                    (let (final)
+                      (funcall work (lambda (e)
+                                      (when (eq (getf e :event) :done)
+                                        (setf final e))))
+                      (json-response 201
+                                     (obj "release_id"      (getf final :release-id)
+                                          "blob_sha256"     (getf final :blob-sha256)
+                                          "blob_size"       (getf final :blob-size)
+                                          "manifest_sha256" (getf final :manifest-sha256)
+                                          "patches_built"   (getf final :patches-built)))))))))))))))
 
 (defun write-body-to-tmp (env cas)
   "Stream the request body into a temp file under the CAS."

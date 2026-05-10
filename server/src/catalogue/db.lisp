@@ -164,6 +164,76 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
        published-by
        (or notes "")))))
 
+(defun insert-release-if-new (catalogue &key release-id software os arch os-versions
+                                            version blob-sha256 blob-size manifest-sha256
+                                            (channels #()) (classifications #())
+                                            uncollectable deprecated
+                                            published-by notes)
+  "Atomic 'insert this release if no row with the same
+(software, os, arch, version) tuple exists'.  Returns one of:
+
+  (values :existing EXISTING-ROW-PLIST)  ;; tuple already in catalogue
+  (values :inserted NIL)                  ;; row was just inserted
+
+The lookup + INSERT happen inside a single =BEGIN IMMEDIATE=
+transaction, which acquires SQLite's write lock at BEGIN time --
+so two ota-server processes attempting the same publish
+concurrently against the same data dir see one win and the other
+hit the :existing branch deterministically.  Without this,
+they would both pass the lookup, both try to insert, and the
+loser would propagate a SQLITE_CONSTRAINT 500 to the client.
+
+NEXT-PUBLISHED-AT is invoked inside the same transaction, so the
+SELECT MAX(published_at) sees no concurrent inserts -- the
+strict-monotonic published_at guarantee (added in v1.1.0) holds
+across processes too, not just within one.
+
+The publish handler in HTTP/server.lisp is the only caller that
+needs this stronger guarantee; the e2e harness and tests can
+keep using the simpler INSERT-RELEASE."
+  (with-catalogue (db catalogue)
+    (sqlite:execute-non-query db "BEGIN IMMEDIATE")
+    (handler-case
+        (let ((existing-rows
+                (sqlite:execute-to-list
+                 db
+                 (format nil "SELECT ~A FROM releases WHERE software_name = ? AND os = ? AND arch = ? AND version = ?"
+                         *release-columns*)
+                 software os arch version)))
+          (cond
+            (existing-rows
+             (sqlite:execute-non-query db "COMMIT")
+             (values :existing (row-to-release (first existing-rows))))
+            (t
+             ;; Compute published_at while still holding the write
+             ;; lock so the MAX(published_at) lookup is consistent
+             ;; with the INSERT we're about to do.
+             (let ((published-at (next-published-at db software)))
+               (sqlite:execute-non-query
+                db
+                (format nil "INSERT INTO releases (~A) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                        *release-columns*)
+                release-id software os arch
+                (com.inuoe.jzon:stringify os-versions :pretty nil)
+                version blob-sha256 blob-size manifest-sha256
+                (com.inuoe.jzon:stringify channels :pretty nil)
+                (com.inuoe.jzon:stringify classifications :pretty nil)
+                (if uncollectable 1 0)
+                (if deprecated    1 0)
+                published-at
+                published-by
+                (or notes "")))
+             (sqlite:execute-non-query db "COMMIT")
+             (values :inserted nil))))
+      (error (c)
+        ;; Roll back so the connection isn't left mid-transaction.
+        ;; If ROLLBACK itself errors (extremely unlikely outside of
+        ;; a closed connection), swallow it and re-raise the
+        ;; original cause.
+        (handler-case (sqlite:execute-non-query db "ROLLBACK")
+          (error () nil))
+        (error c)))))
+
 (defun list-releases (catalogue software-name)
   (with-catalogue (db catalogue)
     (mapcar #'row-to-release

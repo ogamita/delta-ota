@@ -516,6 +516,134 @@ report on).  Backward-compatible with callers that don't pass
       (ota-server.catalogue:close-catalogue cat)
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
 
+;; ---------------------------------------------------------------------------
+;; INSERT-RELEASE-IF-NEW (v1.1.1) -- atomic lookup-then-insert that
+;; closes the multi-process publish race.  See ADR-0006.
+;; ---------------------------------------------------------------------------
+
+(defun %make-release-args (version &optional (sha nil))
+  "Common kwargs for INSERT-RELEASE-IF-NEW under software=irn."
+  (list :release-id      (format nil "irn/x-y/~A" version)
+        :software        "irn"
+        :os              "x"
+        :arch            "y"
+        :os-versions     #()
+        :version         version
+        :blob-sha256     (or sha (format nil "~64,'0X" (sxhash version)))
+        :blob-size       1
+        :manifest-sha256 "0"
+        :published-by    "test"))
+
+(test insert-release-if-new-returns-inserted-on-first-call
+  "First call for a (sw, os, arch, version) tuple returns
+:inserted + NIL, and the row is queryable afterwards via
+GET-RELEASE-BY-TUPLE."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           (multiple-value-bind (status existing)
+               (apply #'ota-server.catalogue:insert-release-if-new
+                      cat (%make-release-args "1.0.0" "deadbeef"))
+             (is (eq :inserted status))
+             (is (null existing)))
+           (let ((r (ota-server.catalogue:get-release-by-tuple
+                     cat "irn" "x" "y" "1.0.0")))
+             (is (string= "deadbeef" (getf r :blob-sha256)))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test insert-release-if-new-returns-existing-on-duplicate-tuple
+  "Second call for the SAME tuple returns :existing + the previously-
+stored row (not the newly-supplied args).  This is what the publish
+handler dispatches its `200 idempotent` / `409 conflict` decision
+on -- the existing row's blob-sha256 is the source of truth."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           (apply #'ota-server.catalogue:insert-release-if-new
+                  cat (%make-release-args "1.0.0" "first-blob"))
+           ;; Second call with a DIFFERENT blob-sha256 still gets
+           ;; back the FIRST blob in :existing -- this is what
+           ;; lets the handler distinguish idempotent re-publish
+           ;; (sha matches) from conflict (sha differs).
+           (multiple-value-bind (status existing)
+               (apply #'ota-server.catalogue:insert-release-if-new
+                      cat (%make-release-args "1.0.0" "second-blob"))
+             (is (eq :existing status))
+             (is (string= "first-blob" (getf existing :blob-sha256))
+                 ":existing must return the row already in the DB, ~
+                  not the just-attempted one")))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test insert-release-if-new-is-atomic-under-concurrent-callers
+  "N parallel threads racing on the same tuple: exactly ONE returns
+:inserted, the rest return :existing.  This is the v1.1.1 fix --
+prior to BEGIN IMMEDIATE wrapping the lookup+insert, the loser of
+the race hit a SQLITE_CONSTRAINT 500 because both callers passed
+the bare GET-RELEASE-BY-TUPLE check before either INSERT landed."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (let* ((n-threads 8)
+                (results-lock (bordeaux-threads:make-lock "results"))
+                (statuses '())
+                (errors '())
+                (start-barrier (bordeaux-threads:make-condition-variable))
+                (start-mutex (bordeaux-threads:make-lock "start"))
+                (ready 0)
+                (go nil)
+                (threads
+                  (loop for i below n-threads
+                        collect
+                        (bordeaux-threads:make-thread
+                         (lambda ()
+                           ;; Wait for the conductor to release us all
+                           ;; together so the contention is real.
+                           (bordeaux-threads:with-lock-held (start-mutex)
+                             (incf ready)
+                             (loop until go
+                                   do (bordeaux-threads:condition-wait
+                                       start-barrier start-mutex)))
+                           (handler-case
+                               (multiple-value-bind (status existing)
+                                   (apply #'ota-server.catalogue:insert-release-if-new
+                                          cat (%make-release-args "1.0.0"
+                                                                  (format nil "~64,'0X" i)))
+                                 (declare (ignore existing))
+                                 (bordeaux-threads:with-lock-held (results-lock)
+                                   (push status statuses)))
+                             (error (e)
+                               (bordeaux-threads:with-lock-held (results-lock)
+                                 (push (princ-to-string e) errors)))))))))
+           (ota-server.catalogue:ensure-software cat :name "irn")
+           ;; Wait for every worker to be parked on the barrier.
+           (loop until (bordeaux-threads:with-lock-held (start-mutex)
+                         (= ready n-threads))
+                 do (sleep 0.01))
+           (bordeaux-threads:with-lock-held (start-mutex)
+             (setf go t)
+             (bordeaux-threads:condition-notify start-barrier)
+             ;; condition-notify wakes one; broadcast wakes all.
+             #+sbcl (loop repeat n-threads
+                          do (bordeaux-threads:condition-notify start-barrier)))
+           (mapc #'bordeaux-threads:join-thread threads)
+           (is (null errors)
+               "no thread should hit SQLITE_CONSTRAINT or any other ~
+                error; got: ~{~%  ~A~}" errors)
+           (is (= n-threads (length statuses))
+               "expected ~A status results, got ~A" n-threads (length statuses))
+           (is (= 1 (count :inserted statuses))
+               "exactly one thread must win and return :inserted; ~
+                got ~A :inserted out of ~A" (count :inserted statuses)
+                                            (length statuses))
+           (is (= (1- n-threads) (count :existing statuses))
+               "all losers must return :existing; got ~A :existing out of ~A"
+               (count :existing statuses) (length statuses)))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (test get-latest-release-mixed-ignores-non-semver
   "When SOME versions are semver and some are not, the non-semver
 ones are ignored and the highest-semver wins.  This matches the
