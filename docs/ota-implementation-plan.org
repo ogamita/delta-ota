@@ -698,17 +698,30 @@ implemented":
 
 ** Security
 
-- [ ] *Mandatory mTLS for admin endpoints
-  (cert-subject identity).*  Today TLS is opt-in (=[tls].cert= /
-  =.key=) and any mTLS is implicit at the proxy layer; the
-  server doesn't verify a client cert subject against an
-  authorised admin list.  Plan reference:
-  [[file:ota-implementation-plan.org::*Phase 4][Phase 4 § "deferred"]].
-  Ship target: v1.1.
-- [ ] *Per-endpoint rate limits.*  The install-page rate limit
-  is in place (token-bucket per channel); admin endpoints rely
-  on the bearer-token alone with no QPS cap.  Plan reference:
-  Phase 4 line 362.  Ship target: v1.1.
+- [X] *Mandatory mTLS for admin endpoints
+  (cert-subject identity).* — landed in v1.4.0.
+  Proxy-trust model: ota-server reads a verified client
+  certificate's Subject DN from a configurable header
+  (=[tls].proxy_subject_header_name=, default
+  =x-ota-client-cert-subject=), checks it against
+  =[tls].admin_subjects=, and records the subject as the
+  audit-log identity in place of the generic ="admin"=.  With
+  =[tls].require_mtls = true=, admin endpoints reject every
+  request that doesn't carry a recognised subject — even with a
+  valid bearer.  Defense in depth: a leaked =OTA_ADMIN_TOKEN= is
+  no longer sufficient.  Direct mTLS at Woo (no proxy) is
+  deferred until a customer asks — see
+  [[file:adr/0009-mtls-admin-identity.org][ADR-0009]].
+- [X] *Per-endpoint rate limits.* — landed in v1.4.0.  The token
+  bucket is now keyed on =(identity, route-keyword)= so each
+  admin endpoint has its own cap, independent of the generous
+  read-path budget.  Built-in defaults in =*admin-rate-limits*=
+  (e.g. publish at 10/min, gc at 6/hour); operators override
+  per row via =[rate_limits]= in TOML.  Honest CI workflows
+  stay well under; a hostile token's burst is bounded.
+  =ADR-0009 §4= covers the bucket arithmetic and the
+  back-fill we apply to Woo's pre-v1.4 status-text table so
+  429 responses don't trip a fast-http callback error.
 
 ** Cross-platform client polish
 

@@ -83,7 +83,19 @@ harness)."
                  :admin-token (getf cfg :admin-token)
                  :hostname (or (getf cfg :hostname) "localhost")
                  :tls-cert (getf cfg :tls-cert)
-                 :tls-key  (getf cfg :tls-key)))
+                 :tls-key  (getf cfg :tls-key)
+                 ;; v1.4: admin cert-subject identity + per-endpoint
+                 ;; rate limits (ADR-0009).  All four knobs are
+                 ;; opt-in -- with no TOML changes the server
+                 ;; behaves exactly like v1.3 modulo the per-route
+                 ;; bucket keying (which inherits the v1.3 defaults
+                 ;; for routes without specific caps).
+                 :admin-subjects               (getf cfg :tls-admin-subjects)
+                 :trust-proxy-subject-header   (getf cfg :tls-trust-proxy-subject-header)
+                 :proxy-subject-header-name    (or (getf cfg :tls-proxy-subject-header-name)
+                                                   "x-ota-client-cert-subject")
+                 :require-mtls                 (getf cfg :tls-require-mtls)
+                 :rate-limits-override         (getf cfg :rate-limits-override)))
          (patch-worker-count (or (getf cfg :patcher-worker-count) 2)))
     (ota-server.catalogue:run-migrations db)
     (ensure-directories-exist

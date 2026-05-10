@@ -17,11 +17,30 @@
   (default-client-classifications #("public") :type vector)
   tls-cert
   tls-key
+  ;; v1.4 — admin cert-subject identity (ADR-0009).
+  ;; admin-subjects: NIL or a list of Subject DN strings; when
+  ;; supplied, admin endpoints require the request's resolved
+  ;; cert subject to be a member.  trust-proxy-subject-header
+  ;; gates whether we read the header at all (off by default to
+  ;; refuse forged subjects on a misconfigured deployment).
+  ;; require-mtls + admin-subjects together implement the
+  ;; defense-in-depth knob: a leaked OTA_ADMIN_TOKEN is no
+  ;; longer sufficient when these are set.
+  (admin-subjects nil)
+  (trust-proxy-subject-header nil)
+  (proxy-subject-header-name "x-ota-client-cert-subject")
+  (require-mtls nil)
   ;; phase-7-followup: in-memory token-bucket rate limit per identity.
-  ;; KEY = client_id|"admin"|"anon-<ip>", VALUE = (cons tokens last-refill).
+  ;; KEY = (identity . route-keyword), VALUE = (cons tokens last-refill).
+  ;; (Route-keyed in v1.4 — ADR-0009 §4 -- so an admin endpoint can
+  ;;  declare a stricter cap than the generous default for read
+  ;;  paths like /v1/blobs.)
   (rate-buckets (make-hash-table :test 'equal :synchronized t))
-  (rate-capacity 600)              ; tokens
-  (rate-refill-per-sec 10)         ; tokens/sec
+  (rate-capacity 600)              ; default tokens for non-admin routes
+  (rate-refill-per-sec 10)         ; default tokens/sec
+  ;; Plist mapping ROUTE-KEYWORD -> (CAP . REFILL/SEC).  Overlaid
+  ;; on top of *admin-rate-limits* by APP-EFFECTIVE-RATE-LIMITS.
+  (rate-limits-override nil)
   ;; v1.2: async patch-build worker pool (workers/pool.lisp).  NIL when
   ;; the legacy synchronous fan-in is wanted (some tests, the e2e
   ;; harness if not yet updated).
@@ -225,8 +244,97 @@ closed automatically when EVENT-BUILDER returns or signals."
       (subseq auth 7))))
 
 (defun authorised-admin-p (env app)
+  "Legacy bearer-token check.  Retained for tests and the pure
+v1.0–v1.3 path; production endpoints since v1.4 call
+ADMIN-IDENTITY which folds in cert-subject verification and the
+mandatory-mTLS knob."
   (let ((tok (bearer-of env)))
     (and tok (string= tok (app-state-admin-token app)))))
+
+(defun %request-cert-subject (env app)
+  "Extract the verified client cert's Subject DN from the request,
+when TRUST-PROXY-SUBJECT-HEADER is on.  Returns the subject string
+or NIL.  The header name is configurable -- nginx commonly emits
+X-Client-Verify + X-Client-DN; Apache emits SSL_CLIENT_S_DN; the
+default X-Ota-Client-Cert-Subject is our canonical name when the
+operator can configure the proxy.
+
+We trust ANY non-empty value when the knob is on.  Locking the
+header to a specific proxy IP is left to the network layer (the
+reverse-proxy bind address shouldn't be reachable from outside in
+a sensible deployment); a future iteration can layer an explicit
+allowlist of source CIDRs if a customer hits a deployment shape
+where that isn't enough."
+  (when (app-state-trust-proxy-subject-header app)
+    (let* ((headers (or (env-get env :headers) (make-hash-table)))
+           (name (or (app-state-proxy-subject-header-name app)
+                     "x-ota-client-cert-subject"))
+           (val (and (hash-table-p headers) (gethash name headers))))
+      (and val (plusp (length val)) val))))
+
+(defun %subject-allowed-p (subject app)
+  "T when SUBJECT is permitted to use admin endpoints.  An empty
+ADMIN-SUBJECTS list means \"no allowlist enforcement\" -- the
+subject is recorded in the audit log but anyone with a valid
+bearer-token + a verified cert may proceed.  A non-empty list is
+a strict allowlist; subjects not on it are rejected."
+  (let ((allowed (app-state-admin-subjects app)))
+    (cond ((null allowed) t)
+          (t (member subject allowed :test #'string=)))))
+
+(defun admin-identity (env app)
+  "Resolve the identity of the calling admin, applying both the
+bearer-token check and (when configured) the cert-subject check.
+
+Returns one of:
+
+  (values :ok IDENTITY-STRING) ;; admin call accepted.  IDENTITY
+                                ;; is the cert subject when supplied
+                                ;; and allowed; otherwise \"admin\".
+  (values :reject CODE MSG)     ;; bearer or cert check failed.
+
+Defense-in-depth modes the caller doesn't have to think about:
+
+  - bearer wrong / missing       -> :reject 401
+  - require-mtls T, no subject   -> :reject 403 \"client cert required\"
+  - admin-subjects non-empty
+      and subject not on list    -> :reject 403 \"subject not authorised\"
+
+When a subject is presented and allowed, we use it as the audit-log
+identity so administrative actions trace back to a real human
+operator instead of the generic \"admin\"."
+  (let ((tok (bearer-of env))
+        (subject (%request-cert-subject env app)))
+    (cond
+      ;; Bearer-token must be present and correct in every case --
+      ;; the cert is an *additional* factor, not a replacement.
+      ((not (and tok (string= tok (app-state-admin-token app))))
+       (values :reject 401 "unauthorised"))
+      ;; Mandatory mTLS: no usable subject -> reject.
+      ((and (app-state-require-mtls app) (null subject))
+       (values :reject 403 "client cert required"))
+      ;; Subject presented but not on the allowlist.
+      ((and subject (not (%subject-allowed-p subject app)))
+       (values :reject 403 "subject not authorised"))
+      ;; Empty allowlist + no mandatory-mtls: pre-v1.4 behaviour.
+      ((null subject) (values :ok "admin"))
+      ;; Subject present and either accepted or no allowlist.
+      (t (values :ok subject)))))
+
+(defmacro with-admin-identity ((identity-var env app) &body body)
+  "Helper for admin handlers: bind IDENTITY-VAR to the resolved
+audit-log identity and run BODY.  On reject, return the
+appropriate error-response.  Saves several lines per admin
+endpoint and ensures every admin path goes through the
+identity-resolution gate."
+  (let ((status      (gensym "STATUS"))
+        (code-or-id  (gensym "CODE-OR-ID"))
+        (msg         (gensym "MSG")))
+    `(multiple-value-bind (,status ,code-or-id ,msg)
+         (admin-identity ,env ,app)
+       (cond ((eq ,status :ok)
+              (let ((,identity-var ,code-or-id)) ,@body))
+             (t (error-response ,code-or-id ,msg))))))
 
 (defun resolve-identity (env app)
   "Return a plist describing the calling identity:
@@ -259,37 +367,121 @@ closed automatically when EVENT-BUILDER returns or signals."
                       :classifications (app-state-default-client-classifications app)
                       :client-id nil))))))))
 
-(defun rate-allow-p (app key)
-  "Token-bucket rate limiter, in-memory, per APP-keyed identity.
-   Returns T if KEY may make one more request, NIL if rate-limited."
-  (let* ((cap (app-state-rate-capacity app))
-         (refill (app-state-rate-refill-per-sec app))
-         (buckets (app-state-rate-buckets app))
-         (now (get-internal-real-time))
-         (units internal-time-units-per-second)
-         (cell (gethash key buckets)))
-    (multiple-value-bind (tokens last)
-        (if cell (values (car cell) (cdr cell)) (values cap now))
-      (let* ((elapsed-sec (/ (- now last) units))
-             (refilled (min cap (+ tokens (* elapsed-sec refill)))))
-        (cond ((>= refilled 1)
-               (setf (gethash key buckets) (cons (- refilled 1) now))
-               t)
-              (t
-               (setf (gethash key buckets) (cons refilled now))
-               nil))))))
+;; ---------------------------------------------------------------------------
+;; v1.4: per-endpoint rate limits (ADR-0009 §4).
+;;
+;; Through v1.3 a single per-identity bucket (capacity 600,
+;; refill 10/sec) covered every endpoint -- generous enough for
+;; the install-page rate limit but inappropriate for admin
+;; endpoints, where a leaked OTA_ADMIN_TOKEN should not be able
+;; to publish hundreds of releases in a burst.
+;;
+;; The cap table below applies stricter (capacity, refill) pairs
+;; to admin routes; non-admin routes fall back to the per-app
+;; defaults, which keep the v1.3 behaviour unchanged.  Operators
+;; can override individual rows via [rate_limits] in TOML.
+;; ---------------------------------------------------------------------------
 
-(defun rate-limit-key (env identity)
-  (or (getf identity :client-id)
-      (let ((ra (or (getf env :remote-addr)
-                    (and (getf env :headers)
-                         (header-of (getf env :headers) "x-forwarded-for")))))
-        (concatenate 'string "anon-" (or ra "?")))))
+(defparameter *admin-rate-limits*
+  '(;; publish: cap a hostile token at 10 releases / minute.  An
+    ;; honest CI publishing 3-4 releases a day stays well under.
+    (:admin-publish-release        . (10 . 1/6))
+    ;; one-off mint: 60/min is fine for a real operator's UI work.
+    (:admin-mint-install-token     . (60 . 1))
+    ;; batch mint: heavier, lower cap.  *batch-mint-cap* (10000)
+    ;; bounds the per-call size; this bounds the call rate.
+    (:admin-mint-install-tokens-batch . (5 . 1/60))
+    ;; reverse patches: a hostile rate could pin the bsdiff queue.
+    (:admin-build-reverse-patch    . (10 . 1/6))
+    ;; mark-uncollectable: same envelope as publish.
+    (:admin-mark-uncollectable     . (30 . 1/2))
+    ;; gc + verify: expensive on the server side; serialise hard.
+    (:admin-gc                     . (6 . 1/60))
+    (:admin-verify                 . (6 . 1/60)))
+  "Per-route (CAPACITY . REFILL-PER-SEC) overrides for admin
+endpoints.  Routes not listed inherit the per-app default.")
+
+(defun app-effective-rate-limits (app route)
+  "Return (values CAP REFILL) for ROUTE under APP.  Resolution
+order: operator override > built-in admin defaults > per-app
+default."
+  (let* ((override (getf (app-state-rate-limits-override app) route))
+         (builtin  (cdr (assoc route *admin-rate-limits*))))
+    (cond
+      (override (values (car override) (cdr override)))
+      (builtin  (values (car builtin)  (cdr builtin)))
+      (t        (values (app-state-rate-capacity app)
+                        (app-state-rate-refill-per-sec app))))))
+
+(defun rate-allow-p (app key &optional route)
+  "Token-bucket rate limiter, in-memory.  KEY is the (identity,
+route) bucket name; ROUTE is the route keyword used to look up
+per-endpoint caps.  Returns T if KEY may make one more request,
+NIL if rate-limited."
+  (multiple-value-bind (cap refill) (app-effective-rate-limits app route)
+    (let* ((buckets (app-state-rate-buckets app))
+           (now (get-internal-real-time))
+           (units internal-time-units-per-second)
+           (cell (gethash key buckets)))
+      (multiple-value-bind (tokens last)
+          (if cell (values (car cell) (cdr cell)) (values cap now))
+        (let* ((elapsed-sec (/ (- now last) units))
+               ;; A bucket that was capped under a tighter limit can
+               ;; legitimately exceed the new cap when the operator
+               ;; relaxes the cap mid-run; clamp it back so we don't
+               ;; permanently exceed CAP.
+               (refilled (min cap (+ tokens (* elapsed-sec refill)))))
+          (cond ((>= refilled 1)
+                 (setf (gethash key buckets) (cons (- refilled 1) now))
+                 t)
+                (t
+                 (setf (gethash key buckets) (cons refilled now))
+                 nil)))))))
+
+(defun rate-limit-key (env identity &optional route)
+  "Compose the rate-limit bucket key.  v1.4: bucket on (identity,
+route) so admin endpoints can hit their own (lower) caps without
+exhausting the generous read-path budget."
+  (let ((id (or (getf identity :client-id)
+                (let ((ra (or (getf env :remote-addr)
+                              (and (getf env :headers)
+                                   (header-of (getf env :headers) "x-forwarded-for")))))
+                  (concatenate 'string "anon-" (or ra "?"))))))
+    (cons id (or route :default))))
+
+;; Woo's bundled status-code-to-text table (woo/src/response.lisp:22)
+;; predates RFC 6585 and is missing 429 ("Too Many Requests").
+;; Worse: at load time Woo runs a top-level loop that pre-bakes
+;; status-line bytes into `woo.response::*status-line*` for every
+;; recognised code, so just patching status-code-to-text isn't
+;; enough -- we have to back-fill the cache for the codes we care
+;; about, otherwise RESPONSE-HEADERS-BYTES looks up NIL bytes and
+;; crashes with "NIL is not of type VECTOR" on the next 429.
+;;
+;; Idempotent: if Woo ships with the fix one day this becomes a
+;; harmless re-population.
+(defparameter *missing-woo-status-texts*
+  '((425 . "Too Early")
+    (428 . "Precondition Required")
+    (429 . "Too Many Requests")
+    (431 . "Request Header Fields Too Large")))
+
+(eval-when (:load-toplevel :execute)
+  (dolist (entry *missing-woo-status-texts*)
+    (let* ((code (car entry))
+           (text (cdr entry))
+           (line (format nil "HTTP/1.1 ~A ~A~C~C"
+                         code text #\Return #\Linefeed)))
+      (setf (gethash code (symbol-value
+                           (find-symbol "*STATUS-LINE*"
+                                        (find-package "WOO.RESPONSE"))))
+            (trivial-utf-8:string-to-utf-8-bytes line)))))
 
 (defun rate-limited-response ()
+  ;; 429 Too Many Requests + Retry-After per RFC 6585 §4.
   (list 429
         (list :content-type "application/json; charset=utf-8"
-              :|retry-after| "1")
+              :retry-after "1")
         (list (encode-json-string (obj "error" "rate limited")))))
 
 (defun classification-match-p (identity-classifications release-classifications)
@@ -658,28 +850,28 @@ reply 416 with `Content-Range: bytes */SIZE` per RFC 7233."
                  (funcall writer "" :close t))))))))))
 
 (defun handle-admin-create-software (app env)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-create-software (error-response 401 "unauthorised")))
-  (let* ((body (read-request-body-bytes env))
-         (json (and body (com.inuoe.jzon:parse
-                          (sb-ext:octets-to-string body :external-format :utf-8))))
-         (name (gethash "name" json))
-         (display (gethash "display_name" json)))
-    (cond ((or (null name) (zerop (length name)))
-           (error-response 400 "missing name"))
-          (t
-           (ota-server.catalogue:ensure-software
-            (app-state-catalogue app)
-            :name name
-            :display-name (or display name))
-           (ota-server.catalogue:append-audit
-            (app-state-catalogue app)
-            :identity "admin" :action "create-software" :target name :detail nil)
-           (json-response 201 (obj "name" name "display_name" (or display name)))))))
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (com.inuoe.jzon:parse
+                            (sb-ext:octets-to-string body :external-format :utf-8))))
+           (name (gethash "name" json))
+           (display (gethash "display_name" json)))
+      (cond ((or (null name) (zerop (length name)))
+             (error-response 400 "missing name"))
+            (t
+             (ota-server.catalogue:ensure-software
+              (app-state-catalogue app)
+              :name name
+              :display-name (or display name))
+             (ota-server.catalogue:append-audit
+              (app-state-catalogue app)
+              :identity identity :action "create-software" :target name :detail nil)
+             (json-response 201 (obj "name" name "display_name" (or display name))))))))
 
 (defun %publish-finalize-and-emit (app emit &key software os arch version release-id
                                                  osversions sha size manifest-bytes
-                                                 manifest-sha sig notes)
+                                                 manifest-sha sig notes
+                                                 (identity "admin"))
   "Post-INSERT-RELEASE-IF-NEW work: write manifest to disk, append
 audit, enqueue patch jobs, tail them to emit per-patch progress, and
 re-sign the manifest with `patches_in` once they are all done.
@@ -703,7 +895,7 @@ EMIT is a one-arg function called with a plist per event."
                  sig)
     (ota-server.catalogue:append-audit
      (app-state-catalogue app)
-     :identity "admin" :action "publish-release"
+     :identity identity :action "publish-release"
      :target release-id
      :detail (format nil "blob=~A size=~A" sha size))
     (funcall emit (list :event :stored
@@ -879,8 +1071,7 @@ other hit the :existing branch deterministically -- no
 SQLITE_CONSTRAINT 500 races.  Manifest .json/.sig only land on
 disk for the :inserted branch; idempotent + conflict cases never
 overwrite an existing manifest with one for a different blob."
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-publish-release (error-response 401 "unauthorised")))
+  (with-admin-identity (identity env app)
   (let* ((software (getf params :software))
          (headers (getf env :headers))
          (version  (header-of headers "x-ota-version"))
@@ -968,7 +1159,8 @@ overwrite an existing manifest with one for a different blob."
                           :manifest-bytes manifest-bytes
                           :manifest-sha manifest-sha
                           :sig sig
-                          :notes notes))))
+                          :notes notes
+                          :identity identity))))
                  (cond
                    ((client-accepts-ndjson-p env)
                     (streaming-ndjson-response work))
@@ -982,7 +1174,7 @@ overwrite an existing manifest with one for a different blob."
                                           "blob_sha256"     (getf final :blob-sha256)
                                           "blob_size"       (getf final :blob-size)
                                           "manifest_sha256" (getf final :manifest-sha256)
-                                          "patches_built"   (getf final :patches-built)))))))))))))))
+                                          "patches_built"   (getf final :patches-built))))))))))))))))
 
 (defun write-body-to-tmp (env cas)
   "Stream the request body into a temp file under the CAS."
@@ -1060,140 +1252,136 @@ overwrite an existing manifest with one for a different blob."
                                   (coerce classifications 'vector)))))))))))
 
 (defun handle-admin-mint-install-token (app env)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-mint-install-token (error-response 401 "unauthorised")))
-  (let* ((body (read-request-body-bytes env))
-         (json (and body (ignore-errors
-                           (com.inuoe.jzon:parse
-                            (sb-ext:octets-to-string body :external-format :utf-8)))))
-         (cls (and (hash-table-p json) (gethash "classifications" json)))
-         (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json))
-                  900)))
-    (multiple-value-bind (token expires)
-        (ota-server.catalogue:mint-install-token
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (cls (and (hash-table-p json) (gethash "classifications" json)))
+           (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json))
+                    900)))
+      (multiple-value-bind (token expires)
+          (ota-server.catalogue:mint-install-token
+           (app-state-catalogue app)
+           :classifications (or cls #("public"))
+           :ttl-seconds ttl
+           :created-by identity)
+        (ota-server.catalogue:append-audit
          (app-state-catalogue app)
-         :classifications (or cls #("public"))
-         :ttl-seconds ttl
-         :created-by "admin")
-      (ota-server.catalogue:append-audit
-       (app-state-catalogue app)
-       :identity "admin" :action "mint-install-token"
-       :target nil :detail (format nil "ttl=~A" ttl))
-      (json-response 201 (obj "install_token" token "expires_at" expires)))))
+         :identity identity :action "mint-install-token"
+         :target nil :detail (format nil "ttl=~A" ttl))
+        (json-response 201 (obj "install_token" token "expires_at" expires))))))
 
 (defparameter *batch-mint-cap* 10000
   "Hard ceiling on the number of tokens a single batch call may
    mint, to keep the server's audit log and DB write path sane.")
 
 (defun handle-admin-mint-install-tokens-batch (app env)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-mint-install-tokens-batch (error-response 401 "unauthorised")))
-  (let* ((body (read-request-body-bytes env))
-         (json (and body (ignore-errors
-                           (com.inuoe.jzon:parse
-                            (sb-ext:octets-to-string body :external-format :utf-8)))))
-         (count (or (and (hash-table-p json) (gethash "count" json)) 1))
-         (cls (or (and (hash-table-p json) (gethash "classifications" json))
-                  #("public")))
-         (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json)) 604800)))
-    (cond
-      ((or (not (integerp count)) (< count 1))
-       (error-response 400 "count must be a positive integer"))
-      ((> count *batch-mint-cap*)
-       (error-response 400 (format nil "count exceeds cap of ~A" *batch-mint-cap*)))
-      (t
-       (let ((tokens (loop repeat count collect
-                           (multiple-value-bind (token expires)
-                               (ota-server.catalogue:mint-install-token
-                                (app-state-catalogue app)
-                                :classifications cls
-                                :ttl-seconds ttl
-                                :created-by "admin")
-                             (obj "install_token" token "expires_at" expires)))))
-         (ota-server.catalogue:append-audit
-          (app-state-catalogue app)
-          :identity "admin" :action "mint-install-tokens-batch"
-          :target nil :detail (format nil "count=~A ttl=~A" count ttl))
-         (json-response 201
-                        (obj "count"  count
-                             "tokens" (coerce tokens 'vector))))))))
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (count (or (and (hash-table-p json) (gethash "count" json)) 1))
+           (cls (or (and (hash-table-p json) (gethash "classifications" json))
+                    #("public")))
+           (ttl (or (and (hash-table-p json) (gethash "ttl_seconds" json)) 604800)))
+      (cond
+        ((or (not (integerp count)) (< count 1))
+         (error-response 400 "count must be a positive integer"))
+        ((> count *batch-mint-cap*)
+         (error-response 400 (format nil "count exceeds cap of ~A" *batch-mint-cap*)))
+        (t
+         (let ((tokens (loop repeat count collect
+                             (multiple-value-bind (token expires)
+                                 (ota-server.catalogue:mint-install-token
+                                  (app-state-catalogue app)
+                                  :classifications cls
+                                  :ttl-seconds ttl
+                                  :created-by identity)
+                               (obj "install_token" token "expires_at" expires)))))
+           (ota-server.catalogue:append-audit
+            (app-state-catalogue app)
+            :identity identity :action "mint-install-tokens-batch"
+            :target nil :detail (format nil "count=~A ttl=~A" count ttl))
+           (json-response 201
+                          (obj "count"  count
+                               "tokens" (coerce tokens 'vector)))))))))
 
 (defun handle-admin-list-audit (app env)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-list-audit (error-response 401 "unauthorised")))
-  (let ((rows (ota-server.catalogue:list-audit (app-state-catalogue app))))
-    (json-response 200
-                   (coerce
-                    (mapcar
-                     (lambda (r)
-                       (obj "id" (getf r :id)
-                            "identity" (getf r :identity)
-                            "action" (getf r :action)
-                            "target" (or (getf r :target) "")
-                            "detail" (or (getf r :detail) "")
-                            "at" (getf r :at)))
-                     rows)
-                    'vector))))
+  (with-admin-identity (_identity env app)
+    (declare (ignore _identity))
+    (let ((rows (ota-server.catalogue:list-audit (app-state-catalogue app))))
+      (json-response 200
+                     (coerce
+                      (mapcar
+                       (lambda (r)
+                         (obj "id" (getf r :id)
+                              "identity" (getf r :identity)
+                              "action" (getf r :action)
+                              "target" (or (getf r :target) "")
+                              "detail" (or (getf r :detail) "")
+                              "at" (getf r :at)))
+                       rows)
+                      'vector)))))
 
 (defun handle-admin-build-reverse-patch (app env params)
   "Build an on-demand reverse patch from `from`->`to` (where `from`
    is the newer version), useful for the recovery tool to
    downgrade with bandwidth savings.  Body: {from: ver, to: ver}."
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-build-reverse-patch (error-response 401 "unauthorised")))
-  (let* ((body (read-request-body-bytes env))
-         (json (and body (ignore-errors
-                           (com.inuoe.jzon:parse
-                            (sb-ext:octets-to-string body :external-format :utf-8)))))
-         (from-v (and (hash-table-p json) (gethash "from" json)))
-         (to-v   (and (hash-table-p json) (gethash "to"   json)))
-         (sw     (getf params :software)))
-    (cond
-      ((or (null from-v) (null to-v))
-       (error-response 400 "both 'from' and 'to' versions required"))
-      (t
-       (let ((from-rel (ota-server.catalogue:get-release
-                        (app-state-catalogue app) sw from-v))
-             (to-rel   (ota-server.catalogue:get-release
-                        (app-state-catalogue app) sw to-v)))
-         (cond
-           ((or (null from-rel) (null to-rel))
-            (error-response 404 "release(s) not found"))
-           (t
-            (multiple-value-bind (sha size)
-                (ota-server.workers:build-patch-from-blobs
-                 (app-state-cas app) (app-state-catalogue app)
-                 :from-release-id (getf from-rel :release-id)
-                 :to-release-id   (getf to-rel   :release-id)
-                 :from-blob-sha   (getf from-rel :blob-sha256)
-                 :to-blob-sha     (getf to-rel   :blob-sha256))
-              (ota-server.catalogue:append-audit
-               (app-state-catalogue app)
-               :identity "admin" :action "build-reverse-patch"
-               :target (format nil "~A->~A" from-v to-v)
-               :detail (format nil "size=~A" size))
-              (json-response 201
-                             (obj "from"    from-v
-                                  "to"      to-v
-                                  "patcher" "bsdiff"
-                                  "sha256"  sha
-                                  "size"    size
-                                  "url"     (format nil "/v1/patches/~A" sha)))))))))))
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (from-v (and (hash-table-p json) (gethash "from" json)))
+           (to-v   (and (hash-table-p json) (gethash "to"   json)))
+           (sw     (getf params :software)))
+      (cond
+        ((or (null from-v) (null to-v))
+         (error-response 400 "both 'from' and 'to' versions required"))
+        (t
+         (let ((from-rel (ota-server.catalogue:get-release
+                          (app-state-catalogue app) sw from-v))
+               (to-rel   (ota-server.catalogue:get-release
+                          (app-state-catalogue app) sw to-v)))
+           (cond
+             ((or (null from-rel) (null to-rel))
+              (error-response 404 "release(s) not found"))
+             (t
+              (multiple-value-bind (sha size)
+                  (ota-server.workers:build-patch-from-blobs
+                   (app-state-cas app) (app-state-catalogue app)
+                   :from-release-id (getf from-rel :release-id)
+                   :to-release-id   (getf to-rel   :release-id)
+                   :from-blob-sha   (getf from-rel :blob-sha256)
+                   :to-blob-sha     (getf to-rel   :blob-sha256))
+                (ota-server.catalogue:append-audit
+                 (app-state-catalogue app)
+                 :identity identity :action "build-reverse-patch"
+                 :target (format nil "~A->~A" from-v to-v)
+                 :detail (format nil "size=~A" size))
+                (json-response 201
+                               (obj "from"    from-v
+                                    "to"      to-v
+                                    "patcher" "bsdiff"
+                                    "sha256"  sha
+                                    "size"    size
+                                    "url"     (format nil "/v1/patches/~A" sha))))))))))))
 
 (defun handle-admin-mark-uncollectable (app env params)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-mark-uncollectable (error-response 401 "unauthorised")))
-  (ota-server.catalogue:mark-uncollectable
-   (app-state-catalogue app)
-   (getf params :software) (getf params :version))
-  (ota-server.catalogue:append-audit
-   (app-state-catalogue app)
-   :identity "admin" :action "mark-uncollectable"
-   :target (format nil "~A/~A" (getf params :software) (getf params :version))
-   :detail nil)
-  (json-response 200 (obj "software" (getf params :software)
-                          "version"  (getf params :version)
-                          "uncollectable" t)))
+  (with-admin-identity (identity env app)
+    (ota-server.catalogue:mark-uncollectable
+     (app-state-catalogue app)
+     (getf params :software) (getf params :version))
+    (ota-server.catalogue:append-audit
+     (app-state-catalogue app)
+     :identity identity :action "mark-uncollectable"
+     :target (format nil "~A/~A" (getf params :software) (getf params :version))
+     :detail nil)
+    (json-response 200 (obj "software" (getf params :software)
+                            "version"  (getf params :version)
+                            "uncollectable" t))))
 
 (defun handle-get-anchors (app env params)
   "Return server-curated 'known-good' versions for the recovery
@@ -1237,55 +1425,53 @@ overwrite an existing manifest with one for a different blob."
             return (cdr pair))))
 
 (defun handle-admin-gc (app env params)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-gc (error-response 401 "unauthorised")))
-  (let* ((body (read-request-body-bytes env))
-         (json (and body (ignore-errors
-                           (com.inuoe.jzon:parse
-                            (sb-ext:octets-to-string body :external-format :utf-8)))))
-         (dry-run (and (hash-table-p json) (gethash "dry_run" json)))
-         (min-users (or (and (hash-table-p json) (gethash "min_user_count" json)) 0))
-         (min-age   (or (and (hash-table-p json) (gethash "min_age_days"   json)) 30))
-         (result (ota-server.workers:gc-software
-                  (app-state-cas app)
-                  (app-state-catalogue app)
-                  (app-state-keypair app)
-                  (app-state-manifests-dir app)
-                  :software (getf params :software)
-                  :min-user-count min-users
-                  :min-age-days min-age
-                  :dry-run dry-run)))
-    (ota-server.catalogue:append-audit
-     (app-state-catalogue app)
-     :identity "admin" :action "gc"
-     :target (getf params :software)
-     :detail (format nil "pruned=~A dry_run=~A"
-                     (length (getf result :pruned)) (getf result :dry-run)))
-    (json-response 200
-                   (obj "software" (getf params :software)
-                        "pruned"   (coerce (getf result :pruned) 'vector)
-                        "dry_run"  (if (getf result :dry-run) t nil)))))
+  (with-admin-identity (identity env app)
+    (let* ((body (read-request-body-bytes env))
+           (json (and body (ignore-errors
+                             (com.inuoe.jzon:parse
+                              (sb-ext:octets-to-string body :external-format :utf-8)))))
+           (dry-run (and (hash-table-p json) (gethash "dry_run" json)))
+           (min-users (or (and (hash-table-p json) (gethash "min_user_count" json)) 0))
+           (min-age   (or (and (hash-table-p json) (gethash "min_age_days"   json)) 30))
+           (result (ota-server.workers:gc-software
+                    (app-state-cas app)
+                    (app-state-catalogue app)
+                    (app-state-keypair app)
+                    (app-state-manifests-dir app)
+                    :software (getf params :software)
+                    :min-user-count min-users
+                    :min-age-days min-age
+                    :dry-run dry-run)))
+      (ota-server.catalogue:append-audit
+       (app-state-catalogue app)
+       :identity identity :action "gc"
+       :target (getf params :software)
+       :detail (format nil "pruned=~A dry_run=~A"
+                       (length (getf result :pruned)) (getf result :dry-run)))
+      (json-response 200
+                     (obj "software" (getf params :software)
+                          "pruned"   (coerce (getf result :pruned) 'vector)
+                          "dry_run"  (if (getf result :dry-run) t nil))))))
 
 (defun handle-admin-verify (app env)
-  (unless (authorised-admin-p env app)
-    (return-from handle-admin-verify (error-response 401 "unauthorised")))
-  (let ((r (ota-server.workers:verify-storage (app-state-cas app))))
-    (ota-server.catalogue:append-audit
-     (app-state-catalogue app)
-     :identity "admin" :action "verify-storage"
-     :target nil
-     :detail (format nil "checked=~A ok=~A bad=~A"
-                     (getf r :checked) (getf r :ok) (length (getf r :bad))))
-    (json-response 200
-                   (obj "checked" (getf r :checked)
-                        "ok"      (getf r :ok)
-                        "bad"     (coerce
-                                   (mapcar (lambda (entry)
-                                             (obj "path" (first entry)
-                                                  "actual" (second entry)
-                                                  "expected" (third entry)))
-                                           (getf r :bad))
-                                   'vector)))))
+  (with-admin-identity (identity env app)
+    (let ((r (ota-server.workers:verify-storage (app-state-cas app))))
+      (ota-server.catalogue:append-audit
+       (app-state-catalogue app)
+       :identity identity :action "verify-storage"
+       :target nil
+       :detail (format nil "checked=~A ok=~A bad=~A"
+                       (getf r :checked) (getf r :ok) (length (getf r :bad))))
+      (json-response 200
+                     (obj "checked" (getf r :checked)
+                          "ok"      (getf r :ok)
+                          "bad"     (coerce
+                                     (mapcar (lambda (entry)
+                                               (obj "path" (first entry)
+                                                    "actual" (second entry)
+                                                    "expected" (third entry)))
+                                             (getf r :bad))
+                                     'vector))))))
 
 (defun handle-events-install (app env)
   "Best-effort install-event recorder. Always 204 even on parse error."
@@ -1330,7 +1516,8 @@ overwrite an existing manifest with one for a different blob."
           ((and (not (eq route :health))
                 (not (rate-allow-p state
                                    (rate-limit-key
-                                    env (resolve-identity env state)))))
+                                    env (resolve-identity env state) route)
+                                   route)))
            (rate-limited-response))
           (t
            (handler-case
