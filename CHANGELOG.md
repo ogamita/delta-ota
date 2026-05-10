@@ -19,6 +19,17 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Fixed
+- **`TestDefaultOTAHome_FallsBackToHome` was Unix-only and broke
+  the GitHub Actions Windows runner.** `os.UserHomeDir()` reads
+  `$HOME` on Unix but `%USERPROFILE%` on Windows; the test only
+  set `$HOME`, so on Windows the runner's real profile
+  (`C:\Users\runneradmin`) leaked through and the assertion
+  against `/tmp/fake-home/.ota` failed. Test now sets both env
+  vars and uses `t.TempDir()` for an OS-appropriate path.
+
+## [1.1.1] - 2026-05-10
+
 ### Added
 - **libota test backfill** — closes the gap acknowledged in
   Q1 of `questions.txt`. Coverage went from **0.5 % → 77.6 %**

@@ -154,10 +154,18 @@ func TestDefaultOTAHome_EnvWins(t *testing.T) {
 
 func TestDefaultOTAHome_FallsBackToHome(t *testing.T) {
 	t.Setenv("OTA_HOME", "")
-	t.Setenv("HOME", "/tmp/fake-home")
-	got := defaultOTAHome()
-	if got != "/tmp/fake-home/.ota" {
-		t.Errorf("defaultOTAHome=%q; want /tmp/fake-home/.ota", got)
+	// os.UserHomeDir reads $HOME on Unix and %USERPROFILE% on Windows
+	// (and $home on Plan 9).  Setting $HOME alone left the runner's
+	// real profile leaking through on Windows; set both so the test
+	// is OS-portable.  t.TempDir gives an OS-appropriate absolute
+	// path so we don't hard-code a Unix-style "/tmp/..." that
+	// Windows' os.UserHomeDir wouldn't accept anyway.
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	want := filepath.Join(fakeHome, ".ota")
+	if got := defaultOTAHome(); got != want {
+		t.Errorf("defaultOTAHome=%q; want %q", got, want)
 	}
 }
 
