@@ -215,10 +215,18 @@ Server suite is now 177 checks (was 168 at v1.1.1's pre-ADR commit).
     =:inserted=).  Worth deciding whether re-publish attempts
     deserve their own audit row -- arguably yes, for traceability.
 
-  - We have no integration test that boots two server processes
-    against the same data dir and races them.  The 8-thread
-    fiveam test exercises the same SQLite locking path via
-    multiple SBCL threads sharing one connection, which is a
-    weaker guarantee than two PROCESSES sharing one DB file --
-    SQLite's lock manager treats them very similarly, but a real
-    e2e would seal it.  Recorded as a v1.2 e2e candidate.
+  - [X] *Real two-process e2e test* — landed in v1.1.1 alongside
+    this ADR.  =tests/e2e/two-process-publish.sh= boots two
+    independent =sbcl + ota-server= processes against the same
+    data dir on different ports and runs three races:
+
+      1. Same =(sw, os, arch, version)= + same blob → expect
+         exactly one 201 and one 200 (idempotent), no 5xx.
+      2. Same tuple + DIFFERENT blob → expect exactly one 201
+         and one 409 (conflict), no 5xx.
+      3. Different versions on each server → both 201, no
+         interference.
+
+    Followed by a catalogue-consistency check: both servers must
+    list the same 4 versions afterwards.  Wired into =make e2e=
+    as =e2e-two-process= and into the GitLab CI =e2e= job.

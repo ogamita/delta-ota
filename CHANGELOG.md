@@ -19,6 +19,22 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **`tests/e2e/two-process-publish.sh`** — boots two independent
+  `ota-server` processes against the same data dir on different
+  ports and races three publish scenarios: same tuple + same
+  blob (expect 201/200, idempotent loser), same tuple + different
+  blob (expect 201/409, conflict loser), different versions (both
+  201, no contention). Followed by a catalogue-consistency check
+  proving both processes list the same 4 versions afterwards.
+  Closes the "real two-process e2e" open item recorded in
+  ADR-0006 — the 8-thread fiveam test exercises the same SQLite
+  locking via threads sharing one connection, this one verifies
+  the same property across actual `fork(2)`-isolated processes.
+  Wired into `make e2e` as `e2e-two-process` and into the GitLab
+  CI `e2e` job. Live-verified: all four checks pass (201/200,
+  201/409, 201/201, 4-version agreement).
+
 ### Fixed
 - **Publish handler is now atomic across multiple ota-server
   processes** sharing one data directory. Two narrow races were

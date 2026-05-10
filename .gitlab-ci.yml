@@ -240,6 +240,7 @@ e2e:
     - tests/e2e/ops.sh
     - tests/e2e/recovery.sh
     - tests/e2e/parallel.sh
+    - tests/e2e/two-process-publish.sh
   artifacts:
     when: always
     paths:
@@ -248,6 +249,7 @@ e2e:
       - tests/e2e/run-ops/logs/
       - tests/e2e/run-recovery/logs/
       - tests/e2e/run-parallel/logs/
+      - tests/e2e/run-two-process/logs/
     expire_in: 1 week
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
