@@ -20,6 +20,22 @@ C ABI) follow these compatibility commitments:
 ## [Unreleased]
 
 ### Fixed
+- **Server: `published_at` is now strictly monotonic per software.**
+  v1.0.x stamped publish timestamps via SQL's
+  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`, which has 1-second
+  precision. Two back-to-back publishes within the same second
+  tied on `published_at`, and the fallback `ORDER BY
+  published_at DESC` was nondeterministic about which row counted
+  as "newest". `insert-release` now computes `published_at`
+  catalogue-side as `max(MAX(prior published_at for this
+  software) + 1s, now)`, so a tight publish loop produces
+  strictly increasing timestamps without anyone needing to
+  `sleep 1`. New `published-at-is-strictly-monotonic-per-software`
+  unit test inserts five releases in a tight loop and asserts
+  the timestamps form a strictly decreasing sequence under
+  `list-releases`. Also lets the existing
+  `get-latest-release-falls-back-to-published-at-for-non-semver`
+  test drop its "any of three" relaxation.
 - **Server: `/releases/latest` now returns the highest *semver*
   version, not the most-recently-*published* one.** Surfaced
   during v1.1.0 testing: an operator re-published 1.0.1 today

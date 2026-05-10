@@ -342,17 +342,54 @@ ordering when versions look like 'alpha', 'beta-build', ...)."
               :manifest-sha256 "0"
               :published-by "test"))
            ;; No semver parses -> we fall back to LIST-RELEASES's
-           ;; first row (sorted published_at DESC).  With 3 rows
-           ;; inserted in the same wall-clock second, the timestamps
-           ;; tie and SQLite picks one arbitrarily; the contract is
-           ;; only "returns SOME inserted release without crashing".
+           ;; first row (sorted published_at DESC).  Since v1.1.0
+           ;; INSERT-RELEASE makes published_at *strictly* monotonic
+           ;; per software, the last-inserted (gamma) is unambiguously
+           ;; the newest -- the test no longer needs the "any of
+           ;; three" relaxation that worked around the same-second tie.
            (let ((latest (ota-server.catalogue:get-latest-release cat "ns")))
-             (is (not (null latest))
-                 "fallback should return a release, not NIL")
-             (is (member (getf latest :version) '("alpha" "beta" "gamma")
-                         :test #'string=)
-                 "fallback returned ~S; expected one of alpha/beta/gamma"
+             (is (string= "gamma" (getf latest :version))
+                 "fallback returned ~S; expected gamma (last inserted)"
                  (getf latest :version))))
+      (ota-server.catalogue:close-catalogue cat)
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
+(test published-at-is-strictly-monotonic-per-software
+  "Two back-to-back inserts in the same wall-clock second must NOT
+tie on published_at.  v1.1.0: INSERT-RELEASE computes published_at
+catalogue-side as max(MAX(prior published_at) + 1s, now), so any
+ORDER BY published_at DESC consumer (notably the v1.0.x
+get-latest-release fallback for non-semver versions) is
+deterministic without the publisher having to sleep."
+  (multiple-value-bind (cat root) (fresh-tmp-catalogue)
+    (unwind-protect
+         (progn
+           (ota-server.catalogue:ensure-software cat :name "mono")
+           ;; Five tight inserts; we're betting these all happen
+           ;; inside one wall-clock second on every reasonable host.
+           (dotimes (i 5)
+             (ota-server.catalogue:insert-release
+              cat
+              :release-id (format nil "mono/x-y/r~D" i)
+              :software "mono"
+              :os "x" :arch "y" :os-versions #()
+              :version (format nil "~D" i)
+              :blob-sha256 (format nil "~64,'0X" i)
+              :blob-size 1
+              :manifest-sha256 "0"
+              :published-by "test"))
+           (let* ((rels (ota-server.catalogue:list-releases cat "mono"))
+                  (timestamps (mapcar (lambda (r) (getf r :published-at)) rels)))
+             ;; LIST-RELEASES returns published_at DESC, so the list
+             ;; should be strictly decreasing.
+             (loop for (a b) on timestamps
+                   while b
+                   do (is (string> a b)
+                          "published_at not strictly monotonic: ~S then ~S"
+                          a b))
+             ;; And: every timestamp is unique.
+             (is (= (length timestamps) (length (remove-duplicates timestamps :test #'string=)))
+                 "duplicate published_at: ~S" timestamps)))
       (ota-server.catalogue:close-catalogue cat)
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
 

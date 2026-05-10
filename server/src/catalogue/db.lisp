@@ -144,19 +144,25 @@ for concurrent multi-worker access (WAL mode, NORMAL synchronous,
                                       uncollectable deprecated
                                       published-by notes)
   (with-catalogue (db catalogue)
-    (sqlite:execute-non-query
-     db
-     (format nil "INSERT INTO releases (~A) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, ?)"
-             *release-columns*)
-     release-id software os arch
-     (com.inuoe.jzon:stringify os-versions :pretty nil)
-     version blob-sha256 blob-size manifest-sha256
-     (com.inuoe.jzon:stringify channels :pretty nil)
-     (com.inuoe.jzon:stringify classifications :pretty nil)
-     (if uncollectable 1 0)
-     (if deprecated    1 0)
-     published-by
-     (or notes ""))))
+    ;; Compute published_at catalogue-side so that two back-to-back
+    ;; publishes within the same wall-clock second don't tie -- see
+    ;; NEXT-PUBLISHED-AT for the rationale.  (Replaces the prior
+    ;; SQL-side "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".)
+    (let ((published-at (next-published-at db software)))
+      (sqlite:execute-non-query
+       db
+       (format nil "INSERT INTO releases (~A) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+               *release-columns*)
+       release-id software os arch
+       (com.inuoe.jzon:stringify os-versions :pretty nil)
+       version blob-sha256 blob-size manifest-sha256
+       (com.inuoe.jzon:stringify channels :pretty nil)
+       (com.inuoe.jzon:stringify classifications :pretty nil)
+       (if uncollectable 1 0)
+       (if deprecated    1 0)
+       published-at
+       published-by
+       (or notes "")))))
 
 (defun list-releases (catalogue software-name)
   (with-catalogue (db catalogue)
@@ -343,6 +349,45 @@ treated as zero (so (1 0) and (1 0 0) are equal)."
 (defun universal-to-iso8601 (univ)
   (multiple-value-bind (s m h d mo y) (decode-universal-time univ 0)
     (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ" y mo d h m s)))
+
+(defun iso8601-to-universal (iso)
+  "Inverse of UNIVERSAL-TO-ISO8601 for the strict
+\"YYYY-MM-DDTHH:MM:SSZ\" shape we emit ourselves."
+  (encode-universal-time
+   (parse-integer iso :start 17 :end 19)   ; ss
+   (parse-integer iso :start 14 :end 16)   ; mm
+   (parse-integer iso :start 11 :end 13)   ; hh
+   (parse-integer iso :start  8 :end 10)   ; dd
+   (parse-integer iso :start  5 :end  7)   ; MM
+   (parse-integer iso :start  0 :end  4)   ; YYYY
+   0))                                      ; UTC
+
+(defun succ-iso8601 (iso)
+  "Return the ISO-8601 string one second after ISO."
+  (universal-to-iso8601 (1+ (iso8601-to-universal iso))))
+
+(defun next-published-at (db software-name)
+  "Return an ISO-8601 timestamp suitable as the new release's
+published_at: the wall-clock now, OR -- if a prior release of
+SOFTWARE-NAME already has that timestamp (or any in its future,
+e.g. after an NTP correction) -- the maximum existing
+published_at plus one second.
+
+This keeps published_at *strictly* monotonic per-software: two
+back-to-back publishes in the same wall-clock second do not tie,
+so any ORDER BY published_at DESC consumer (notably the v1.0.x
+get-latest-release fallback) is deterministic.  No sleeps;
+purely catalogue-side."
+  (let* ((now  (universal-to-iso8601 (get-universal-time)))
+         (rows (sqlite:execute-to-list
+                db
+                "SELECT MAX(published_at) FROM releases WHERE software_name = ?"
+                software-name))
+         (prev (caar rows)))
+    (cond
+      ((null prev)         now)
+      ((string< prev now)  now)            ; clock has advanced; use it
+      (t                   (succ-iso8601 prev)))))
 
 (defun claim-install-token (catalogue token)
   "Mark an install token as used (one-shot).  Returns the token's
