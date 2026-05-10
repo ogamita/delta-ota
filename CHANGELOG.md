@@ -19,6 +19,34 @@ C ABI) follow these compatibility commitments:
 
 ## [Unreleased]
 
+### Added
+- **libota test backfill** — closes the gap acknowledged in
+  Q1 of `questions.txt`. Coverage went from **0.5 % → 77.6 %**
+  (just shy of the QA-plan's 80 % target for `client/libota/`;
+  the remaining 2.4 pp are in the patch-download branch, the
+  `cfg.Timeout` wiring, and the install-token exchange path,
+  each of which needs more elaborate fixtures and is recorded
+  as a follow-up). 28 new tests across:
+  - **pure-function helpers**: `defaultOTAHome` (env / $HOME /
+    fallback), `(Config) fallbackRatio` (default 0.7 / explicit
+    / non-positive), `pickPatch` (smallest-matching, no-match,
+    non-bsdiff filter, ratio cap, blob_size=0 means no cap),
+    `checkTrust` (TOFU, persisted-key match / change, trusted-
+    set match / unlisted), `short`, `pruneOldArtefacts`
+    (no-op under 3 history entries / drops oldest blob +
+    archived dist + matching patches at ≥ 3).
+  - **`Install` integration** against an `httptest` server with
+    a freshly-generated Ed25519 keypair: happy-path explicit
+    version, `--latest`/`""` resolution, software-mismatch
+    detection, tampered-manifest signature rejection,
+    untrusted-pubkey rejection, blob-hash mismatch rejection,
+    pinned-key-change rejection (TOFU then second install with
+    a different key).
+  - **`Upgrade`** populates Previous correctly (1.0.0 → 1.0.1).
+  - **`Revert`** errors with no Previous; swaps Current/Previous
+    cleanly when Previous exists.
+  - `Drain` utility byte-count.
+
 ### Changed
 - **CI: dev-image cache backend switched from `inline` to a
   registry cache ref.** Buildx's inline cache exporter is
