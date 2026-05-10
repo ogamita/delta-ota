@@ -30,6 +30,23 @@ C ABI) follow these compatibility commitments:
   schema, agent reporting contract, query catalogue, test plan,
   and open questions. Code lands in subsequent commits on this
   branch.
+- **Release-1.6 plan landed.** Reachability-aware GC: Dijkstra over
+  the patches graph + the v1.5 snapshot to compute, before any
+  drop, whether each client's cheapest upgrade path survives.
+  Pre-builds the minimum set of missing edges via the v1.2
+  worker pool (atomic with the drop); operators get an
+  `allow_blob_fallback` escape hatch. Lazy upgrade-time patch
+  build closes the out-of-order-publish gap naturally. See
+  [docs/release-1.6-plan.org](docs/release-1.6-plan.org).
+- **Release-1.7 plan landed.** Opt-in client-person link
+  (`client_emails` table) + upgrade-notification dispatch via a
+  configurable webhook (no built-in SMTP — vendoring policy +
+  attack-surface arguments). Outbox pattern mirrors `patch_jobs`
+  for atomicity + restart-safety + retry. Sample webhook
+  receivers (smtp, ses, slack, teams) ship under
+  `tools/notifications/`. GDPR posture: opt-in, plain-text
+  storage, deletion via one HTTP call. See
+  [docs/release-1.7-plan.org](docs/release-1.7-plan.org).
 
 ## [1.4.2] - 2026-05-10
 
